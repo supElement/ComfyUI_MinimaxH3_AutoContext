@@ -1,0 +1,2 @@
+# ComfyUI_MinimaxH3_AutoContext
+初步实现了Minimax_H3的长视频拆分为多段独立推理，但还是有很多问题，先放到这里。
