@@ -77,10 +77,10 @@
 0-5s: 镜头跟拍，场景过渡为中式园林
 5-10s: 镜头穿过园林，...入画
 
-integrated_multimodal_description（多模态整体画面描述）
+【全局】integrated_multimodal_description（多模态整体画面描述）
 你的提示词
 
-overall_soundscape（整体环境音效）
+【全局】overall_soundscape（整体环境音效）
 你的提示词
 
 ```
