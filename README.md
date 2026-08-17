@@ -51,7 +51,6 @@
 - 新增 `drive_audio`（AUDIO，可选）输入 + `audio_drive`（disable/enable，默认 disable）开关
 - 开启后：把 `drive_audio` 编码后锁进 latent 的音频半区，并设 `noise_mask`（视频=1 正常去噪、音频=0 不重新生成），
   让视频生成被这条音频"驱动"（口型/节奏对齐），同时**输出音频 = `drive_audio` 本身**（无损，绕过 VAE 往返）
-- 用法与 VRGDG `MiniMax H3 Audio Drive` 一致：**同一条音频同时接 `ref_audio_0`（在提示词里写 `<Audio 1>`）和 `drive_audio`**
   —— `ref_audio_0` 负责语义驱动，`drive_audio` 负责锁定输出
 - 每段按输出时间轴切片源音频（含非首段续接重演头），段间拼接后与视频逐帧对齐
 - 源音频短于目标时长时自动补零，长于时自动截断
@@ -130,7 +129,7 @@ overall_soundscape（整体环境音效）
 
 **标签写法**：标签独占一行作为分割点，标签后推荐换行。不换行时也能处理（跳过分隔符取段内容）：
 ```
-段1
+段1:0-3s
 视频：
 【0-3秒：进入image1人物】
 镜头从昏暗走廊开始，前景有飘动的布帘和斜射金光。
@@ -139,7 +138,7 @@ overall_soundscape（整体环境音效）
 
 不要硬切镜头，不要黑屏。
 
-段2
+段2:3-8s
 视频：
 【0-2秒：离开image1】
 镜头继续跟拍，女子经过帷幔后快速横穿离开画面。
@@ -168,25 +167,3 @@ overall_soundscape（整体环境音效）
 - **audio**：拼接后的音频（段间 cosine 交叉淡化）
 - **latent**：音视频共用 latent（NestedTensor），裁掉段间重演区后拼接，可用 ComfyUI 原生 VAE Decode 解码。推荐用法：latent → VAE Decode 得到视频，配合 audio 端口输出音频（波形层面交叉淡化，连续性更好）
 
-## 技术细节
-
-### 17n+5 VAE 时序网格
-
-H3 的 VAE 要求帧数满足 `17n+5` 网格（5, 22, 39, 56, 73, 90, 107, 124, ...）。节点自动将每段帧数吸附到最近的网格点，并动态计算分段策略。
-
-### 多帧 keyframe 锚定
-
-续接时从上一段尾部提取 N 个 latent 帧作为独立 keyframe。每个 keyframe 锚定到当前段的 `pixel_index` 对应时间坐标：
-
-```
-cond_t = video_t0 + FRAME_RESCALE × pixel_index
-```
-
-其中 `video_t0` 是视频段在 packed sequence 中的实际起始位置（考虑 ref 块的 cursor 偏移）。
-
-### Monkey-patch
-
-节点运行时自动应用两个 patch：
-
-1. **PackedLayout.\_\_init\_\_**：接受任意 `resolved_frame_index`（官方只允许 0 和 frame_count-1）
-2. **MiniMaxH3.extra_conds**：将 keyframe latent 与 ref latent 拼接（官方覆写 ref 时丢弃 keyframe）
