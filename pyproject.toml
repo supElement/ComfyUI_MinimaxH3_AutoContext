@@ -1,7 +1,7 @@
 [project]
 name = "ComfyUI_MinimaxH3_AutoContext"
 description = "One-click MiniMax H3 long-video generation node: chunked inference, inter-chunk keyframe continuation anchoring, and timeline-based prompt slicing for seamless long videos on limited VRAM."
-version = "0.3.1"
+version = "0.3.2"
 license = {file = "LICENSE"}
 
 
