@@ -1,0 +1,72 @@
+name: Translate Readme
+
+on:
+  push:
+    branches: ['main']
+    paths:
+      - 'README.md'  # 只在 README.md 变化时触发，避免死循环
+
+jobs:
+  translate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # 确保有写入权限
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}  # 使用你的 token
+          fetch-depth: 0  # 获取完整历史，便于 rebase
+
+      - name: Translate with Zhipu (Free Forever)
+        env:
+          ZHIPU_KEY: ${{ secrets.ZHIPU_API_KEY }}
+        run: |
+          python << 'PYEOF'
+          import requests, os, json
+          
+          # 读取中文README
+          with open('README.md', 'r', encoding='utf-8') as f:
+              text = f.read()
+          
+          # 调用智谱 GLM-4-Flash
+          resp = requests.post(
+              "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+              headers={"Authorization": f"Bearer {os.environ['ZHIPU_KEY']}"},
+              json={
+                  "model": "glm-4-flash",
+                  "messages": [
+                      {"role": "system", "content": "将中文README翻译成英文。要求：1.保留原始markdown格式；2.代码块内的注释可翻译，代码本身不翻译；3.图片链接格式 ![描述](url) 保持原样；4.不要添加任何代码块标记包裹整个输出；5.直接返回翻译后的markdown文本"},
+                      {"role": "user", "content": text}
+                  ]
+              }
+          ).json()
+          
+          content = resp['choices'][0]['message']['content']
+          
+          # 后处理：去掉模型可能错误添加的外层代码块
+          content = content.strip()
+          if content.startswith('```markdown'):
+              content = content[11:].strip()
+          elif content.startswith('```'):
+              # 找到第一个换行，去掉开头的 ``` 和语言标记
+              first_newline = content.find('\n')
+              if first_newline != -1:
+                  content = content[first_newline+1:].strip()
+          if content.endswith('```'):
+              content = content[:-3].strip()
+          
+          # 写入英文README
+          with open('README.en.md', 'w', encoding='utf-8') as f:
+              f.write(content)
+          PYEOF
+          
+      - name: Push changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.en.md
+          git diff --staged --quiet || (
+            git commit -m "docs: auto translate" &&
+            git pull --rebase origin main &&  # 先拉取最新，避免冲突
+            git push
+          )
