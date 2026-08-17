@@ -1,3 +1,10 @@
+<div align="center">
+
+[![中文](https://img.shields.io/badge/语言-简体中文-red?style=for-the-badge)](./README.md)
+[![English](https://img.shields.io/badge/Language-English-blue?style=for-the-badge)](./README.en.md)
+
+</div>
+
 # ComfyUI_MinimaxH3_AutoContext
 
 一键式 MiniMax H3 长视频自动化生成节点：**分段推理 + 段间续接锚定 + 提示词时间轴切片**。
