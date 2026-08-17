@@ -1,106 +1,112 @@
 <div align="center">
 
-[![Chinese](https://img.shields.io/badge/Language-Simplified%20Chinese-red?style=for-the-badge)](./README.md)
+[![Chinese](https://img.shields.io/badge/Language-Chinese-red?style=for-the-badge)](./README.md)
 [![English](https://img.shields.io/badge/Language-English-blue?style=for-the-badge)](./README.en.md)
 
 </div>
 
 # ComfyUI_MinimaxH3_AutoContext
 
-One-click MiniMax H3 long-video auto-generation node: **chunked inference + inter-chunk continuation anchoring + prompt timeline slicing**.
+One-click MiniMax H3 Long Video Automatic Generation Node: **Segmented Inference + Inter-segment Continuation Anchoring + Prompt Timeline Slicing**.
 
-With limited VRAM, split a long video into multiple independently inferred chunks, anchor them seamlessly via multi-frame keyframes, and automatically slice prompts along the timeline so each chunk's content aligns with the prompt rhythm.
+In situations where GPU memory is limited, long videos are divided into multiple segments for independent inference. Seamless connection between segments is achieved through multi-frame keyframe anchoring, and prompts are automatically sliced along the timeline to align the generated content with the prompt rhythm.
 
 ## Core Features
 
-### Chunked Inference
-- Split into chunks by `total_frames` / `chunk_frames` (in frames); parameter stride is 17 (optional: 5, 22, 39, 56, 73, 90, ...)
-- Each chunk's frame count snaps to H3's 17n+5 VAE temporal grid
-- The last chunk is preferentially lengthened to absorb the anchoring deficit (≤30% cap), avoiding tiny trailing chunks
-- `fps` is only used for audio sync and seconds conversion inside prompts
+### Segmented Inference
+- Divided into multiple segments based on `total_frames` / `chunk_frames` (frame unit), parameter step size is 17 (optional: 5, 22, 39, 56, 73, 90, ...).
+- Each segment's frame count is吸附 to the H3's 17n+5 VAE temporal grid.
+- The last segment is extended by a priority to absorb the anchoring deficit (≤30% limit) to avoid producing tiny tail segments.
+- `fps` is only used for audio synchronization and prompt second conversion.
 
-### Inter-chunk Continuation Anchoring
-- Extract N latent frames from the tail of the previous chunk as standalone keyframes, anchored to the corresponding time coordinates of the current chunk
-- The model sees a real motion sequence rather than a single static frame, correctly continuing motion direction and speed
-- Context audio is passed through the ref channel (no `<Audio j>` tags inserted); the model treats it as "previous content" rather than reference material
-- Inter-chunk audio cosine cross-fade, strictly aligned with the video frames
+### Inter-segment Continuation Anchoring
+- Extract N latent frames from the end of the previous segment as independent keyframes and anchor them to the corresponding time coordinate of the current segment.
+- The model sees a real motion sequence rather than a single static frame, correctly continuing the direction and speed of motion.
+- Context audio is passed through the ref channel (no `<Audio j>` tag inserted), and the model treats it as "previous content" rather than reference material.
+- Inter-segment audio is cosine cross-faded and strictly aligned with the number of video frames.
 
 ### Prompt Timeline
-- **auto**: paragraphs containing time markers (e.g. `0-5s`) are sliced automatically; unmarked paragraphs (style / sound effects / prohibitions) are merged into every window
-- **timeline**: force-slice by time markers
-- **global**: the whole prompt is used for all windows (suitable for a one-take shot with homogeneous motion throughout)
-- **sequential**: spread paragraphs in reading order across the timeline; paragraphs starting with `全局:`/`[全局]` are merged into every window
+- **auto**: Segments with time markers (such as `0-5s`) are automatically split. Segments without markers (style/sound/ban items) are merged into each window.
+- **timeline**: Splitting is forced by time markers.
+- **global**: The entire segment prompt is used for all windows (suitable for one-take shots with consistent actions throughout).
+- **sequential**: Poured onto the timeline according to the sentence reading order, with segments starting with `全局:`/`[全局]` merged into each window.
 
-### Clip_Tag Paragraph Segmentation Mode
-- Slice prompts by user-defined tags (e.g. `段1`/`段2`/`段3`); each segment = one chunk = all of that segment's prompt
-- Segment duration is determined by the prompt content (three-level priority):
-  1. Duration right after the tag line (e.g. `段1:0-5秒` → 5s; `段1:3-8秒` → 5s)
-  2. The maximum end value of in-segment time markers (e.g. `【0-2秒】`+`【2-5秒】` → 5s)
-  3. `chunk_frames / fps` as the fallback default
-- In-segment time markers are **relative** (each segment starts from 0), not global absolute time
-- Continuation anchoring compensation: non-first segments generate `context_frames` extra frames for head anchoring, automatically cropped after generation to keep segments continuous
-- At inference the tags themselves are removed; the remaining prompt content is output per `prompt_format`:
-  - `official`/`legacy`: time coordinates are auto-converted to segment-relative
-  - `raw`: output as-is after tag removal, no conversion
+### Clip_Tag Tag-based Segmentation Mode
+- Split prompts based on user-defined tags (such as `段1`/`段2`/`段3`). Each segment = one chunk = all prompts of that segment.
+- Segment duration is determined by the prompt content (three priority levels):
+  1. Duration immediately following the tag line (such as `段1:0-5秒` → 5 seconds; `段1:3-8秒` → 5 seconds).
+  2. Maximum end value of time markers within the segment (such as `[0-2秒】`+`【2-5秒】` → 5 seconds).
+  3. Default value of `chunk_frames / fps`.
+- Segment time markers are**relative time** (starting from 0 in each segment), not global absolute time.
+- Continuation anchoring compensation: Non-first segments generate `context_frames` frames for head anchoring, which are automatically trimmed after generation to ensure continuity between segments.
+- Tags are removed during inference, and the rest of the prompt content is output according to `prompt_format`:
+  - `official`/`legacy`: Time coordinates are automatically converted to relative coordinates within the segment.
+  - `raw`: Tags are removed and the content is output as is, without any conversion (used with Clip_Tag only).
 
-### Smart Reference Filtering (Image / Video / Audio)
-- Parse references in each segment's prompt (`image1`/`image 1`/`图像1`/`图片1`, `视频1`, `音频1`/`audio 1`, and native `<Picture N>`/`<Video N>`/`<Audio N>`, 1-based); only pass the referenced references to the current segment
-- Numbers are auto-remapped to consecutive indices, aligned with the model's native `<Picture N>`/`<Video N>`/`<Audio N>` tags
-- Videos are bound to their paired audio tracks; tracks and standalone audio are counted as `<Audio N>` per official rules (tracks first)
-- Avoids visual/audio crosstalk caused by passing all references at once
+### Reference Smart Filtering (Image / Video / Audio)
+- Parse references in each segment prompt (`image1`/`image 1`/`图像1`/`图片1`, `视频1`, `音频1`/`audio 1`, as well as native `<Picture N>`/`<Video N>`/`<Audio N>`, 1-based), and only pass the referenced references to the current segment.
+- The numbering is automatically remapped to a continuous sequence, aligning with the native `<Picture N>`/`<Video N>`/`<Audio N>` tags.
+- Video is bound to its paired audio track; tracks and independent audio are counted as `<Audio N>` (track first) according to official rules.
+- Avoid interference between image and sound when all references are passed at the same time.
 
 ### Dynamic Ports (Autogrow)
-- Only the `_0` port is shown by default; `_1` appears after connecting, and so on
-- Supported: reference images (0-9), reference videos (0-3), paired audio tracks for reference videos (0-3), standalone reference audio (0-3)
-- `first_frame` / `last_frame` are always shown (for FL2VA first/last frame anchoring mode)
+- Only the `_0` port is displayed by default, and `_1` is displayed after connection, and so on.
+- Supported: Reference images (0-9), reference videos (0-3), paired audio tracks of reference videos (0-3), and independent reference audio (0-3).
+- `first_frame`/`last_frame` are always displayed (used for FL2VA head and tail frame anchoring mode).
 
-### Audio Drive (drive the video with reference audio)
-- New `drive_audio` (AUDIO, optional) input + `audio_drive` (disable/enable, default disable) switch
-- When enabled: encode `drive_audio`, lock it into the latent audio half, and set `noise_mask` (video=1 normal denoising, audio=0 no regeneration),
-  so the video generation is "driven" by this audio (lip sync / rhythm alignment), while **output audio = `drive_audio` itself** (lossless, bypassing the VAE round-trip)
-  —— `ref_audio_0` handles semantic driving, `drive_audio` locks the output
-- Each chunk slices the source audio along the output timeline (including the replay head of non-first chunks); after concatenation it aligns frame-by-frame with the video
-- Source audio shorter than the target duration is zero-padded; longer is truncated
+### Audio Drive (Audio Drive, reference audio drive video)
+- New `drive_audio` (AUDIO, optional) input + `audio_drive` (disable/enable, default disable) switch.
+- When enabled: The `drive_audio` is encoded and locked into the audio half of the latent space, and `noise_mask` (video=1 normal denoising, audio=0 not regenerated) is set, so that video generation is "driven" by this audio (mouth shape/rhythm alignment), and at the same time**output audio = `drive_audio` itself** (lossless, bypassing the VAE round trip).
+  —— `ref_audio_0` is responsible for semantic driving, and `drive_audio` is responsible for locking the output.
+- Source audio is sliced according to the output timeline for each segment (including replay heads of non-first segments), and then spliced and aligned with the video frame by frame.
+- Automatically zero-padded when source audio is shorter than the target duration, and automatically truncated when longer.
 
 ### Other
-- Node progress bar and preview image shown in real time
-- PackedLayout time-coordinate fix: keyframe `cond_t` is based on the video segment's actual start coordinate, not text_len
-- extra_conds concatenation fix: keyframe cond rows and ref rows are concatenated rather than overwritten
+- Node progress bar and preview image are displayed in real time.
+- PackedLayout time coordinate correction: `cond_t` of keyframes is based on the actual starting coordinate of the video segment, not text_len.
+- extra_conds splicing repair: keyframe cond rows are spliced with ref rows instead of overwritten.
 
 ## Installation
 
-Put the `ComfyUI_MinimaxH3_AutoContext` folder into ComfyUI's `custom_nodes` directory and restart ComfyUI.
+- Manual Installation (Manual Installation)<br>
+Enter the ./ComfyUI/custom_nodes directory and run the following code:<br>
 
-Dependencies: `torchaudio` (for audio resampling, optional).
+      git clone https://github.com/supElement/ComfyUI_MinimaxH3_AutoContext.git
+
+- Install using Manager (Install using Manager)<br>
+
+  Search for ComfyUI_MinimaxH3_AutoContext in the ComfyUI Manager, then Install.
+
+Dependencies: `torchaudio` (used for audio resampling, optional).
 
 ## Node Parameters
 
-| Parameter | Default | Description |
-|------|--------|------|
-| model / vae / audio_vae / clip | — | MiniMax H3 model components |
-| first_frame | optional | First-frame anchoring (FL2VA mode) |
-| last_frame | optional | Last-frame anchoring (FL2VA mode) |
-| long_prompt | — | Long prompt; supports time-marker segmentation |
-| clip_mode | Clip_Frame | Segmentation mode: Clip_Frame (uniform frame slicing) / Clip_Tag (custom tag slicing) |
-| clip_tag | 段1 | Split-tag template for Clip_Tag mode; must end with a numeric index (e.g. `段1`/`A01`/`[片段001]`) |
-| prompt_mode | auto | Prompt timeline mode (only effective in Clip_Frame) |
-| prompt_format | official | Prompt output format: official / legacy / raw (raw is Clip_Tag-only, outputs as-is) |
-| crop_mode | stretch | Scale/crop for reference images / first-last frames / reference videos: center (scale to shortest edge with center crop) / stretch (direct stretch) / none (keep original resolution, 32-aligned only, advanced users) |
-| ref_sync_mode | global | Whether reference video/audio is sliced per chunk: global (each chunk uses the full reference) / segmented (each chunk takes the corresponding time slice, for lip sync) |
-| decode_output | disable | Whether to decode internally: disable (default, latent only) / enable (output image+audio+latent) |
-| width × height | 960×544 | Generation resolution |
-| total_frames | 362 | Total frames to generate (must satisfy 17n+5, ~15s@24fps); overridden by the sum of segments in Clip_Tag mode |
-| fps | 24 | Frame rate; only used for audio sync and seconds conversion inside prompts |
-| chunk_frames | 90 | Frames per chunk (must satisfy 17n+5, ~3.75s@24fps); acts as the fallback duration in Clip_Tag mode |
-| context_frames | 22 | Inter-chunk continuation frames; larger = stronger continuity |
+| Parameter | Default Value | Description |
+|-----------|---------------|-------------|
+| model / vae / audio_vae / clip | — | MiniMax H3 model component |
+| first_frame | Optional | First frame anchoring (FL2VA mode) |
+| last_frame | Optional | Tail frame anchoring (FL2VA mode) |
+| long_prompt | — | Long prompt, supports time-marked segmentation |
+| clip_mode | Clip_Frame | Segmentation mode: Clip_Frame (uniformly cut by frame) / Clip_Tag (split by custom tags) |
+| clip_tag | 段1 | Clip_Tag segmentation tag template, must end with a digit (such as `段1`/`段2`/`段3`) |
+| prompt_mode | auto | Prompt timeline mode (only effective for Clip_Frame) |
+| prompt_format | official | Prompt output format: official / legacy / raw (raw is used with Clip_Tag, output as is) |
+| crop_mode | stretch | Scaling and cropping of reference images/first and last frames/reference videos: center (proportional scaling to the shortest side and center cropping) / stretch (stretch directly) / none (keep original resolution, only 32 aligned, advanced users) |
+| ref_sync_mode | global | Whether to slice reference videos/audio by segment: global (use complete reference for each segment) / segmented (take corresponding time segment for each segment, used for mouth shape synchronization) |
+| decode_output | disable | Internal decoding: disable (default, only output latent) / enable (output image+audio+latent) |
+| width × height | 960×544 | Output resolution |
+| total_frames | 362 | Total number of generated frames (must meet 17n+5, about 15s@24fps), covered by the sum of each segment in Clip_Tag mode |
+| fps | 24 | Frame rate, only used for audio synchronization and prompt second conversion |
+| chunk_frames | 90 | Number of frames generated per segment (must meet 17n+5, about 3.75s@24fps), used as the default value for duration in Clip_Tag mode |
+| context_frames | 22 | Inter-segment continuation frames, the larger the value, the stronger the continuity |
 | steps / cfg / sampler / scheduler | 30 / 1.0 / euler / simple | Sampling parameters |
 | seed | 0 | Random seed |
-| ref_image_N | optional | Reference images (referenced in prompts via `image1`/`image 1`/`图像1`/`图片1` or `<Picture N>`, 1-based) |
-| ref_video_N | optional | Reference video frames |
-| ref_video_audio_N | optional | Paired audio track of the reference video with the same number |
-| ref_audio_N | optional | Standalone reference audio |
-| drive_audio | optional | Audio-drive source (source audio to lock in), used with `audio_drive=enable` |
-| audio_drive | disable | Audio-drive switch: when enable, locks `drive_audio` (noise_mask=0), output audio = the source audio itself |
+| ref_image_N | Optional | Reference image (used in prompt with `image1`/`image 1`/`图像1`/`图片1` or `<Picture N>` reference, base 1) |
+| ref_video_N | Optional | Reference video frame |
+| ref_video_audio_N | Optional | Paired audio track of the same number as the reference video |
+| ref_audio_N | Optional | Independent reference audio |
+| drive_audio | Optional | Audio drive source (source audio to be locked), used with `audio_drive=enable` |
+| audio_drive | disable | Audio drive switch: enable locks `drive_audio` (noise_mask=0), output audio = source audio itself |
 
 ## Prompt Writing Examples
 
@@ -117,22 +123,22 @@ overall_soundscape
 
 ```
 
-Paragraphs containing the `0-5s` marker are sliced by time; unmarked paragraphs (style / sound effects / prohibitions) are automatically merged into every window.
+Segments with `0-5s` markers are split by time, and segments without markers (style/sound/ban items) are automatically merged into each window.
 
 ### Global Mode (global)
 
-The whole prompt is used for all chunks — suitable for a one-take shot with homogeneous motion throughout.
+The entire segment prompt is used for all segments, suitable for one-take shots with consistent actions throughout.
 
-### Clip_Tag Mode (tag-based segmentation)
+### Clip_Tag Mode (split by tags)
 
-Set `clip_mode` to `Clip_Tag` and fill `clip_tag` with the tag template (must end with a numeric index).
+Set `clip_mode` to `Clip_Tag`, and fill in the tag template (`clip_tag`) (must end with a digit).
 
-**Tag template examples**:
-- `段1` → matches `段1`/`段2`/`段3` in the prompt (prefix "段" + number)
-- `A01` → matches `A01`/`A02`/`A03` (prefix "A" + number)
-- `[片段001]` → matches `[片段001]`/`[片段002]` (prefix "[片段" + number + suffix "]")
+**Tag template example**:
+- `段1` → Matches `段1`/`段2`/`段3` (prefix "段"+digit)
+- `A01` → Matches `A01`/`A02`/`A03` (prefix "A"+digit)
+- `[片段001]` → Matches `[片段001]`/`[片段002]` (prefix "[片段"+digit+suffix"]")
 
-**Tag syntax**: the tag occupies its own line as a split point; a newline after the tag is recommended. Lines without a newline are also handled (the separator is skipped and the segment content is taken):
+**Tag writing**: The tag occupies a line on its own as a separator, and it is recommended to have a line break after the tag. It can also be processed (skip the separator to take the segment content) without a line break:
 ```
 段1:3s
 视频：
@@ -152,19 +158,19 @@ Set `clip_mode` to `Clip_Tag` and fill `clip_tag` with the tag template (must en
 
 ```
 
-**Segment duration rules** (three-level priority):
-1. Duration right after the tag line: `段1:0-5秒` → 5s; `段1:3-8秒` → 5s (the duration marker is removed from the prompt)
-2. 0-based in-segment time markers: `【0-2秒】`+`【2-5秒】` → 5s
-3. Neither → fallback to `chunk_frames / fps`
+**Segment duration rules** (three priority levels):
+1. Duration immediately following the tag line: `段1:0-5秒` → 5 seconds; `段1:3-8秒` → 5 seconds (duration markers are removed from the prompt).
+2. 0-based time markers within the segment: `[0-2秒】`+`【2-5秒】` → 5 seconds.
+3. None of the above → `chunk_frames / fps` as a fallback value.
 
 **prompt_format selection**:
-- `official`/`legacy`: in-segment time markers are auto-converted to segment-relative coordinates when rendered
-- `raw`: output as-is after tag removal; time markers are kept unchanged (suitable for structured prompts generated by LLMs)
+- `official`/`legacy`: Segment time markers are automatically converted to relative coordinates within the segment.
+- `raw`: Tags are removed and the content is output as is, without any conversion (suitable for structured prompts generated by large models).
 
-**Continuation compensation**: non-first segments generate `context_frames` extra frames for head anchoring (replaying the previous segment's tail), automatically cropped after generation to keep segments continuous and stutter-free. Actual output duration = the sum of each segment's effective additions; the runtime log prints the actual value.
+**Continuation compensation**: Non-first segments generate `context_frames` frames for head anchoring (replaying the end of the previous segment), which are automatically trimmed after generation to ensure continuity between segments. The actual output duration = sum of effective new content of each segment, and the actual value will be printed in the run log.
 
 ## Output
 
-- **video_frames**: the concatenated full video frame sequence (internal decode, cropped and aligned between segments)
-- **audio**: the concatenated audio (cosine cross-fade between segments)
-- **latent**: the shared audio-video latent (NestedTensor), concatenated after cropping the inter-segment replay regions; can be decoded with ComfyUI's native VAE Decode. Recommended usage: latent → VAE Decode for the video, paired with the audio port's output (waveform-level cross-fade, better continuity)
+- **video_frames**: The complete video frame sequence after splicing (internally decoded, spliced and aligned between segments).
+- **audio**: The audio after splicing (cosine cross-fading between segments).
+- **latent**: The audio and video share the same latent (NestedTensor), spliced after removing the redundant area between segments, and can be decoded using ComfyUI's native VAE Decode. Recommended usage: latent → VAE Decode to get video, and output audio (waveform level cross-fading, better continuity) along with the audio port.
