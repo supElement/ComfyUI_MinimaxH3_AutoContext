@@ -69,7 +69,14 @@
 
 ## 安装
 
-将 `ComfyUI_MinimaxH3_AutoContext` 文件夹放入 ComfyUI 的 `custom_nodes` 目录，重启 ComfyUI 即可。
+- 手动安装（Manual Installation）<br>
+进入 ./ComfyUI/custom_nodes 目录，运行以下代码：<br>
+
+      git clone https://github.com/supElement/ComfyUI_MinimaxH3_AutoContext.git
+
+- 在 Manager 管理器中安装（Install using Manager）<br>
+
+  在 ComfyUI Manager 中搜索 ComfyUI_MinimaxH3_AutoContext，然后 Install。
 
 依赖：`torchaudio`（用于音频重采样，可选）。
 
