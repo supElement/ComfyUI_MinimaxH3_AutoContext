@@ -1,0 +1,18 @@
+[project]
+name = "ComfyUI_MinimaxH3_AutoContext"
+description = "One-click MiniMax H3 long-video generation node: chunked inference, inter-chunk keyframe continuation anchoring, and timeline-based prompt slicing for seamless long videos on limited VRAM."
+version = "0.3.1"
+license = {file = "LICENSE"}
+
+
+[project.urls]
+Repository = "https://github.com/supElement/ComfyUI_MinimaxH3_AutoContext"
+#  Used by Comfy Registry https://registry.comfy.org
+Documentation = "https://github.com/supElement/ComfyUI_MinimaxH3_AutoContext/wiki"
+"Bug Tracker" = "https://github.com/supElement/ComfyUI_MinimaxH3_AutoContext/issues"
+
+[tool.comfy]
+PublisherId = "sup-element"
+DisplayName = "ComfyUI_MinimaxH3_AutoContext"
+Icon = ""
+includes = []
