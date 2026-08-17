@@ -101,10 +101,6 @@ class H3AutoContextSampler(io.ComfyNode):
                     options=["global", "segmented"],
                     default="global",
                     tooltip=_REF_SYNC_MODE_TOOLTIP),
-                io.Combo.Input("decode_output",
-                    options=["disable", "enable"],
-                    default="disable",
-                    tooltip="是否在节点内部解码输出 video_frames 和 audio。disable (默认): 只输出 latent，用 ComfyUI 原生 VAE Decode 解码（画面连续性更好）; enable: 节点内部解码，输出 image+audio+latent"),
                 io.Int.Input("width", default=960, min=64, max=4096, step=32),
                 io.Int.Input("height", default=544, min=64, max=4096, step=32),
                 io.Int.Input("total_frames", default=362, min=5, max=2880, step=17,
@@ -115,6 +111,14 @@ class H3AutoContextSampler(io.ComfyNode):
                     tooltip="每段生成帧数，需满足 17n+5 (5,22,39,...)。设为 ≥ total_frames 时不拆分，整个视频作为一段生成"),
                 io.Int.Input("context_frames", default=22, min=5, max=124, step=1,
                     tooltip=_CONTEXT_FRAMES_TOOLTIP),
+                io.Boolean.Input("audio_drive",
+                    default=False,
+                    tooltip="音频驱动开关。勾选后把 drive_audio 编码后锁进 latent (noise_mask=0，"
+                            "不重新生成音频)，视频照它生成；输出音频=drive_audio 本身。"
+                            "不勾选 (默认): 与之前行为一致"),
+                io.Boolean.Input("decode_output",
+                    default=False,
+                    tooltip="是否在节点内部解码输出 video_frames 和 audio。不勾选 (默认): 只输出 latent，用 ComfyUI 原生 VAE Decode 解码（画面连续性更好）; 勾选: 节点内部解码，输出 image+audio+latent"),
                 io.Int.Input("steps", default=30, min=1, max=100, step=1),
                 io.Float.Input("cfg", default=1.0, min=0.0, max=30.0, step=0.1),
                 io.Combo.Input("sampler_name", options=_SAMPLERS, default="euler"),
@@ -145,12 +149,6 @@ class H3AutoContextSampler(io.ComfyNode):
                 io.Audio.Input("drive_audio", optional=True,
                     tooltip="音频驱动源 (Audio Drive)。接要锁定的源音频，开启 audio_drive 后 "
                             "输出音频=这条音频本身 (口型/节奏由它驱动)。可与 ref_audio_0 接同一条音频"),
-                io.Combo.Input("audio_drive",
-                    options=["disable", "enable"],
-                    default="disable",
-                    tooltip="音频驱动开关。enable: 把 drive_audio 编码后锁进 latent (noise_mask=0，"
-                            "不重新生成音频)，视频照它生成；输出音频=drive_audio 本身。"
-                            "disable (默认): 与之前行为一致"),
             ],
             outputs=[
                 io.Image.Output(display_name="video_frames"),
@@ -168,20 +166,25 @@ class H3AutoContextSampler(io.ComfyNode):
                 prompt_format="official",
                 crop_mode="stretch",
                 ref_sync_mode="global",
-                decode_output="disable",
+                decode_output=False,
                 width=960, height=544,
                 total_frames=362, fps=24, chunk_frames=90,
                 context_frames=22, steps=30, cfg=1.0,
                 sampler_name="euler", scheduler="simple", seed=0,
                 ref_images=None, ref_videos=None,
                 ref_video_audios=None, ref_audios=None,
-                drive_audio=None, audio_drive="disable") -> io.NodeOutput:
+                drive_audio=None, audio_drive=False) -> io.NodeOutput:
 
         if clip_mode != "Clip_Tag":
             if chunk_frames <= 0:
                 chunk_frames = total_frames
         width = max(32, (width // 32) * 32)
         height = max(32, (height // 32) * 32)
+        # 兼容旧版 combo 字符串值 ("disable"/"enable")，新版为布尔复选框
+        if isinstance(decode_output, str):
+            decode_output = (decode_output == "enable")
+        if isinstance(audio_drive, str):
+            audio_drive = (audio_drive == "enable")
 
         def _autogrow_to_list(ag_dict, prefix, max_count):
             """将 autogrow dict 转为有序 list，按 ref_xxx_N 的 N 排序"""
@@ -223,7 +226,7 @@ class H3AutoContextSampler(io.ComfyNode):
             prompt_format=prompt_format,
             clip_mode=clip_mode, clip_tag=clip_tag,
             crop_mode=crop_mode, ref_sync_mode=ref_sync_mode,
-            decode_output=(decode_output == "enable"),
-            drive_audio=drive_audio, audio_drive=(audio_drive == "enable"),
+            decode_output=decode_output,
+            drive_audio=drive_audio, audio_drive=audio_drive,
         )
         return io.NodeOutput(frames, audio, latent)
