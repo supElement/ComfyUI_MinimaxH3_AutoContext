@@ -22,27 +22,48 @@ jobs:
           ZHIPU_KEY: ${{ secrets.ZHIPU_API_KEY }}
         run: |
           python << 'PYEOF'
-          import requests, os, json
-          
+          import requests, os, json, sys
+
           # 读取中文README
           with open('README.md', 'r', encoding='utf-8') as f:
               text = f.read()
-          
+
+          # 检查密钥是否已配置
+          api_key = os.environ.get('ZHIPU_KEY', '').strip()
+          if not api_key:
+              print('❌ 未检测到 ZHIPU_API_KEY Secret，请在仓库 Settings → Secrets and variables → Actions 中配置')
+              sys.exit(1)
+
           # 调用智谱 GLM-4-Flash
           resp = requests.post(
               "https://open.bigmodel.cn/api/paas/v4/chat/completions",
-              headers={"Authorization": f"Bearer {os.environ['ZHIPU_KEY']}"},
+              headers={"Authorization": f"Bearer {api_key}"},
               json={
                   "model": "glm-4-flash",
                   "messages": [
                       {"role": "system", "content": "将中文README翻译成英文。要求：1.保留原始markdown格式；2.代码块内的注释可翻译，代码本身不翻译；3.图片链接格式 ![描述](url) 保持原样；4.不要添加任何代码块标记包裹整个输出；5.直接返回翻译后的markdown文本"},
                       {"role": "user", "content": text}
                   ]
-              }
-          ).json()
-          
-          content = resp['choices'][0]['message']['content']
-          
+              },
+              timeout=120
+          )
+
+          print(f"HTTP 状态码: {resp.status_code}")
+          try:
+              data = resp.json()
+          except Exception:
+              print("❌ 响应不是合法 JSON：")
+              print(resp.text[:2000])
+              sys.exit(1)
+
+          # 检查 API 是否返回错误
+          if 'choices' not in data:
+              print("❌ 智谱 API 返回错误：")
+              print(json.dumps(data, ensure_ascii=False, indent=2))
+              sys.exit(1)
+
+          content = data['choices'][0]['message']['content']
+
           # 后处理：去掉模型可能错误添加的外层代码块
           content = content.strip()
           if content.startswith('```markdown'):
@@ -54,12 +75,14 @@ jobs:
                   content = content[first_newline+1:].strip()
           if content.endswith('```'):
               content = content[:-3].strip()
-          
+
           # 写入英文README
           with open('README.en.md', 'w', encoding='utf-8') as f:
               f.write(content)
+
+          print(f"✅ 翻译完成，已写入 README.en.md（{len(content)} 字符）")
           PYEOF
-          
+
       - name: Push changes
         run: |
           git config user.name "github-actions[bot]"
