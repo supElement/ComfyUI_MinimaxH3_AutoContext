@@ -117,7 +117,7 @@ app.registerExtension({
             if ((totalR.connected && totalR.value === undefined) ||
                 (chunkR.connected && chunkR.value === undefined) ||
                 (ctxR.connected && ctxR.value === undefined)) {
-                if (this.infoWidget) this.infoWidget.value = "已连接上游(无法预估)，以运行日志为准";
+                if (this.infoWidget) this.infoWidget.value = "已连接上游(无法预测)，以运行日志为准";
                 return;
             }
 
@@ -331,15 +331,20 @@ function traceOrigin(graph, linkId, visited) {
 
 function readOriginValue(node, slot) {
     if (!node || !node.widgets || !node.widgets.length) return undefined;
-    // 1) 直接取输出槽位对应的 widget (primitive/常量节点)
-    const w = node.widgets[slot];
-    if (w && typeof w.value !== "undefined" && w.value !== null && w.value !== "") return w.value;
-    // 2) 单输出 + 单 widget 的常量节点
-    const outCount = node.outputs ? node.outputs.length : 0;
-    if (outCount === 1 && node.widgets.length === 1) {
-        const w0 = node.widgets[0];
-        if (w0 && typeof w0.value !== "undefined" && w0.value !== null && w0.value !== "") return w0.value;
+    const hasValue = (v) => typeof v !== "undefined" && v !== null && v !== "";
+    // 1) primitive 节点 (ComfyUI 自带 Int/Float/String/Boolean 等，type === "PrimitiveNode")：
+    //    首个 widget 即固定值（mode=fixed 时即输出值），后续 widget 是 control_after_generate 模式控件。
+    if (node.type === "PrimitiveNode") {
+        const w = node.widgets[0];
+        return (w && hasValue(w.value)) ? w.value : undefined;
     }
+    // 2) 名为 "value" 的 widget（kjnode INTConstant、io.Int 等常量节点的统一值控件）
+    const valueWidget = node.widgets.find(w => w && w.name === "value" && hasValue(w.value));
+    if (valueWidget) return valueWidget.value;
+    // 3) 仅当存在唯一一个有值的 widget 时，才认为它是常量输出值，
+    //    避免把计算节点的输入 widget 误当成输出。
+    const valued = node.widgets.filter(w => w && hasValue(w.value));
+    if (valued.length === 1) return valued[0].value;
     return undefined;
 }
 
