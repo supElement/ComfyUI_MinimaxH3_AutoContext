@@ -22,84 +22,29 @@ jobs:
           ZHIPU_KEY: ${{ secrets.ZHIPU_API_KEY }}
         run: |
           python << 'PYEOF'
-          import requests, os, json, sys, time, re
-
+          import requests, os, json
+          
           # 读取中文README
           with open('README.md', 'r', encoding='utf-8') as f:
               text = f.read()
-
-          # 检查密钥是否已配置
-          api_key = os.environ.get('ZHIPU_KEY', '').strip()
-          if not api_key:
-              print('❌ 未检测到 ZHIPU_API_KEY Secret，请在仓库 Settings → Secrets and variables → Actions 中配置')
-              sys.exit(1)
-
-          # 按二级标题（## ）拆分片段，保留标题行，拼接后与原文结构一致
-          chunks = [c for c in re.split(r'(?m)^(?=## )', text) if c.strip()]
-          total = len(chunks)
-          print(f"📄 README 已拆分为 {total} 个片段")
-
-          API_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
-          SYSTEM_PROMPT = ("将以下中文README片段翻译成英文。要求："
-                           "1.保留原始markdown格式；2.代码块内的注释可翻译，代码本身不翻译；"
-                           "3.图片链接格式 ![描述](url) 保持原样；"
-                           "4.标题中的HTML锚点（如 <a id=\"...\"></a>）和链接锚点（如 (#xxx)）保持原样；"
-                           "5.不要添加任何代码块标记包裹整个输出；6.直接返回翻译后的文本，不要添加任何额外说明")
-
-
-          def translate_chunk(chunk, index):
-              payload = {
+          
+          # 调用智谱 GLM-4-Flash
+          resp = requests.post(
+              "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+              headers={"Authorization": f"Bearer {os.environ['ZHIPU_KEY']}"},
+              json={
                   "model": "glm-4-flash",
                   "messages": [
-                      {"role": "system", "content": SYSTEM_PROMPT},
-                      {"role": "user", "content": chunk}
+                      {"role": "system", "content": "将中文README翻译成英文。要求：1.保留原始markdown格式；2.代码块内的注释可翻译，代码本身不翻译；3.图片链接格式 ![描述](url) 保持原样；4.不要添加任何代码块标记包裹整个输出；5.直接返回翻译后的markdown文本"},
+                      {"role": "user", "content": text}
                   ]
               }
-              for attempt in range(1, 4):
-                  try:
-                      resp = requests.post(
-                          API_URL,
-                          headers={"Authorization": f"Bearer {api_key}"},
-                          json=payload,
-                          timeout=300
-                      )
-                      if resp.status_code in (429, 500, 502, 503, 504):
-                          print(f"  ⚠️ 片段 {index} 服务端繁忙（HTTP {resp.status_code}），{10 * attempt} 秒后重试 ...")
-                          time.sleep(10 * attempt)
-                          continue
-                      data = resp.json()
-                      if 'choices' not in data:
-                          raise RuntimeError(f"片段 {index} 智谱 API 返回错误：{json.dumps(data, ensure_ascii=False, indent=2)}")
-                      return data['choices'][0]['message']['content']
-                  except requests.exceptions.Timeout:
-                      print(f"  ⚠️ 片段 {index} 读取超时，{10 * attempt} 秒后重试 ...")
-                      time.sleep(10 * attempt)
-                  except requests.exceptions.ConnectionError:
-                      print(f"  ⚠️ 片段 {index} 连接失败，{10 * attempt} 秒后重试 ...")
-                      time.sleep(10 * attempt)
-                  except requests.exceptions.JSONDecodeError:
-                      print(f"  ⚠️ 片段 {index} 响应不是合法 JSON，前 2000 字符：{resp.text[:2000]}")
-                      time.sleep(10 * attempt)
-                  except RuntimeError:
-                      raise
-                  except Exception as e:
-                      raise RuntimeError(f"片段 {index} 请求异常：{e}")
-              raise RuntimeError(f"片段 {index} 连续 3 次网络请求失败")
-
-          results = []
-          for i, chunk in enumerate(chunks, 1):
-              print(f"⏳ 翻译片段 {i}/{total}（{len(chunk)} 字符）...")
-              try:
-                  translated = translate_chunk(chunk, i)
-              except RuntimeError as e:
-                  print(f"❌ {e}")
-                  sys.exit(1)
-              results.append(translated)
-              time.sleep(1)  # 稍作间隔，避免免费额度限流
-
-          content = ''.join(results).strip()
-
+          ).json()
+          
+          content = resp['choices'][0]['message']['content']
+          
           # 后处理：去掉模型可能错误添加的外层代码块
+          content = content.strip()
           if content.startswith('```markdown'):
               content = content[11:].strip()
           elif content.startswith('```'):
@@ -109,14 +54,12 @@ jobs:
                   content = content[first_newline+1:].strip()
           if content.endswith('```'):
               content = content[:-3].strip()
-
+          
           # 写入英文README
           with open('README.en.md', 'w', encoding='utf-8') as f:
               f.write(content)
-
-          print(f"✅ 翻译完成，共 {total} 段，已写入 README.en.md（{len(content)} 字符）")
           PYEOF
-
+          
       - name: Push changes
         run: |
           git config user.name "github-actions[bot]"
