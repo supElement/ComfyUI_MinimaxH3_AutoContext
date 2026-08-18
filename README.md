@@ -13,14 +13,14 @@
 
 ## 📖 目录
 
-- [核心特性](#-核心特性)
-- [安装](#-安装)
-- [节点参数](#-节点参数)
-- [输出](#-输出)
-- [提示词写法示例](#-提示词写法示例)
-- [提示词注意事项（节点的局限性）](#-提示词注意事项节点的局限性)
+- [核心特性](#features)
+- [安装](#install)
+- [节点参数](#params)
+- [输出](#output)
+- [提示词写法示例](#prompt-examples)
+- [提示词注意事项（节点的局限性）](#limitations)
 
-## ✨ 核心特性
+## <a id="features"></a> ✨ 核心特性
 
 ### 🧩 分段推理
 
@@ -85,7 +85,7 @@
 - PackedLayout 时间坐标修正：keyframe 的 `cond_t` 基于视频段实际起始坐标，而非 text_len
 - extra_conds 拼接修复：keyframe cond rows 与 ref rows 拼接而非覆写
 
-## 📦 安装
+## <a id="install"></a> 📦 安装
 
 ### 方式一：手动安装（Manual Installation）
 
@@ -101,13 +101,13 @@ git clone https://github.com/supElement/ComfyUI_MinimaxH3_AutoContext.git
 
 > **依赖**：`torchaudio`（用于音频重采样，可选）。
 
-## ⚙️ 节点参数
+## <a id="params"></a> ⚙️ 节点参数
 
 ### 模型组件
 
-| 参数 | 说明 |
-|------|------|
-| model / vae / audio_vae / clip | MiniMax H3 模型组件 |
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| model / vae / audio_vae / clip | — | MiniMax H3 模型组件 |
 
 ### 关键帧与提示词
 
@@ -143,12 +143,12 @@ git clone https://github.com/supElement/ComfyUI_MinimaxH3_AutoContext.git
 
 ### 参考素材
 
-| 参数 | 说明 |
-|------|------|
-| ref_image_N | 参考图片（提示词中用 `image1`/`image 1`/`图像1`/`图片1` 或 `<Picture N>` 引用，1 基） |
-| ref_video_N | 参考视频帧 |
-| ref_video_audio_N | 同编号参考视频的配对音轨 |
-| ref_audio_N | 独立参考音频 |
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| ref_image_N | 可选 | 参考图片（提示词中用 `image1`/`image 1`/`图像1`/`图片1` 或 `<Picture N>` 引用，1 基） |
+| ref_video_N | 可选 | 参考视频帧 |
+| ref_video_audio_N | 可选 | 同编号参考视频的配对音轨 |
+| ref_audio_N | 可选 | 独立参考音频 |
 
 ### 音频驱动
 
@@ -157,7 +157,7 @@ git clone https://github.com/supElement/ComfyUI_MinimaxH3_AutoContext.git
 | drive_audio | 可选 | 音频驱动源（要锁定的源音频），配合 `audio_drive=enable` 使用 |
 | audio_drive | disable | 音频驱动开关：enable 时锁定 `drive_audio`（noise_mask=0），输出音频=源音频本身 |
 
-## 📤 输出
+## <a id="output"></a> 📤 输出
 
 | 输出 | 说明 |
 |------|------|
@@ -167,7 +167,7 @@ git clone https://github.com/supElement/ComfyUI_MinimaxH3_AutoContext.git
 
 > 💡 **推荐用法**：`latent → VAE Decode` 得到视频，`latent → VAE audio Decode`，若音频有问题，可以尝试 `audio` 端口输出音频。
 
-## ✍️ 提示词写法示例
+## <a id="prompt-examples"></a> ✍️ 提示词写法示例
 
 ### 时间轴模式（auto / timeline）
 
@@ -181,15 +181,15 @@ integrated_multimodal_description
 overall_soundscape
 ```
 
-含 `0-5s` 标记的段落按时间切分，无标记段落（风格/音效/禁止项）自动拼入每个窗口。
+> 含 `0-5s` 标记的段落按时间切分，无标记段落（风格/音效/禁止项）自动拼入每个窗口。
 
 ### 全局模式（global）
 
-整段提示词用于所有分段，适合全程同质动作的一镜到底。
+> 整段提示词用于所有分段，适合全程同质动作的一镜到底。
 
 ### Clip_Tag 模式（按标签分段）
 
-`clip_mode` 设为 `Clip_Tag`，`clip_tag` 填写标签模板（必须以数字序号结尾）。
+> `clip_mode` 设为 `Clip_Tag`，`clip_tag` 填写标签模板（必须以数字序号结尾）。
 
 **标签模板示例**
 
@@ -232,14 +232,14 @@ overall_soundscape
 
 **续接补偿**：非首段多生成 `context_frames` 帧用于头部锚定（重演上一段尾部），生成后自动裁掉，保证段间连续无卡顿。实际输出时长 = 各段有效新增之和，运行日志会打印实际值。
 
-## 📝 提示词注意事项（节点的局限性）
+## <a id="limitations"></a> 📝 提示词注意事项（节点的局限性）
 
 > 以下注意事项**不适用于**简单的、始终有效的提示词场景（即所有分段共用同一个提示词，global 模式），
 > 比如：口播数字人（当然，台词需要分段）、视频中的镜头/构图变化不大，或视频替换角色等提示词通用的场景。
 
 ### 1️⃣ 核心原则：时序排他性
 
-使用分段推理（Chunk）时，请务必遵守**时序排他性**原则——每一段提示词只能描述该段"正在发生"的、相对于上一段末尾的**新变化**。
+> 使用分段推理（Chunk）时，请务必遵守**时序排他性**原则——每一段提示词只能描述该段"正在发生"的、相对于上一段末尾的**新变化**。
 
 - **分段即"接力"**：第 N 段生成时，它的起始画面状态（位置、动作姿态、镜头位置）完全由上一段末尾的"锚定帧（Context Frames）"隐式提供。你不需要在提示词里重复描述这个起始状态。
 - **禁止"回叙"与"重叠"**：第 N 段的提示词绝对不可以重复描述第 N-1 段已经完成的动作或镜头运动。如果重复描述（比如上一段已经在"穿过"，这一段又写"正在穿过"），模型接收到的指令就会与锚定帧的画面产生逻辑冲突（即指令冲突），导致生成画面卡顿、运动逻辑错乱或动作重复。
@@ -267,7 +267,7 @@ overall_soundscape
 
 ### 2️⃣ 核心原则：逐段引用声明
 
-使用分段推理并搭配参考图/视频（image1、video1 等）时，请务必遵守**逐段引用声明**原则——每一段提示词都必须独立且完整地声明该段所需要的全部引用素材，引用不会被"记忆"或"继承"到下一段。
+> 使用分段推理并搭配参考图/视频（image1、video1 等）时，请务必遵守**逐段引用声明**原则——每一段提示词都必须独立且完整地声明该段所需要的全部引用素材，引用不会被"记忆"或"继承"到下一段。
 
 你可以把每一段推理理解为一次独立的"新会话"，而非连续的"上下文对话"：
 
