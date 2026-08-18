@@ -103,16 +103,11 @@ git clone https://github.com/supElement/ComfyUI_MinimaxH3_AutoContext.git
 
 ## <a id="params"></a> ⚙️ 节点参数
 
-### 模型组件
-
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
+| **模型组件** | | |
 | model / vae / audio_vae / clip | — | MiniMax H3 模型组件 |
-
-### 关键帧与提示词
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
+| **关键帧与提示词** | | |
 | first_frame | 可选 | 首帧锚定（FL2VA 模式） |
 | last_frame | 可选 | 尾帧锚定（FL2VA 模式） |
 | long_prompt | — | 长提示词，支持时间标记分段 |
@@ -120,19 +115,11 @@ git clone https://github.com/supElement/ComfyUI_MinimaxH3_AutoContext.git
 | clip_tag | 段1 | Clip_Tag 模式的分割标签模板，必须以数字序号结尾（如 `段1`/`A01`/`[片段001]`） |
 | prompt_mode | auto | 提示词时间轴模式（仅 Clip_Frame 生效） |
 | prompt_format | official | 提示词输出格式：official / legacy / raw（raw 为 Clip_Tag 专用，原样输出） |
-
-### 画面处理
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
+| **画面处理** | | |
 | crop_mode | stretch | 参考图/首尾帧/参考视频的缩放裁剪：center（等比缩放到最短边并中心裁剪）/ stretch（直接拉伸）/ none（保持原始分辨率，仅 32 对齐，高级用户） |
 | ref_sync_mode | global | 参考视频/音频是否按段切片：global（每段用完整参考）/ segmented（每段取对应时间片段，用于口型同步） |
 | decode_output | disable | 是否内部解码：disable（默认，只输出 latent）/ enable（输出 image+audio+latent） |
-
-### 生成参数
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
+| **生成参数** | | |
 | width × height | 960×544 | 生成分辨率 |
 | total_frames | 362 | 生成总帧数（需满足 17n+5，约 15s@24fps），Clip_Tag 模式下被各段之和覆盖 |
 | fps | 24 | 帧率，仅用于音频同步和提示词内秒数换算 |
@@ -140,20 +127,12 @@ git clone https://github.com/supElement/ComfyUI_MinimaxH3_AutoContext.git
 | context_frames | 22 | 段间续接帧数，值越大连续性越强 |
 | steps / cfg / sampler / scheduler | 30 / 1.0 / euler / simple | 采样参数 |
 | seed | 0 | 随机种子 |
-
-### 参考素材
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
+| **参考素材** | | |
 | ref_image_N | 可选 | 参考图片（提示词中用 `image1`/`image 1`/`图像1`/`图片1` 或 `<Picture N>` 引用，1 基） |
 | ref_video_N | 可选 | 参考视频帧 |
 | ref_video_audio_N | 可选 | 同编号参考视频的配对音轨 |
 | ref_audio_N | 可选 | 独立参考音频 |
-
-### 音频驱动
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
+| **音频驱动** | | |
 | drive_audio | 可选 | 音频驱动源（要锁定的源音频），配合 `audio_drive=enable` 使用 |
 | audio_drive | disable | 音频驱动开关：enable 时锁定 `drive_audio`（noise_mask=0），输出音频=源音频本身 |
 
