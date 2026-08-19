@@ -285,7 +285,7 @@ def _split_paragraphs(text: str):
     return [p.strip() for p in re.split(r'\n+', text) if p.strip()]
 
 
-def build_prompt_schedule(long_prompt: str, total_seconds: float, mode: str = "auto"):
+def build_prompt_schedule(long_prompt: str, total_seconds: float, mode: str = "auto", quiet: bool = False):
     """
     结构化构建提示词时间轴 (适配官方 skill 分节模板)。
 
@@ -427,7 +427,8 @@ def build_prompt_schedule(long_prompt: str, total_seconds: float, mode: str = "a
     if mode == "timeline" or (mode == "auto" and has_timeline):
         if has_timeline:
             return _result(timeline_segs, g_before, g_after, "timeline")
-        print("[H3-Auto] 提示: 未检测到时间标记 (如 '0-5s')，降级为 global 模式")
+        if not quiet:
+            print("[H3-Auto] 提示: 未检测到时间标记 (如 '0-5s')，降级为 global 模式")
         return _result([_fulltext_segment(long_prompt)], "", "", "global")
 
     if mode == "sequential":
@@ -923,7 +924,7 @@ def render_tag_segment(seg_text, seg_seconds, fmt, prefix=""):
         parts = [p for p in (seg_text, prefix) if p]
         return "\n\n".join(parts)
 
-    schedule = build_prompt_schedule(seg_text, seg_seconds, mode="timeline")
+    schedule = build_prompt_schedule(seg_text, seg_seconds, mode="timeline", quiet=True)
     window_prompt = compose_window_prompt(schedule, 0.0, seg_seconds, fmt=fmt)
     if prefix:
         window_prompt = window_prompt + "\n\n" + prefix
