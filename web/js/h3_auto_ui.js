@@ -3,7 +3,7 @@ import { app } from "../../scripts/app.js";
 app.registerExtension({
     name: "H3.AutoContextSampler",
     async beforeRegisterNodeDef(nodeType, nodeData) {
-        if (nodeData.name !== "H3AutoContextSampler") return;
+        if (nodeData.name !== "H3Parameter") return;
 
         const onNodeCreated = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function () {
