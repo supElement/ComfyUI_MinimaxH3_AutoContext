@@ -884,30 +884,66 @@ def build_tag_schedule(long_prompt, clip_tag_input, default_seconds):
     return {"segments": segments, "prefix": prefix_text.strip()}
 
 
-def compute_tag_chunks(seg_target_frames_list, context_frames):
-    """Clip_Tag 模式的分块计算 (每段独立 +ctx 头部补偿)。
+def _snap_to_17_multiple_nearest(n_frames):
+    """吸附到最近的 17 的倍数 (非首段新增帧数用，无 5 帧头部)。"""
+    n_frames = max(5, int(n_frames))
+    k = round(n_frames / 17.0)
+    return max(17, k * 17)
 
-    - 首段: snap_to_grid_nearest(target)
-    - 非首段: snap_to_grid_nearest(target + context_frames)，多生成的 ctx 帧用于头部锚定
-    - effective_context 在调用方计算 (与 Clip_Frame 共用逻辑)
+
+def compute_tag_chunks(seg_target_frames_list, context_frames):
+    """Clip_Tag 模式的分块计算 (每段新增帧数贴目标 + 总时长锚定补偿)。
+
+    帧数账目 (H3 17n+5 网格约束)：
+    - 首段 (无锚定): 段长 = 新增 = snap_to_grid_nearest(target)  (17n+5 形式)
+    - 非首段: 段长 = 新增 + context_frames；由于 context_frames 取 17n+5 形式，
+      新增必然是 17 的倍数 (段长 17n+5 − context 17n+5 = 17 倍数)，如 68/85/102
+    - 总时长补偿: 各段新增之和与目标总帧数之差，按 17 帧粒度从未段起逐段 ±17，
+      使总时长尽量贴近用户目标 (不再像旧版那样每段都向下缩水 4 帧)
 
     返回 (chunks, seg_sizes)
     - chunks: [(start, end), ...] 名义累积坐标
     - seg_sizes: [seg_size, ...] 实际生成帧数
     """
-    seg_sizes = []
-    for i, target in enumerate(seg_target_frames_list):
-        if i == 0:
-            size = snap_to_grid_nearest(max(5, target))
-        else:
-            size = snap_to_grid_nearest(max(5, target + context_frames))
-        seg_sizes.append(size)
+    targets = [max(5, int(t)) for t in seg_target_frames_list]
+    n = len(targets)
+    if n == 0:
+        return [], []
+
+    # 各段"新增帧数" (merge 后实际保留的帧数)
+    new_frames = [snap_to_grid_nearest(targets[0])]
+    for t in targets[1:]:
+        new_frames.append(_snap_to_17_multiple_nearest(t))
+
+    target_total = sum(targets)
+    total_new = sum(new_frames)
+    diff = target_total - total_new
+
+    # 从未段起逐段 ±17 帧补偿总时长 (17 帧粒度，保持首段 17n+5 / 非首段 17 倍数)
+    if diff != 0 and n >= 2:
+        k = int(round(diff / 17.0))
+        step = 17 if k > 0 else -17
+        idx = n - 1
+        remaining = abs(k)
+        while remaining > 0 and idx >= 0:
+            if new_frames[idx] + step >= 5:
+                new_frames[idx] += step
+                remaining -= 1
+            idx -= 1
+        total_new = sum(new_frames)
+
+    seg_sizes = [new_frames[0]]
+    for i in range(1, n):
+        seg_sizes.append(new_frames[i] + context_frames)
 
     chunks = []
     start = 0
     for s in seg_sizes:
         chunks.append((start, start + s))
         start += s
+
+    print(f"[H3-Auto] Clip_Tag 分块: 目标总帧数={target_total} "
+          f"实际总新增={total_new} (偏差 {total_new - target_total:+d}帧)")
 
     return chunks, seg_sizes
 

@@ -348,7 +348,9 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
                                 clip_mode="Clip_Frame", clip_tag="段1",
                                 crop_mode="stretch", ref_sync_mode="global",
                                 decode_output=False,
-                                drive_audio=None, audio_drive=False):
+                                drive_audio=None, audio_drive=False,
+                                latent_input=None, sigmas=None, denoise=1.0,
+                                lock_audio=True, sampler=None):
     h3_patches.apply_patches()
 
     device = comfy.model_management.get_torch_device()
@@ -406,8 +408,34 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
               f"全局段(前={bool(prompt_schedule['prefix'])} 后={bool(prompt_schedule['suffix'])})")
     else:
         prompt_schedule = None
-    latent_w = width // SPATIAL_COMPRESSION
-    latent_h = height // SPATIAL_COMPRESSION
+    # 二采：空间分辨率以输入 latent 为准 (忽略 widget width/height，社区一采低清二采高清)
+    is_second_pass = latent_input is not None
+    if is_second_pass:
+        v_in, _ = h3_conditioning.unpack_nested_latent(latent_input)
+        if v_in is None:
+            print("[H3-Auto] 警告: latent_input 无视频 latent，回退一采")
+            is_second_pass = False
+            latent_w = width // SPATIAL_COMPRESSION
+            latent_h = height // SPATIAL_COMPRESSION
+        else:
+            latent_w = int(v_in.shape[4])
+            latent_h = int(v_in.shape[3])
+            # H3 patch_size=(1,2,2) 要求空间偶数；奇数时 pad 到偶数，否则段间续接 keyframe 的 patchify 会崩溃
+            if latent_w % 2 != 0 or latent_h % 2 != 0:
+                print(f"[H3-Auto] 警告: 输入 latent 尺寸 {latent_w}x{latent_h} 为奇数，"
+                      f"H3 需偶数 (patch_size=2)。已 pad 到 "
+                      f"{latent_w + (latent_w % 2)}x{latent_h + (latent_h % 2)}；"
+                      f"建议改用 32 对齐分辨率 (如 1920x1088)")
+                latent_input = _pad_latent_spatial_even(latent_input)
+                v_in, _ = h3_conditioning.unpack_nested_latent(latent_input)
+                latent_w = int(v_in.shape[4])
+                latent_h = int(v_in.shape[3])
+            width = latent_w * SPATIAL_COMPRESSION
+            height = latent_h * SPATIAL_COMPRESSION
+            print(f"[H3-Auto] 二采模式: 空间分辨率以输入 latent 为准 {width}x{height}")
+    else:
+        latent_w = width // SPATIAL_COMPRESSION
+        latent_h = height // SPATIAL_COMPRESSION
 
     if first_frame is not None or last_frame is not None:
         print("[H3-Auto] 正在 VAE 编码首/尾帧...")
@@ -465,8 +493,19 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
         print("[H3-Auto] 提示: drive_audio 已连接但 audio_drive=disable，未启用音频锁定。"
               "如需让 audio 端口输出源音频，请把 audio_drive 设为 enable")
 
+    # 二采：把一采 merged latent 逆向切成逐段完整 latent (段间重叠头用前段尾部重建)
+    first_pass_segments = None
+    if is_second_pass:
+        first_pass_segments = _split_first_pass_latent(
+            latent_input, seg_sizes, effective_context, fps)
+        if first_pass_segments is None or len(first_pass_segments) != len(chunks):
+            print("[H3-Auto] 错误: 二采切分失败 (输入 latent 与分段账目不匹配)，回退一采")
+            is_second_pass = False
+            first_pass_segments = None
+
     all_segments = []
-    prev_segment = None
+    all_x0 = []
+    prev_x0 = None
     output_cursor = 0  # 累积"新增输出"帧数，用于音频驱动按输出时间轴切片
 
     overall_pbar = comfy.utils.ProgressBar(len(chunks) * (2 if decode_output else 1))
@@ -477,13 +516,20 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
         is_last_chunk = (idx == len(chunks) - 1)
         seg_frames = end_f - start_f
 
+        # 段间续接锚定用上一段的干净 x0 预测 (含残余噪声的 samples 不能直接当 keyframe)
+        anchor_prev = None
+        if not is_first_chunk:
+            anchor_prev = prev_x0
+
         account = f"帧数={seg_frames}"
         if not is_first_chunk:
             account += f" (锚定={effective_context} + 新增={seg_frames - effective_context})"
         print(f"[H3-Auto] 生成段 {idx+1}/{len(chunks)} (帧{start_f}-{end_f}) {account}")
 
         if is_tag_mode:
-            seg_text, seg_seconds = tag_segments[idx]
+            seg_text, _ = tag_segments[idx]
+            # 用实际新增帧数渲染时间，保证提示词时间坐标与实际产出帧数一致 (总时长补偿后)
+            seg_seconds = new_frames[idx] / fps
             window_prompt = h3_utils.render_tag_segment(
                 seg_text, seg_seconds, prompt_format, tag_prefix)
         else:
@@ -514,7 +560,7 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
             seed=seed + idx, frame_count=seg_frames,
             first_latent=first_latent if is_first_chunk else None,
             last_latent=last_latent if is_last_chunk else None,
-            prev_segment=prev_segment if not is_first_chunk else None,
+            prev_segment=anchor_prev,
             context_frames=effective_context, fps=fps,
             ref_img_data=seg_ref_img,
             ref_vid_data=seg_ref_vid,
@@ -530,7 +576,7 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
         positive = h3_conditioning.inject_conditioning_data(positive, payload)
 
         drive_aud_latent = None
-        if drive_waveform is not None:
+        if drive_waveform is not None and not is_second_pass:
             # 本段锁定的音频对应输出时间轴 [gen_start, gen_end)，含非首段的续接重演头
             gen_start = output_cursor - (effective_context if not is_first_chunk else 0)
             gen_end = gen_start + seg_frames
@@ -539,19 +585,31 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
             if drive_aud_latent is None:
                 print(f"[H3-Auto] 段 {idx+1}/{len(chunks)}: drive_audio 切片为空，本段不锁定音频")
 
-        latent_input = _make_h3_empty_latent(
-            latent_w, latent_h, seg_frames, fps, drive_audio_latent=drive_aud_latent)
+        if is_second_pass:
+            seg_latent_dict = first_pass_segments[idx]
+            if lock_audio:
+                seg_latent_dict = _with_locked_audio(seg_latent_dict)
+        else:
+            seg_latent_dict = _make_h3_empty_latent(
+                latent_w, latent_h, seg_frames, fps, drive_audio_latent=drive_aud_latent)
 
         segment_latent = _sample_segment(
-            model, positive, latent_input, steps, cfg,
-            sampler_name, scheduler, seed + idx)
+            model, positive, seg_latent_dict, steps, cfg,
+            sampler_name, scheduler, seed + idx,
+            denoise=denoise, sigmas=sigmas,
+            sampler_obj=sampler)
 
-        prev_segment = segment_latent
-        all_segments.append(segment_latent)
+        samples_dict = {"samples": segment_latent["samples"]}
+        x0 = segment_latent.get("x0")
+        x0_dict = {"samples": x0} if x0 is not None else samples_dict
+        prev_x0 = x0_dict
+        all_segments.append(samples_dict)
+        all_x0.append(x0_dict)
         output_cursor += new_frames[idx]
         overall_pbar.update(1)
 
     final_latent = _merge_segment_latents(all_segments, effective_context, fps)
+    final_denoised = _merge_segment_latents(all_x0, effective_context, fps)
 
     # 音频驱动模式：提前准备好"无损源音频" (裁齐到总时长)，供 audio 端口直接输出。
     # 无论 decode_output 是否开启，audio 端口都返回源音频本身，绕过 VAE 有损往返。
@@ -566,7 +624,7 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
     if not decode_output:
         print("[H3-Auto] decode_output=disable，跳过内部解码，仅输出 latent"
               + (" (音频驱动: audio 端口输出源音频)" if drive_final_audio is not None else ""))
-        return None, drive_final_audio, final_latent
+        return None, drive_final_audio, final_latent, final_denoised
 
     print("[H3-Auto] 开始逐段 VAE 解码与拼接...")
     all_pixels, all_waveforms = [], []
@@ -603,7 +661,7 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
         final_audio = _crossfade_audio(all_waveforms, head_trims, effective_context,
                                        total_frames, fps)
 
-    return final_pixels, final_audio, final_latent
+    return final_pixels, final_audio, final_latent, final_denoised
 
 
 def _prepare_ref_images(ref_images, vae, device, gen_w, gen_h, crop_mode="stretch"):
@@ -935,27 +993,209 @@ def _make_h3_empty_latent(latent_w, latent_h, pixel_frames, fps, drive_audio_lat
     return result
 
 
-def _sample_segment(model, positive, latent_dict, steps, cfg, sampler_name, scheduler, seed):
-    """采样一段 latent"""
+def _sample_segment(model, positive, latent_dict, steps, cfg, sampler_name, scheduler, seed,
+                    denoise=1.0, sigmas=None, sampler_obj=None):
+    """采样一段 latent。denoise<1 或 sigmas 非空时作为二采 (img2img 从 latent_dict 起步)。
+
+    - sampler_obj: 外部 SAMPLER 对象 (可选)，覆盖内置 sampler_name/scheduler
+    """
     import latent_preview
 
     latent_tensor = latent_dict["samples"]
     noise = comfy.sample.prepare_noise(latent_tensor, seed)
-    sampler = comfy.samplers.KSampler(
-        model, steps=steps, device=model.load_device,
-        sampler=sampler_name, scheduler=scheduler,
-        denoise=1.0, model_options=model.model_options)
 
-    callback = latent_preview.prepare_callback(model, steps)
+    # sigma 优先级最高：传入 sigmas 时接管采样序列；denoise≠1 则 final_sigmas = sigmas * denoise
+    use_custom_sigmas = sigmas is not None
+    kdenoise = denoise
+    if use_custom_sigmas:
+        kdenoise = 1.0
+        if denoise is not None and denoise < 0.9999:
+            sigmas = sigmas * denoise
+
+    # sigmas 传入时 steps 失效：预览步数用 sigma 长度，采样步数完全由 sigmas 决定
+    n_steps = max(1, int(len(sigmas)) - 1) if use_custom_sigmas else steps
+    x0_output = {}
+    callback = latent_preview.prepare_callback(model, n_steps, x0_output)
     disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
 
     negative = []
-    samples = sampler.sample(
-        noise, positive, negative, cfg=cfg, latent_image=latent_tensor,
-        force_full_denoise=True, start_step=0, last_step=steps,
-        denoise_mask=latent_dict.get("noise_mask"),
-        callback=callback, disable_pbar=disable_pbar)
-    return {"samples": samples}
+    denoise_mask = latent_dict.get("noise_mask")
+
+    if sampler_obj is not None:
+        # 外部 SAMPLER 对象 (SamplerCustom 同款)，需显式 sigmas
+        if sigmas is None:
+            _ks = comfy.samplers.KSampler(
+                model, steps=steps, device=model.load_device,
+                sampler=sampler_name, scheduler=scheduler,
+                denoise=denoise, model_options=model.model_options)
+            sigmas = _ks.sigmas
+        samples = comfy.sample.sample_custom(
+            model, noise, cfg, sampler_obj, sigmas, positive, negative, latent_tensor,
+            noise_mask=denoise_mask, callback=callback, disable_pbar=disable_pbar, seed=seed)
+    else:
+        sampler = comfy.samplers.KSampler(
+            model, steps=steps, device=model.load_device,
+            sampler=sampler_name, scheduler=scheduler,
+            denoise=kdenoise, model_options=model.model_options)
+        if use_custom_sigmas:
+            samples = sampler.sample(
+                noise, positive, negative, cfg=cfg, latent_image=latent_tensor,
+                force_full_denoise=True,
+                denoise_mask=denoise_mask,
+                sigmas=sigmas, callback=callback, disable_pbar=disable_pbar)
+        else:
+            samples = sampler.sample(
+                noise, positive, negative, cfg=cfg, latent_image=latent_tensor,
+                force_full_denoise=True, start_step=0, last_step=steps,
+                denoise_mask=denoise_mask,
+                callback=callback, disable_pbar=disable_pbar)
+
+    # 提取最后一步去噪预测 x0 (干净内容)：含残余噪声的 samples 不能直接当段间 keyframe
+    x0 = x0_output.get("x0")
+    if x0 is not None:
+        if hasattr(samples, "is_nested") and samples.is_nested \
+                and not getattr(x0, "is_nested", False):
+            latent_shapes = [t.shape for t in samples.unbind()]
+            try:
+                x0 = comfy.nested_tensor.NestedTensor(
+                    comfy.utils.unpack_latents(x0, latent_shapes))
+            except Exception:
+                pass
+        # x0 需 process_latent_out (H3 音频流除以 audio_scale)，与 SamplerCustomAdvanced 的 denoised_output 一致
+        try:
+            x0 = model.model.process_latent_out(x0.cpu())
+        except Exception:
+            pass
+    return {"samples": samples, "x0": x0}
+
+
+def _pad_latent_spatial_even(latent_dict):
+    """把 latent 的 video 区 H/W pad 到偶数 (H3 patch_size=(1,2,2) 要求)。
+
+    主 latent 进入模型时会被 ComfyUI pad_to_patch_size 自动补偶，
+    但段间续接 keyframe 走 _cond_video_rows 不 pad，奇数会 patchify 崩溃；
+    因此二采入口先对齐，保证 keyframe 与主 latent 一致。
+    """
+    v_lat, a_lat = h3_conditioning.unpack_nested_latent(latent_dict)
+    if v_lat is None:
+        return latent_dict
+    h, w = int(v_lat.shape[3]), int(v_lat.shape[4])
+    if h % 2 == 0 and w % 2 == 0:
+        return latent_dict
+    v_pad = torch.nn.functional.pad(v_lat, (0, w % 2, 0, h % 2))
+    if a_lat is not None:
+        try:
+            combined = comfy.nested_tensor.NestedTensor((v_pad, a_lat))
+        except Exception:
+            combined = (v_pad, a_lat)
+    else:
+        combined = v_pad
+    result = dict(latent_dict)
+    result["samples"] = combined
+    return result
+
+
+def _with_locked_audio(latent_dict):
+    """二采锁定音频区：noise_mask video=1 (正常去噪) / audio=0 (原样保留一采音频)。"""
+    samples = latent_dict.get("samples")
+    if samples is None:
+        return latent_dict
+    if hasattr(samples, "is_nested") and samples.is_nested:
+        tensors = list(samples.unbind())
+    elif isinstance(samples, (list, tuple)):
+        tensors = list(samples)
+    else:
+        tensors = [samples]
+    masks = []
+    for t in tensors:
+        if t.dim() == 5:
+            masks.append(torch.ones_like(t))
+        else:
+            masks.append(torch.zeros_like(t))
+    try:
+        combined = comfy.nested_tensor.NestedTensor(tuple(masks))
+    except Exception:
+        combined = tuple(masks)
+    result = dict(latent_dict)
+    result["noise_mask"] = combined
+    return result
+
+
+def _split_first_pass_latent(merged_latent, seg_sizes, effective_context, fps):
+    """把 merged latent 逆向切成逐段完整 latent (二采起点)，与 _merge_segment_latents 严格互逆。
+
+    merge 时非首段裁掉头部 n_i 个 token (重叠区)，这里用前段尾部 n_i 个 token 重建该头，
+    再拼上 merged 中本段新增部分。返回 [{"samples": NestedTensor}, ...] 或 None (账目不匹配)。
+    """
+    v_all, a_all = h3_conditioning.unpack_nested_latent(merged_latent)
+    if v_all is None:
+        return None
+
+    n_seg = len(seg_sizes)
+    seg_v_tokens = [video_latent_frames(s) for s in seg_sizes]
+    seg_a_tokens = [audio_latent_frames(s, fps) for s in seg_sizes]
+
+    ctx_v = video_latent_frames(effective_context) if effective_context > 5 else 2
+    ctx_v = max(2, ctx_v)
+    ctx_a = max(1, int(effective_context / fps * AUDIO_LATENTS_PER_SEC))
+
+    # 账目校验：merged 各 token 数必须等于各段 (裁重叠后) 之和，否则 info/分段与输入 latent 不一致
+    expected_v = seg_v_tokens[0] + sum(
+        seg_v_tokens[i] - min(ctx_v, seg_v_tokens[i] - 2) for i in range(1, n_seg))
+    if int(v_all.shape[2]) != expected_v:
+        print(f"[H3-Auto] 二采切分失败: 视频 token 数 {int(v_all.shape[2])} ≠ 账目 {expected_v}")
+        return None
+    if a_all is not None:
+        expected_a = seg_a_tokens[0] + sum(
+            seg_a_tokens[i] - min(ctx_a, seg_a_tokens[i] - 1) for i in range(1, n_seg))
+        if int(a_all.shape[-1]) != expected_a:
+            print(f"[H3-Auto] 二采切分失败: 音频 token 数 {int(a_all.shape[-1])} ≠ 账目 {expected_a}")
+            return None
+
+    seg_v_lats = []
+    v_cursor = 0
+    for i in range(n_seg):
+        v_t = seg_v_tokens[i]
+        if i == 0:
+            seg = v_all[:, :, v_cursor:v_cursor + v_t, :, :]
+            v_cursor += v_t
+        else:
+            n_i = min(ctx_v, v_t - 2)
+            head = v_all[:, :, v_cursor - n_i:v_cursor, :, :]
+            body = v_all[:, :, v_cursor:v_cursor + (v_t - n_i), :, :]
+            seg = torch.cat([head, body], dim=2)
+            v_cursor += (v_t - n_i)
+        seg_v_lats.append(seg)
+
+    seg_a_lats = [None] * n_seg
+    if a_all is not None:
+        a_cursor = 0
+        for i in range(n_seg):
+            a_t = seg_a_tokens[i]
+            if i == 0:
+                seg = a_all[..., a_cursor:a_cursor + a_t]
+                a_cursor += a_t
+            else:
+                n_a = min(ctx_a, a_t - 1)
+                head = a_all[..., a_cursor - n_a:a_cursor]
+                body = a_all[..., a_cursor:a_cursor + (a_t - n_a)]
+                seg = torch.cat([head, body], dim=-1)
+                a_cursor += (a_t - n_a)
+            seg_a_lats[i] = seg
+
+    result = []
+    for i in range(n_seg):
+        v = seg_v_lats[i]
+        a = seg_a_lats[i]
+        if a is not None:
+            try:
+                combined = comfy.nested_tensor.NestedTensor((v, a))
+            except Exception:
+                combined = (v, a)
+        else:
+            combined = v
+        result.append({"samples": combined})
+    return result
 
 
 def _crossfade_audio(all_waveforms, head_trims, context_frames, total_frames, fps):
