@@ -7,18 +7,31 @@
 
 # ComfyUI_MinimaxH3_AutoContext
 
-> 一键式 MiniMax H3 长视频自动化生成节点：**分段推理 + 段间续接锚定 + 提示词时间轴切片**。
+> 一键式 MiniMax H3 长视频自动化生成节点：**分段推理 + 段间续接锚定 + 提示词时间轴切片 + 二次采样（二采）+ 接缝修正**。
 
-在显存有限的情况下，将长视频拆分为多段独立推理，通过多帧 keyframe 锚定实现段间无缝衔接，同时按时间轴自动切分提示词，让每段生成内容 与提示词节奏对齐。
+在显存有限的情况下，将长视频拆分为多段独立推理，通过多帧 keyframe 锚定实现段间无缝衔接，同时按时间轴自动切分提示词，让每段生成内容与提示词节奏对齐。支持二采（低清一采 + 高清二采）提升人脸/细节清晰度。
 
 ## 📖 目录
 
+- [节点列表](#nodes)
 - [核心特性](#features)
 - [安装](#install)
 - [节点参数](#params)
 - [输出](#output)
+- [二采与 SplitSigmas 高低频](#second-pass)
+- [接缝修正节点](#seam)
 - [提示词写法示例](#prompt-examples)
 - [提示词注意事项（节点的局限性）](#limitations)
+
+## <a id="nodes"></a> 🧩 节点列表
+
+| 节点 | 说明 |
+|------|------|
+| **Minimax_H3_AutoContext_parameter** | 参数组节点：集中管理提示词/分段/分辨率/音频等参数，输出 `parameter`，并实时预览「预计分段」 |
+| **Minimax_H3_AutoContext_Sampler** | 主节点：分段推理 + 续接锚定 + 采样（一采/二采共用） |
+| **Minimax_H3_Seam_Correction** | 接缝修正节点：对解码后视频的段间接缝做像素域修正 |
+
+> 用法：`parameter 节点 --parameter--> 主节点`。提示词在 parameter 节点填写，主节点通过 `parameter`（必选）接收。
 
 ## <a id="features"></a> ✨ 核心特性
 
@@ -35,6 +48,12 @@
 - 模型看到真实运动序列而非单张静帧，正确延续运动方向与速度
 - 上下文音频通过 ref 通道传入（不插入 `<Audio j>` 标签），模型视为"之前的内容"而非参考素材
 - 段间音频 cosine 交叉淡化，与视频帧数严格对齐
+
+> 📐 **帧数账目**（H3 17n+5 网格）：
+> - 首段 = `17n+5`（含 5 帧"引子"）
+> - 非首段**新增帧数 = 17 的倍数**（如 68/85，是段中后部的"纯珠串"，无引子）
+> - `context_frames`（续接锚定）必须是 `17n+5` 形式（5/22/39/56…）
+> - 整条 latent 时间轴 = 引子(5) + N 串(17n)，整体满足 17n+5
 
 ### ⏱️ 提示词时间轴
 
@@ -53,98 +72,129 @@
   2. 段内时间标记的最大结束值（如 `【0-2秒】`+`【2-5秒】` → 5 秒）
   3. `chunk_frames / fps` 默认值兜底
 - 段内时间标记是**相对时间**（每段从 0 开始），不是全局绝对时间
-- 续接锚定补偿：非首段多生成 `context_frames` 帧用于头部锚定，生成后自动裁掉，保证段间连续
-- 推理时标签本身会被去除，其余提示词内容根据 `prompt_format` 输出：
-  - `official` / `legacy`：时间坐标自动转为段内相对
-  - `raw`：去标签后原样输出，不做任何转换
+- 续接锚定补偿：非首段多生成 `context_frames` 帧用于头部锚定，生成后自动裁掉
+- 总时长锚定：各段新增帧数之和与目标总帧数之差按 17 帧粒度从末段起补偿，尽量贴近目标总时长
+- 推理时标签本身会被去除，其余提示词内容根据 `prompt_format` 输出
 
 ### 🎯 参考智能过滤（图 / 视频 / 音频）
 
-- 解析每段提示词中的引用（`image1`/`image 1`/`图像1`/`图片1`、`视频1`、`音频1`/`audio 1`，以及原生 `<Picture N>`/`<Video N>`/`<Audio N>`，1 基），只传被引用的参考给当前段
-- 编号自动重映射为连续序号，与模型原生 `<Picture N>`/`<Video N>`/`<Audio N>` 标签对齐
-- 视频与其配对音轨绑定；音轨与独立音频按官方规则统一计数为 `<Audio N>`（音轨在前）
+- 解析每段提示词中的引用，只传被引用的参考给当前段
+- 编号自动重映射为连续序号，与模型原生标签对齐
+- 视频与其配对音轨绑定；音轨与独立音频统一计数为 `<Audio N>`
 - 避免所有参考同时传入导致的画面/声音串扰
 
-### 📐 动态端口（Autogrow）
+### 🖌️ 二次采样（二采）
 
-- 默认只显示 `_0` 端口，连接后才显示 `_1`，以此类推
-- 支持：参考图片（0-9）、参考视频（0-3）、参考视频配对音轨（0-3）、独立参考音频（0-3）
-- `first_frame` / `last_frame` 始终显示（用于 FL2VA 首尾帧锚定模式）
+- 主节点 `latent_input` 接入一采 latent（或经 latent 放大节点）即进入二采模式
+- 二采空间分辨率**以输入 latent 为准**（忽略 parameter 的 width/height），实现低清一采 → 高清二采
+- `denoise` 控制重绘强度；`sigmas` 支持自定义 sigma 序列（与 `SamplerCustomAdvanced` 同款）
+- `lock_audio` 锁住音频区（noise_mask audio=0），二采只重画 video、复用一采音频
 
-### 🎵 音频驱动（Audio Drive，参考音频驱动视频）
+### 🎵 音频驱动（Audio Drive）
 
-- 新增 `drive_audio`（AUDIO，可选）输入 + `audio_drive`（disable/enable，默认 disable）开关
-- 开启后：把 `drive_audio` 编码后锁进 latent 的音频半区，并设 `noise_mask`（视频=1 正常去噪、音频=0 不重新生成），让视频生成被这条音频"驱动"（口型/节奏对齐），同时**输出音频 = `drive_audio` 本身**（无损，绕过 VAE 往返）
-  - `ref_audio_0` 负责语义驱动，`drive_audio` 负责锁定输出
-- 每段按输出时间轴切片源音频（含非首段续接重演头），段间拼接后与视频逐帧对齐
-- 源音频短于目标时长时自动补零，长于时自动截断
-
-### 🔧 其他
-
-- 节点进度条与预览图实时显示
-- PackedLayout 时间坐标修正：keyframe 的 `cond_t` 基于视频段实际起始坐标，而非 text_len
-- extra_conds 拼接修复：keyframe cond rows 与 ref rows 拼接而非覆写
+- `drive_audio`（AUDIO，可选）+ `audio_drive` 开关
+- 开启后把 `drive_audio` 锁进 latent 音频半区（noise_mask audio=0），视频被音频驱动，输出音频 = 源音频本身
 
 ## <a id="install"></a> 📦 安装
 
 ### 方式一：手动安装（Manual Installation）
 
-进入 `./ComfyUI/custom_nodes` 目录，运行：
-
 ```bash
+cd ./ComfyUI/custom_nodes
 git clone https://github.com/supElement/ComfyUI_MinimaxH3_AutoContext.git
 ```
 
 ### 方式二：通过 Manager 安装（Install using Manager）
 
-在 ComfyUI Manager 中搜索 `ComfyUI_MinimaxH3_AutoContext`，然后点击 Install。
+在 ComfyUI Manager 中搜索 `ComfyUI_MinimaxH3_AutoContext`，点击 Install。
 
-> **依赖**：`torchaudio`（用于音频重采样，可选）。
 
 ## <a id="params"></a> ⚙️ 节点参数
 
+### Minimax_H3_AutoContext_parameter（参数组节点）
+
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| **模型组件** | | |
-| model / vae / audio_vae / clip | — | MiniMax H3 模型组件 |
-| **关键帧与提示词** | | |
-| first_frame | 可选 | 首帧锚定（FL2VA 模式） |
-| last_frame | 可选 | 尾帧锚定（FL2VA 模式） |
-| long_prompt | — | 长提示词，支持时间标记分段 |
-| clip_mode | Clip_Frame | 分段模式：Clip_Frame（按帧均匀切）/ Clip_Tag（按自定义标签切分） |
-| clip_tag | 段1 | Clip_Tag 模式的分割标签模板，必须以数字序号结尾（如 `段1`/`A01`/`[片段001]`） |
+| long_prompt | — | 提示词（传给主节点推理，同时用于「预计分段」预览） |
 | prompt_mode | auto | 提示词时间轴模式（仅 Clip_Frame 生效） |
-| prompt_format | official | 提示词输出格式：official / legacy / raw（raw 为 Clip_Tag 专用，原样输出） |
-| **画面处理** | | |
-| crop_mode | stretch | 参考图/首尾帧/参考视频的缩放裁剪：center（等比缩放到最短边并中心裁剪）/ stretch（直接拉伸）/ none（保持原始分辨率，仅 32 对齐，高级用户） |
-| ref_sync_mode | global | 参考视频/音频是否按段切片：global（每段用完整参考）/ segmented（每段取对应时间片段，用于口型同步） |
-| decode_output | disable | 是否内部解码：disable（默认，只输出 latent）/ enable（输出 image+audio+latent） |
-| **生成参数** | | |
-| width × height | 960×544 | 生成分辨率 |
-| total_frames | 362 | 生成总帧数（需满足 17n+5，约 15s@24fps），Clip_Tag 模式下被各段之和覆盖 |
-| fps | 24 | 帧率，仅用于音频同步和提示词内秒数换算 |
-| chunk_frames | 90 | 每段生成帧数（需满足 17n+5，约 3.75s@24fps），Clip_Tag 模式下作为时长兜底默认值 |
-| context_frames | 22 | 段间续接帧数，值越大连续性越强 |
-| steps / cfg / sampler / scheduler | 30 / 1.0 / euler / simple | 采样参数 |
-| seed | 0 | 随机种子 |
-| **参考素材** | | |
-| ref_image_N | 可选 | 参考图片（提示词中用 `image1`/`image 1`/`图像1`/`图片1` 或 `<Picture N>` 引用，1 基） |
-| ref_video_N | 可选 | 参考视频帧 |
-| ref_video_audio_N | 可选 | 同编号参考视频的配对音轨 |
-| ref_audio_N | 可选 | 独立参考音频 |
-| **音频驱动** | | |
-| drive_audio | 可选 | 音频驱动源（要锁定的源音频），配合 `audio_drive=enable` 使用 |
-| audio_drive | disable | 音频驱动开关：enable 时锁定 `drive_audio`（noise_mask=0），输出音频=源音频本身 |
+| clip_mode | Clip_Frame | 分段模式：Clip_Frame / Clip_Tag |
+| clip_tag | 段1 | Clip_Tag 分割标签模板（必须以数字序号结尾） |
+| prompt_format | official | 提示词输出格式：official / legacy / raw |
+| crop_mode | stretch | 参考图/首尾帧/参考视频缩放裁剪：center / stretch / none |
+| ref_sync_mode | segmented | 参考视频/音频是否按段切片：global / segmented |
+| width × height | 960×544 | 一采分辨率（二采时被 latent_input 覆盖） |
+| total_frames | 362 | 生成总帧数（17n+5），Clip_Tag 下被各段之和覆盖 |
+| fps | 24 | 帧率，用于音频同步和提示词秒数换算 |
+| chunk_frames | 90 | 每段生成帧数（17n+5） |
+| context_frames | 22 | 段间续接帧数（17n+5：5/22/39/56…） |
+| lock_audio | enable | 锁定音频区，只重画 video |
+| audio_drive | disable | 音频驱动开关 |
+| decode_output | disable | 是否内部解码 |
+
+> 节点上实时显示「预计分段」预览（前端 JS 计算，不参与推理）。
+
+### Minimax_H3_AutoContext_Sampler（主节点）
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| model / vae / audio_vae / clip | — | MiniMax H3 模型组件 |
+| parameter | 必选 | 参数组输入（来自 parameter 节点） |
+| sampler | 可选 | 外部采样器对象（SAMPLER），覆盖内置 sampler_name/scheduler |
+| sigmas | 可选 | 自定义 sigma 序列（SIGMAS），优先级最高 |
+| latent_input | 可选 | 二采输入 latent（接入即开启二采） |
+| info | 可选 | 参数继承输入（多采串联，保证分段一致） |
+| first_frame / last_frame | 可选 | 首/尾帧锚定（FL2VA） |
+| seed | 0 | 随机种子（control_after_generate） |
+| steps / cfg | 30 / 1.0 | 采样步数 / CFG |
+| sampler_name / scheduler | euler / simple | 内置采样器 / 调度器 |
+| denoise | 1.0 | 重绘强度（接 sigmas 且 ≠1 时 final_sigmas = sigmas×denoise） |
+| ref_image_N / ref_video_N / ref_video_audio_N / ref_audio_N | 可选 | 参考素材（Autogrow 动态端口） |
+| drive_audio | 可选 | 音频驱动源 |
 
 ## <a id="output"></a> 📤 输出
 
 | 输出 | 说明 |
 |------|------|
-| **video_frames** | 拼接后的完整视频帧序列（内部解码，段间裁剪对齐） |
+| **video_frames** | 拼接后的完整视频帧序列（`decode_output=enable` 时） |
 | **audio** | 拼接后的音频（段间 cosine 交叉淡化） |
-| **latent** | 音视频共用 latent（NestedTensor），裁掉段间重演区后拼接，可用 ComfyUI 原生 VAE Decode 解码 |
+| **latent** | 音视频共用 latent（NestedTensor），裁掉段间重演区后拼接 |
+| **denoised_latent** | 干净 x0 预测（merge 后），用于二采接力 / 预览 |
+| **info** | 分段参数（Dict），传给下一个主节点的 info 输入，保证多采分段一致 |
 
-> 💡 **推荐用法**：`latent → VAE Decode` 得到视频，`latent → VAE audio Decode`，若音频有问题，可以尝试 `audio` 端口输出音频。
+> 💡 **推荐用法**：`latent → VAE Decode` ；二采时 `latent / denoised_latent → 放大 → 二采节点`。
+
+## <a id="second-pass"></a> 🔄 二采与 SplitSigmas 高低频
+
+### 基础二采（低清一采 → 高清二采）
+
+```
+parameter 节点 ──parameter──> 主节点(一采, 864×480)
+    └─ latent / denoised_latent ──> [分离 AV] ──> video_latent ──> latent 放大 ──> [合并 AV] ──> 主节点(二采).latent_input
+二采节点: parameter 共用 (或 info 继承)，可选 denoise 0.4~0.6
+```
+
+- 二采分辨率以 `latent_input` 为准，忽略 parameter 的 width/height
+
+### SplitSigmas 高低频（省时间提清晰度）
+
+> ⚠️ **audio 约束**：分段节点的 audio 段间 ref 锚定在「停在中间 sigma」下会失效（半成品），所以高低频**只对 video 生效**。audio 必须完整采样。
+
+```
+一采节点: 完整采样 (不接 high_sigmas，audio 完整去噪)
+          → denoised_latent → 分离放大 video (audio 不动) → 合并 → 二采.latent_input
+二采节点: sigmas ← low_sigmas (只跑低 sigma 段提细节)
+          lock_audio = True (复用一采完整音频)
+```
+
+## <a id="seam"></a> 🧵 接缝修正节点（Minimax_H3_Seam_Correction）
+
+- 输入 `images`（解码后的完整视频帧），输出修正后的 `images`
+- 自动检测段间接缝（帧间亮度跳变 + 局部峰值）
+- 分类：**场景切换 / 瞬态闪光 / 曝光渐变 / 运动卡顿**
+- 开关参数：`fix_flash` / `fix_exposure` / `fix_motion` / `fix_scene_cut` + `threshold` 检测阈值
+- 只对曝光/闪光类跳变做 `lerp` 过渡，场景切换默认不抹平
+
+> 用法：`VAE Decode → H3_Seam_Correction → Save/Video`。
 
 ## <a id="prompt-examples"></a> ✍️ 提示词写法示例
 
@@ -209,8 +259,6 @@ overall_soundscape
 - `official` / `legacy`：段内时间标记自动转为段内相对坐标渲染
 - `raw`：去标签后原样输出，时间标记保持不变（适合用大模型生成的结构化提示词）
 
-**续接补偿**：非首段多生成 `context_frames` 帧用于头部锚定（重演上一段尾部），生成后自动裁掉，保证段间连续无卡顿。实际输出时长 = 各段有效新增之和，运行日志会打印实际值。
-
 ## <a id="limitations"></a> 📝 提示词注意事项（节点的局限性）
 
 > 以下注意事项**不适用于**简单的、始终有效的提示词场景（即所有分段共用同一个提示词，global 模式），
@@ -221,7 +269,7 @@ overall_soundscape
 > 使用分段推理（Chunk）时，请务必遵守**时序排他性**原则——每一段提示词只能描述该段"正在发生"的、相对于上一段末尾的**新变化**。
 
 - **分段即"接力"**：第 N 段生成时，它的起始画面状态（位置、动作姿态、镜头位置）完全由上一段末尾的"锚定帧（Context Frames）"隐式提供。你不需要在提示词里重复描述这个起始状态。
-- **禁止"回叙"与"重叠"**：第 N 段的提示词绝对不可以重复描述第 N-1 段已经完成的动作或镜头运动。如果重复描述（比如上一段已经在"穿过"，这一段又写"正在穿过"），模型接收到的指令就会与锚定帧的画面产生逻辑冲突（即指令冲突），导致生成画面卡顿、运动逻辑错乱或动作重复。
+- **禁止"回叙"与"重叠"**：第 N 段的提示词绝对不可以重复描述第 N-1 段已经完成的动作或镜头运动。如果重复描述，模型接收到的指令就会与锚定帧的画面产生逻辑冲突（指令冲突），导致生成画面卡顿、运动逻辑错乱或动作重复。
 - **边界清零**：切换分段时，请把上一段的"正在进行的动作"清零。新的一段提示词，应当像"按下快门后的新指令"一样，仅针对当前新时间段内发生的位移、动作或新元素出现。
 
 **❌ 错误写法（冲突重叠）**
@@ -252,10 +300,8 @@ overall_soundscape
 
 > 使用分段推理并搭配参考图/视频（image1、video1 等）时，请务必遵守**逐段引用声明**原则——每一段提示词都必须独立且完整地声明该段所需要的全部引用素材，引用不会被"记忆"或"继承"到下一段。
 
-你可以把每一段推理理解为一次独立的"新会话"，而非连续的"上下文对话"：
-
-- **无全局记忆**：节点的工作机制是解析当前段提示词内写明的引用标签（如 image1），精准判断该段需要哪些素材。上一段提示词里写了 image1，只代表上一段调用了它；到了下一段，节点会清空上一段的引用列表，重新扫描新的提示词。
-- **不写则不传**：如果在第 N 段提示词中，你没有再次写明 image1，节点会认为该段完全不需要这张参考图，并且不会将它送入第 N 段的生成流程。这会导致第 N 段模型"忘记"物体 A 的长相，凭空自由发挥，造成角色/物体严重不一致。
+- **无全局记忆**：节点解析当前段提示词内写明的引用标签，精准判断该段需要哪些素材。上一段写了 image1，只代表上一段调用了它；到了下一段，会重新扫描。
+- **不写则不传**：如果第 N 段没再写 image1，该段就不会传入这张参考图，导致角色/物体不一致。
 
 **❌ 错误写法（隐式继承）**
 
@@ -264,13 +310,9 @@ overall_soundscape
 段2[3-6秒]：物体A停下，转身看向镜头。（没写 image1）
 ```
 
-> 问题分析：因为第 2 段没写 image1，节点过滤后只把纯文本送入模型。模型只知道要画一个"物体A"，但没有任何视觉参考，于是它会重新生成一个长相、颜色、质感都不同的物体，导致镜头切换瞬间出现"换人/换物" 的穿帮。
-
 **✅ 正确写法（逐段显式）**
 
 ```text
 段1[3秒]：image1 是物体A，物体A正在向前移动。
 段2[3-6]：image1 是物体A，物体A停下，转身看向镜头。
 ```
-
-> 正确逻辑：第 2 段开头必须重申 image1 是物体A，才能让节点把这个参考图再次传给第 2 段，确保两段里的物体的一致性。

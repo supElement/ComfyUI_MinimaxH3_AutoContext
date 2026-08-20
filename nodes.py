@@ -8,6 +8,9 @@ nodes.py - H3 Auto Context Sampler 节点定义
 - ref_audio_0 ~ ref_audio_3 (独立参考音频)
 
 默认只显示 _0 端口，连接后才显示 _1，以此类推。
+
+参数组 (分段/分辨率/音频等) 已拆分到 Minimax_H3_AutoContext_parameter 节点，
+通过 parameter (Dict) 单端口传入本节点；主节点只保留采样/提示词/参考素材相关输入。
 """
 
 from comfy_api.latest import io
@@ -57,38 +60,29 @@ _REF_SYNC_MODE_TOOLTIP = (
 )
 
 
-class H3AutoContextSampler(io.ComfyNode):
-    """一键式 MiniMax H3 长视频自动化生成节点 (分段推理 + 续接锚定)"""
+class H3ParameterNode(io.ComfyNode):
+    """H3 参数组节点：集中管理分段/分辨率/音频等参数，输出 parameter dict，并预览预计分段。"""
 
     @classmethod
     def define_schema(cls) -> io.Schema:
         return io.Schema(
-            node_id="H3AutoContextSampler",
-            display_name="Minimax_H3_AutoContext_Sampler",
+            node_id="H3Parameter",
+            display_name="Minimax_H3_AutoContext_parameter",
             category="MinimaxH3_AutoContext",
-            description="MiniMax H3 长视频分段推理：自动分段、段间续接锚定、提示词时间轴切片",
+            description="H3 参数组：集中管理分段/分辨率/音频等参数，输出 parameter 供主节点使用，并预览预计分段",
             inputs=[
-                io.Model.Input("model"),
-                io.Vae.Input("vae"),
-                io.Vae.Input("audio_vae"),
-                io.Clip.Input("clip"),
-
-                io.Image.Input("first_frame", optional=True,
-                    tooltip="首帧锚定 (FL2VA 模式)"),
-                io.Image.Input("last_frame", optional=True,
-                    tooltip="尾帧锚定 (FL2VA 模式)"),
-
                 io.String.Input("long_prompt", multiline=True, dynamic_prompts=True,
-                    socketless=False, default="一镜到底，平滑移动"),
+                    socketless=False, default="",
+                    tooltip="提示词 (传给主节点推理，同时用于「预计分段」预览)"),
+                io.Combo.Input("prompt_mode",
+                    options=["auto", "timeline", "global", "sequential"],
+                    default="auto", tooltip=_PROMPT_MODE_TOOLTIP),
                 io.Combo.Input("clip_mode",
                     options=["Clip_Frame", "Clip_Tag"],
                     default="Clip_Frame", tooltip=_CLIP_MODE_TOOLTIP),
                 io.String.Input("clip_tag", multiline=False, dynamic_prompts=True,
                     socketless=False, default="段1",
                     tooltip=_CLIP_TAG_TOOLTIP),
-                io.Combo.Input("prompt_mode",
-                    options=["auto", "timeline", "global", "sequential"],
-                    default="auto", tooltip=_PROMPT_MODE_TOOLTIP),
                 io.Combo.Input("prompt_format",
                     options=["official", "legacy", "raw"],
                     default="official",
@@ -111,6 +105,9 @@ class H3AutoContextSampler(io.ComfyNode):
                     tooltip="每段生成帧数，需满足 17n+5 (5,22,39,...)。设为 ≥ total_frames 时不拆分，整个视频作为一段生成"),
                 io.Int.Input("context_frames", default=22, min=5, max=124, step=1,
                     tooltip=_CONTEXT_FRAMES_TOOLTIP),
+                io.Boolean.Input("lock_audio",
+                    default=True,
+                    tooltip="二采时锁定音频区 (noise_mask audio=0)：只重新采样视频、保持一采音频不变。仅在连接 latent_input 时生效"),
                 io.Boolean.Input("audio_drive",
                     default=False,
                     tooltip="音频驱动开关。勾选后把 drive_audio 编码后锁进 latent (noise_mask=0，"
@@ -118,13 +115,73 @@ class H3AutoContextSampler(io.ComfyNode):
                             "不勾选 (默认): 与之前行为一致"),
                 io.Boolean.Input("decode_output",
                     default=False,
-                    tooltip="是否在节点内部解码输出 video_frames 和 audio。不勾选 (默认): 只输出 latent，用 ComfyUI 原生 VAE Decode 解码（画面连续性更好）; 勾选: 节点内部解码，输出 image+audio+latent"),
+                    tooltip="是否在节点内部解码输出 video_frames 和 audio。不勾选 (默认): 只输出 latent；勾选: 节点内部解码"),
+            ],
+            outputs=[
+                io.Dict.Output(display_name="parameter"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, long_prompt="", prompt_mode="auto",
+                clip_mode="Clip_Frame", clip_tag="段1",
+                prompt_format="official", crop_mode="stretch", ref_sync_mode="segmented",
+                width=960, height=544, total_frames=362, fps=24, chunk_frames=90,
+                context_frames=22, lock_audio=True, audio_drive=False,
+                decode_output=False) -> io.NodeOutput:
+        parameter = {
+            "long_prompt": long_prompt,
+            "prompt_mode": prompt_mode,
+            "clip_mode": clip_mode, "clip_tag": clip_tag,
+            "prompt_format": prompt_format, "crop_mode": crop_mode,
+            "ref_sync_mode": ref_sync_mode,
+            "width": width, "height": height, "total_frames": total_frames,
+            "fps": fps, "chunk_frames": chunk_frames, "context_frames": context_frames,
+            "lock_audio": lock_audio, "audio_drive": audio_drive,
+            "decode_output": decode_output,
+        }
+        return io.NodeOutput(parameter)
+
+
+class H3AutoContextSampler(io.ComfyNode):
+    """一键式 MiniMax H3 长视频自动化生成节点 (分段推理 + 续接锚定)"""
+
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="H3AutoContextSampler",
+            display_name="Minimax_H3_AutoContext_Sampler",
+            category="MinimaxH3_AutoContext",
+            description="MiniMax H3 长视频分段推理：自动分段、段间续接锚定、提示词时间轴切片",
+            inputs=[
+                io.Model.Input("model"),
+                io.Vae.Input("vae"),
+                io.Vae.Input("audio_vae"),
+                io.Clip.Input("clip"),
+
+                io.Dict.Input("parameter",
+                    tooltip="参数组输入 (必选，来自 Minimax_H3_AutoContext_parameter 节点)。提示词与分段/分辨率/音频参数均由此传入；info 中的分段参数优先于本参数组"),
+                io.Sampler.Input("sampler", optional=True,
+                    tooltip="外部采样器对象 (SAMPLER, 可选)。接入后覆盖内置 sampler_name/scheduler，与 SamplerCustom 同款接法"),
+                io.Sigmas.Input("sigmas", optional=True,
+                    tooltip="自定义 sigma 序列 (SIGMAS, 优先级最高, 与 SamplerCustomAdvanced 接法一致)。接入后接管采样 sigma；denoise≠1 时 final_sigmas=sigmas*denoise"),
+                io.Latent.Input("latent_input", optional=True,
+                    tooltip="二采输入 latent (可选)。接上一节点或 latent 放大节点输出的 latent 开启二次采样；空间分辨率以该 latent 为准，忽略 width/height"),
+                io.Dict.Input("info", optional=True,
+                    tooltip="参数继承输入 (来自上一个同款节点的 info 输出)。info 中存在的分段参数覆盖 parameter/本节点同名值，保证多节点分段一致 (二采/多采串联)"),
+                io.Image.Input("first_frame", optional=True,
+                    tooltip="首帧锚定 (FL2VA 模式)"),
+                io.Image.Input("last_frame", optional=True,
+                    tooltip="尾帧锚定 (FL2VA 模式)"),
+
+                io.Int.Input("seed", default=0, min=0, max=0xffffffffffffffff,
+                    control_after_generate=True),
                 io.Int.Input("steps", default=30, min=1, max=100, step=1),
                 io.Float.Input("cfg", default=1.0, min=0.0, max=30.0, step=0.1),
                 io.Combo.Input("sampler_name", options=_SAMPLERS, default="euler"),
                 io.Combo.Input("scheduler", options=_SCHEDULERS, default="simple"),
-                io.Int.Input("seed", default=0, min=0, max=0xffffffffffffffff,
-                    control_after_generate=True),
+                io.Float.Input("denoise", default=1.0, min=0.0, max=1.0, step=0.05,
+                    tooltip="重绘强度。1.0=全量重采样，越小保留越多原结构。连接 sigmas 且 denoise≠1 时 final_sigmas=sigmas*denoise"),
 
                 io.Autogrow.Input("ref_images", optional=True,
                     template=io.Autogrow.TemplatePrefix(
@@ -154,26 +211,68 @@ class H3AutoContextSampler(io.ComfyNode):
                 io.Image.Output(display_name="video_frames"),
                 io.Audio.Output(display_name="audio"),
                 io.Latent.Output(display_name="latent"),
+                io.Latent.Output(display_name="denoised_latent"),
+                io.Dict.Output(display_name="info"),
             ],
         )
 
     @classmethod
     def execute(cls, model, vae, audio_vae, clip,
+                parameter=None,
+                sigmas=None, latent_input=None, info=None,
                 first_frame=None, last_frame=None,
-                long_prompt="一镜到底，平滑移动",
-                clip_mode="Clip_Frame", clip_tag="段1",
-                prompt_mode="auto",
-                prompt_format="official",
-                crop_mode="stretch",
-                ref_sync_mode="segmented",
-                decode_output=False,
-                width=960, height=544,
-                total_frames=362, fps=24, chunk_frames=90,
-                context_frames=22, steps=30, cfg=1.0,
-                sampler_name="euler", scheduler="simple", seed=0,
+                denoise=1.0,
+                steps=30, cfg=1.0,
+                sampler_name="euler", scheduler="simple",
+                sampler=None,
+                seed=0,
                 ref_images=None, ref_videos=None,
                 ref_video_audios=None, ref_audios=None,
-                drive_audio=None, audio_drive=False) -> io.NodeOutput:
+                drive_audio=None) -> io.NodeOutput:
+
+        # 从 parameter dict 解包参数 (缺失项用默认值兜底)
+        p = parameter or {}
+        long_prompt = p.get("long_prompt", "")
+        prompt_mode = p.get("prompt_mode", "auto")
+        clip_mode = p.get("clip_mode", "Clip_Frame")
+        clip_tag = p.get("clip_tag", "段1")
+        prompt_format = p.get("prompt_format", "official")
+        crop_mode = p.get("crop_mode", "stretch")
+        ref_sync_mode = p.get("ref_sync_mode", "segmented")
+        width = int(p.get("width", 960))
+        height = int(p.get("height", 544))
+        total_frames = int(p.get("total_frames", 362))
+        fps = int(p.get("fps", 24))
+        chunk_frames = int(p.get("chunk_frames", 90))
+        context_frames = int(p.get("context_frames", 22))
+        lock_audio = p.get("lock_audio", True)
+        audio_drive = p.get("audio_drive", False)
+        decode_output = p.get("decode_output", False)
+
+        # info 参数继承：info 中存在的分段参数覆盖 parameter 解包值 (保证多节点分段同步)
+        if info:
+            _inherited = {}
+            for _k in ("total_frames", "chunk_frames", "context_frames",
+                       "fps", "clip_mode", "clip_tag"):
+                if _k in info and info[_k] is not None:
+                    _inherited[_k] = info[_k]
+            total_frames = int(_inherited.get("total_frames", total_frames))
+            chunk_frames = int(_inherited.get("chunk_frames", chunk_frames))
+            context_frames = int(_inherited.get("context_frames", context_frames))
+            fps = int(_inherited.get("fps", fps))
+            clip_mode = _inherited.get("clip_mode", clip_mode)
+            clip_tag = _inherited.get("clip_tag", clip_tag)
+            if _inherited:
+                print(f"[H3-Auto] info 参数继承: {list(_inherited.keys())}")
+
+        out_info = {
+            "total_frames": int(total_frames),
+            "chunk_frames": int(chunk_frames),
+            "context_frames": int(context_frames),
+            "fps": int(fps),
+            "clip_mode": str(clip_mode),
+            "clip_tag": str(clip_tag),
+        }
 
         if clip_mode != "Clip_Tag":
             if chunk_frames <= 0:
@@ -185,6 +284,8 @@ class H3AutoContextSampler(io.ComfyNode):
             decode_output = (decode_output == "enable")
         if isinstance(audio_drive, str):
             audio_drive = (audio_drive == "enable")
+        if isinstance(lock_audio, str):
+            lock_audio = (lock_audio == "enable")
 
         def _autogrow_to_list(ag_dict, prefix, max_count):
             """将 autogrow dict 转为有序 list，按 ref_xxx_N 的 N 排序"""
@@ -213,7 +314,7 @@ class H3AutoContextSampler(io.ComfyNode):
 
         ref_audio_list = _autogrow_to_list(ref_audios, "ref_audio_", 4)
 
-        frames, audio, latent = h3_sampler.run_auto_context_generation(
+        frames, audio, latent, denoised_latent = h3_sampler.run_auto_context_generation(
             model=model, vae=vae, audio_vae=audio_vae, clip=clip,
             first_frame=first_frame, last_frame=last_frame,
             ref_images=ref_image_list, ref_videos=ref_video_list,
@@ -228,5 +329,8 @@ class H3AutoContextSampler(io.ComfyNode):
             crop_mode=crop_mode, ref_sync_mode=ref_sync_mode,
             decode_output=decode_output,
             drive_audio=drive_audio, audio_drive=audio_drive,
+            latent_input=latent_input, sigmas=sigmas,
+            denoise=denoise, lock_audio=lock_audio,
+            sampler=sampler,
         )
-        return io.NodeOutput(frames, audio, latent)
+        return io.NodeOutput(frames, audio, latent, denoised_latent, out_info)
