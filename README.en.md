@@ -11,6 +11,11 @@
 
 Under limited VRAM, long videos are split into multiple segments for independent inference; seamless inter-segment continuity is achieved through multi-frame keyframe anchoring, and prompts are auto-sliced along the timeline so each segment's content aligns with the prompt rhythm. Supports a second pass (low-res pass 1 + high-res pass 2).
 
+<img width="2230" height="976" alt="image" src="https://github.com/user-attachments/assets/5634914a-6f98-4d4f-b573-2c8b41e0c57e" />
+
+
+<img width="2209" height="1030" alt="image" src="https://github.com/user-attachments/assets/9bbdda2a-d4ce-4836-b108-e359e72e31de" />
+
 ## 📖 Table of Contents
 
 - [Node List](#nodes)
