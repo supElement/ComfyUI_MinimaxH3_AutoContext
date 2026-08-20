@@ -420,10 +420,10 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
         else:
             latent_w = int(v_in.shape[4])
             latent_h = int(v_in.shape[3])
-            # H3 patch_size=(1,2,2) 要求空间偶数；奇数时 pad 到偶数，否则段间续接 keyframe 的 patchify 会崩溃
+            # H3 patch_size=(1,2,2) 要求空间偶数；奇数时按边缘复制对齐到偶数，否则段间续接 keyframe 的 patchify 会崩溃
             if latent_w % 2 != 0 or latent_h % 2 != 0:
                 print(f"[H3-Auto] 警告: 输入 latent 尺寸 {latent_w}x{latent_h} 为奇数，"
-                      f"H3 需偶数 (patch_size=2)。已 pad 到 "
+                      f"H3 需偶数 (patch_size=2)。已按边缘复制对齐到 "
                       f"{latent_w + (latent_w % 2)}x{latent_h + (latent_h % 2)}；"
                       f"建议改用 32 对齐分辨率 (如 1920x1088)")
                 latent_input = _pad_latent_spatial_even(latent_input)
@@ -1070,11 +1070,14 @@ def _sample_segment(model, positive, latent_dict, steps, cfg, sampler_name, sche
 
 
 def _pad_latent_spatial_even(latent_dict):
-    """把 latent 的 video 区 H/W pad 到偶数 (H3 patch_size=(1,2,2) 要求)。
+    """把 latent 的 video 区 H/W 对齐到偶数 (H3 patch_size=(1,2,2) 要求)。
 
     主 latent 进入模型时会被 ComfyUI pad_to_patch_size 自动补偶，
     但段间续接 keyframe 走 _cond_video_rows 不 pad，奇数会 patchify 崩溃；
     因此二采入口先对齐，保证 keyframe 与主 latent 一致。
+
+    对齐用「复制边缘 (replicate)」而非补零：零行会被 VAE 解码成底部亮斑/伪条带，
+    复制相邻真实 latent 行则与内容连续，解码后无伪影。
     """
     v_lat, a_lat = h3_conditioning.unpack_nested_latent(latent_dict)
     if v_lat is None:
@@ -1082,7 +1085,10 @@ def _pad_latent_spatial_even(latent_dict):
     h, w = int(v_lat.shape[3]), int(v_lat.shape[4])
     if h % 2 == 0 and w % 2 == 0:
         return latent_dict
-    v_pad = torch.nn.functional.pad(v_lat, (0, w % 2, 0, h % 2))
+    pad_h, pad_w = h % 2, w % 2
+    # replicate 要求补数 < 该维尺寸；极小 latent (单行/单列) 退化补零兜底
+    mode = "replicate" if (h > pad_h and w > pad_w) else "constant"
+    v_pad = torch.nn.functional.pad(v_lat, (0, pad_w, 0, pad_h), mode=mode)
     if a_lat is not None:
         try:
             combined = comfy.nested_tensor.NestedTensor((v_pad, a_lat))

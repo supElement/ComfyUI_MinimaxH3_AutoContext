@@ -11,12 +11,6 @@
 
 在显存有限的情况下，将长视频拆分为多段独立推理，通过多帧 keyframe 锚定实现段间无缝衔接，同时按时间轴自动切分提示词，让每段生成内容与提示词节奏对齐。支持二采（低清一采 + 高清二采）。
 
-<img width="2230" height="976" alt="image" src="https://github.com/user-attachments/assets/5634914a-6f98-4d4f-b573-2c8b41e0c57e" />
-
-
-<img width="2209" height="1030" alt="image" src="https://github.com/user-attachments/assets/9bbdda2a-d4ce-4836-b108-e359e72e31de" />
-
-
 ## 📖 目录
 
 - [节点列表](#nodes)
@@ -195,12 +189,28 @@ parameter 节点 ──parameter──> 主节点(一采, 864×480)
 ## <a id="seam"></a> 🧵 接缝修正节点（Minimax_H3_Seam_Correction）
 
 - 输入 `images`（解码后的完整视频帧），输出修正后的 `images`
-- 自动检测段间接缝（帧间亮度跳变 + 局部峰值）
-- 分类：**场景切换 / 瞬态闪光 / 曝光渐变 / 运动卡顿**
-- 开关参数：`fix_flash` / `fix_exposure` / `fix_motion` / `fix_scene_cut` + `threshold` 检测阈值
-- 只对曝光/闪光类跳变做 `lerp` 过渡，场景切换默认不抹平
+- 自动检测段间接缝：降采样后相邻帧亮度差的局部峰值，超过 `threshold` 判定为候选接缝
+- 每个接缝分类：**场景切换（scene_cut）/ 瞬态闪光（flash）/ 曝光渐变（exposure）/ 运动接缝（motion）**
+- 对命中的接缝做 **GPU 光流对齐（warp）→ 局部颜色匹配 → 时间窗口内多帧混合**，而非简单 lerp
+- 各分类由对应开关独立控制，`fix_scene_cut` 默认关闭（场景切换通常不抹平）
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| fix_flash | true | 修正瞬态闪光 / 亮度跳变 |
+| fix_exposure | true | 修正曝光渐变 |
+| fix_motion | true | 修正运动接缝（光流对齐） |
+| fix_scene_cut | false | 修正场景切换，通常不要开启 |
+| threshold | 0.05 | 接缝检测阈值（帧间亮度差） |
+| seam_window | 3 | 接缝前后参与融合的帧数 |
+| flow_strength | 0.75 | GPU 光流位移补偿强度 |
+| blend_strength | 0.65 | 局部颜色/亮度连续性修正强度 |
+| flow_iterations | 12 | 光流迭代次数，越高越慢 |
+| flow_pyramid | 3 | 光流金字塔层数 |
+| use_gpu | true | 使用 CUDA GPU 进行光流与接缝处理 |
 
 > 用法：`VAE Decode → H3_Seam_Correction → Save/Video`。
+
+> ⚠️ 提示：本节点只做像素域接缝修正，无法修复二采上游产生的伪影。若二采输入 latent 因分辨率失配被补零（表现为底部光斑/条带），本节点可能把这条伪带误判为亮度跳变而放大闪烁——应先保证二采分辨率 32 对齐、latent 空间为偶数，再启用本节点。
 
 ## <a id="prompt-examples"></a> ✍️ 提示词写法示例
 
