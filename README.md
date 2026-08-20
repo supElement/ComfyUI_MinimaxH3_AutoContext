@@ -11,6 +11,11 @@
 
 在显存有限的情况下，将长视频拆分为多段独立推理，通过多帧 keyframe 锚定实现段间无缝衔接，同时按时间轴自动切分提示词，让每段生成内容与提示词节奏对齐。支持二采（低清一采 + 高清二采）。
 
+<img width="2230" height="976" alt="image" src="https://github.com/user-attachments/assets/5634914a-6f98-4d4f-b573-2c8b41e0c57e" />
+
+
+<img width="2209" height="1030" alt="image" src="https://github.com/user-attachments/assets/9bbdda2a-d4ce-4836-b108-e359e72e31de" />
+
 ## 📖 目录
 
 - [节点列表](#nodes)
