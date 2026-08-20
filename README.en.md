@@ -11,6 +11,12 @@
 
 With limited VRAM, long videos are split into multiple independently inferred segments; seamless connections between segments are achieved through multi-frame keyframe anchoring, while the prompt is automatically sliced along the timeline so that each segment's generated content stays aligned with the prompt's rhythm. Supports a second pass (low-res first pass + hi-res second pass) to improve face/detail clarity.
 
+<img width="2423" height="1077" alt="image" src="https://github.com/user-attachments/assets/c3edb888-86cd-4966-87f2-8d1de30091ff" />
+
+
+<img width="2209" height="1030" alt="image" src="https://github.com/user-attachments/assets/134afc80-2b83-4079-862e-dbd9af9e753c" />
+
+
 ## 📖 Table of Contents
 
 - [Node List](#nodes)
