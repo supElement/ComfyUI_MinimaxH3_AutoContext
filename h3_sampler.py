@@ -1086,9 +1086,12 @@ def _pad_latent_spatial_even(latent_dict):
     if h % 2 == 0 and w % 2 == 0:
         return latent_dict
     pad_h, pad_w = h % 2, w % 2
+    # 5D latent [B,C,T,H,W] 用 replicate/reflect 时 pad 长度必须为 6 (补最后 3 维)，
+    # 故 T 维补 0、只补空间 H/W： (W左, W右, H上, H下, T前, T后)
+    pad = (0, pad_w, 0, pad_h, 0, 0)
     # replicate 要求补数 < 该维尺寸；极小 latent (单行/单列) 退化补零兜底
     mode = "replicate" if (h > pad_h and w > pad_w) else "constant"
-    v_pad = torch.nn.functional.pad(v_lat, (0, pad_w, 0, pad_h), mode=mode)
+    v_pad = torch.nn.functional.pad(v_lat, pad, mode=mode)
     if a_lat is not None:
         try:
             combined = comfy.nested_tensor.NestedTensor((v_pad, a_lat))
