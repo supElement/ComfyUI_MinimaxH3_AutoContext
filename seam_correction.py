@@ -38,6 +38,8 @@ KJNodes 的 ColorMatchV2。
 import torch
 import torch.nn.functional as F
 from comfy_api.latest import io
+import numpy as np
+
 
 _LONG_SIDE = 320
 _STAT_LONG_SIDE = 256
@@ -66,7 +68,7 @@ _CUT_TOL = 2
 _CUT_MIN_GAP = 4
 
 # 瞬态 (flash / 段首 warm-up) 检测与修正
-_WARMUP_MIN = 0.02
+_WARMUP_MIN = 0.005
 _WARMUP_MAX = 2
 
 # 接缝残差尖峰修平 (de-step 硬切后) 的判定阈值
@@ -79,7 +81,7 @@ _RAMP_MIN_DEV = 0.0005
 # 高光保护：线性变换会按比例把高光 (车灯等镜面高光) 一起压暗变灰。
 # luma 低于 _HL_LO 的像素接受完整校正，高于 _HL_HI 的像素基本保持原样。
 _HL_LO = 0.70
-_HL_HI = 0.95
+_HL_HI = 1.0
 
 
 # ============================================================
@@ -541,8 +543,9 @@ def _correct_exposure(images, seams, edit_points, mode, method, strength,
         a, b = _blend_toward_identity(a, b, strength)
         _apply_transform(images, s + warmup, e, a, b, device)
         _fix_warmup_frames(images, bnd, warmup, device)
-        _despike_seam(images, bnd, device)
-        _smooth_seam_ramp(images, bnd, blend_frames, device)
+        if blend_frames > 0:                     # ← 新增条件
+            _despike_seam(images, bnd, device)
+            _smooth_seam_ramp(images, bnd, blend_frames, device)
         logs.append((bnd, s, e, a, b, warn))
 
     return logs
@@ -715,29 +718,33 @@ def _smooth_seam_ramp(images, bnd, blend, device, strength=_RAMP_STRENGTH):
 # ============================================================
 
 @torch.no_grad()
-def _detect_transient_frames(stats, threshold, min_gap=_CUT_MIN_GAP):
-    """单帧瞬态 (flash / 段首 warm-up) 检测。
-
-    判据是「跳入、跳出都大，但两帧净值小」：帧 t 相对 t-1 剧烈跳变，
-    t+1 又跳回接近 t-1 的水平 —— 单帧闪光 / 段首 re-anchor 帧的签名。
-    它比旧的"帧差局部尖峰"更准：当瞬态帧前后都有大帧差时，相邻两个
-    尖峰会互相顶掉，导致漏检。
-
-    返回瞬态帧号列表 (升序)。瞬态帧常是"下一段新增内容的首帧"，
-    可作接缝边界的精定位依据。
+def _detect_transient_frames(stats, window=3, z_thresh=2.5, min_gap=_CUT_MIN_GAP):
     """
-    n = int(stats.shape[0])
-    if n < 3:
+    使用亮度中位数的 Z-score 检测瞬态帧，自适应阈值。
+    stats: [N,4] 第4列为亮度中位数
+    window: 前后窗口大小（检测帧不包含自身）
+    z_thresh: Z-score 阈值，超过此值判定为异常（推荐 2.0~3.0）
+    """
+    n = stats.shape[0]
+    if n < 2 * window + 3:
         return []
-
-    y = stats[:, 3].float().cpu()  # 逐帧亮度中位数
-
+    y = stats[:, 3].float().cpu().numpy()  # 亮度中位数
     out = []
-    for t in range(1, n - 1):
-        jump_in = abs(float(y[t] - y[t - 1]))
-        jump_out = abs(float(y[t + 1] - y[t]))
-        net = abs(float(y[t + 1] - y[t - 1]))
-        if jump_in > threshold and jump_out > threshold and net < 0.6 * jump_in:
+    for t in range(window, n - window):
+        # 窗口内不包括 t 本身
+        window_seq = np.concatenate([y[t-window:t], y[t+1:t+window+1]])
+        med = np.median(window_seq)
+        mad = np.median(np.abs(window_seq - med))
+        if mad < 1e-6:
+            continue
+        z = (y[t] - med) / (1.4826 * mad)
+        if abs(z) > z_thresh:
+            # 更稳健的局部极值条件：前后平均差异 > 与中位数的差异（可选）
+            # 如果不希望误过滤，可以完全注释掉这两行
+            if t > 0 and t < n-1:
+                avg_diff = (abs(y[t] - y[t-1]) + abs(y[t] - y[t+1])) / 2
+                if avg_diff < abs(y[t] - med):
+                    continue
             if not out or t - out[-1] >= min_gap:
                 out.append(t)
     return out
@@ -837,6 +844,66 @@ def _hist_pearson(a, b):
 
 @torch.no_grad()
 def _detect_shot_cuts(images, threshold, device, min_gap=_CUT_MIN_GAP):
+    """
+    使用 TransNetV2 检测镜头边界，返回切镜帧号列表。
+    threshold 参数保留但忽略（TransNetV2 内部固定阈值）。
+    """
+    # 尝试两种导入名
+    try:
+        from transnetv2_pytorch import TransNetV2
+        print("[H3-Seam] TransNetV2 imported from transnetv2_pytorch")
+    except ImportError:
+        try:
+            from transnetv2 import TransNetV2
+            print("[H3-Seam] TransNetV2 imported from transnetv2")
+        except ImportError:
+            print("[H3-Seam] TransNetV2 not installed, falling back to histogram method.")
+            return _detect_shot_cuts_histogram(images, threshold, device, min_gap)
+
+    # 加载模型（使用环境变量 TRANSVNET_CACHE 指定权重目录）
+    import os
+    # 如果环境变量未设置，尝试自动设置到 ComfyUI/models/transnetv2
+    if 'TRANSVNET_CACHE' not in os.environ:
+        import folder_paths
+        model_dir = os.path.join(folder_paths.models_dir, "transnetv2")
+        if os.path.exists(os.path.join(model_dir, "transnetv2.pth")):
+            os.environ['TRANSVNET_CACHE'] = model_dir
+            print(f"[H3-Seam] TRANSVNET_CACHE set to {model_dir}")
+
+    model = TransNetV2()
+    if torch.cuda.is_available():
+        model = model.cuda()
+    model.eval()
+
+    # 预处理帧
+    import numpy as np
+    from PIL import Image
+    frames_np = (images.cpu().numpy() * 255).astype(np.uint8)
+    resized = []
+    for frame in frames_np:
+        pil = Image.fromarray(frame)
+        resized.append(np.array(pil.resize((48, 27), Image.BILINEAR), dtype=np.uint8))
+    batch = np.stack(resized, axis=0)[np.newaxis, ...]
+    tensor = torch.from_numpy(batch).to(dtype=torch.uint8).to(model.device)
+
+    with torch.no_grad():
+        pred = model(tensor)
+        if isinstance(pred, tuple):
+            pred = pred[0]
+        pred = pred.cpu().numpy().squeeze()
+
+    binary = (pred > 0.5).astype(np.uint8)
+    cuts = [i for i in range(1, len(binary)) if binary[i-1] == 0 and binary[i] == 1]
+    if min_gap > 1:
+        filtered = []
+        for c in cuts:
+            if not filtered or c - filtered[-1] >= min_gap:
+                filtered.append(c)
+        cuts = filtered
+    return cuts
+
+
+def _detect_shot_cuts_histogram(images, threshold, device, min_gap=_CUT_MIN_GAP):
     """全片逐帧镜头边界检测：返回切镜帧号列表 (升序)。
 
     逐帧算 RGB 直方图，比较相邻帧的直方图相关度；相关度低于 threshold
@@ -1644,31 +1711,21 @@ class H3SeamCorrection(io.ComfyNode):
             f"blend={blend_frames}"
         )
 
-        # ---- 边界确定：纯内容自动检测 (不依赖 info) ----
-        # 注意：检测用固定小窗 _DETECT_WINDOW，不能用 stat_window ——
-        # stat_window 随 color 档位变大 (high=8)，会让台阶 z 分被稀释而漏检。
+        # ---- 边界确定：纯内容自动检测 ----
         min_gap = max(4, _DETECT_WINDOW)
         stats = _frame_stats(images, device)
 
-        # 1) 单帧瞬态 (flash / 段首 warm-up)：跳入跳出都大、净值小，
-        #    精确定位"下一段新增内容的首帧"。
-        transients = _detect_transient_frames(stats, _WARMUP_MIN, min_gap)
+        # 仅检测曝光台阶（不依赖瞬态）
+        steps, z = _detect_step_boundaries(stats, _DETECT_WINDOW, _DETECT_Z, min_gap)
+        # 偏移 +1：因为检测标记的是边界位置，实际变化发生在下一帧
+        steps = [s + 1 for s in steps if s + 1 < n_frames]
 
-        # 2) 曝光台阶 (level shift)：右窗跳过 warm-up 帧，避免瞬态抹平台阶。
-        steps, z = _detect_step_boundaries(
-            stats, _DETECT_WINDOW, _DETECT_Z, min_gap)
-
-        # 瞬态帧附近的台阶属同一接缝，以瞬态帧的精确定位为准
-        steps = [
-            s for s in steps
-            if all(abs(s - f) >= min_gap for f in transients)
-        ]
-
-        boundaries = sorted(set(transients) | set(steps))
+        # 不再过滤与瞬态重叠，因为瞬态将在色彩校正后二次检测
+        boundaries = sorted(set(steps))
+        transients = []   # 清空，避免后续逻辑误用
 
         print(
-            f"[H3-Seam] 边界来源=内容检测: 瞬态={transients} "
-            f"台阶={steps} -> 合并={boundaries}"
+            f"[H3-Seam] 边界来源=内容检测: 台阶={steps} -> 合并={boundaries}"
         )
 
         if debug and z is not None:
@@ -1786,6 +1843,60 @@ class H3SeamCorrection(io.ComfyNode):
                         f"({off[0]:+.4f},{off[1]:+.4f},{off[2]:+.4f}) "
                         f"中灰亮度 0.500 -> {luma_out:.3f}"
                     )
+
+
+        # ---- 二次瞬态修正（基于色彩校正后的画面） ----
+        if fix_flash:
+            # 重新计算统计量
+            stats_after = _frame_stats(out, device)
+            # 使用高阈值 + 小窗口，只捕获最显著的瞬态
+            transients_after = _detect_transient_frames(stats_after, window=1, z_thresh=1.5, min_gap=min_gap)
+            
+            if transients_after:
+                device = out.device
+                lw = torch.tensor(_LUMA_W, device=device)
+                # 设定异常面积阈值（只修正面积超过该比例的帧）
+                area_threshold = 0.30  # 30%，可调整
+                
+                for f in transients_after:
+                    if 0 < f < out.shape[0] - 1:
+                        # 获取当前帧、前帧、后帧的RGB
+                        curr = out[f, ..., :3].float().to(device)
+                        prev = out[f-1, ..., :3].float().to(device)
+                        nxt = out[f+1, ..., :3].float().to(device)
+                        
+                        # 计算亮度（用于遮罩）
+                        luma_curr = torch.sum(curr * lw, dim=-1, keepdim=True)
+                        luma_prev = torch.sum(prev * lw, dim=-1, keepdim=True)
+                        luma_nxt = torch.sum(nxt * lw, dim=-1, keepdim=True)
+                        
+                        # 目标亮度 = 前后帧平均
+                        luma_target = (luma_prev + luma_nxt) / 2.0
+                        
+                        # 相对差异图
+                        diff = (luma_curr - luma_target).abs() / (luma_target + 1e-6)
+                        
+                        # 生成二进制遮罩：差异大于阈值的像素视为异常
+                        mask = (diff > 0.10).float()  # 0.10 可调整，越小修正区域越大
+                        abnormal_ratio = mask.mean().item()
+                        
+                        # 如果异常面积小于阈值，跳过修正
+                        if abnormal_ratio < area_threshold:
+                            print(f"[H3-Seam] 帧{f} 差异面积 {abnormal_ratio:.1%} 小于 {area_threshold:.0%}，跳过")
+                            continue
+                        
+                        # 修正：将当前帧异常区域混合前后帧平均（50% 当前帧 + 50% 前后平均）
+                        # 注意：这里只用亮度调整，不改变色相
+                        # 简单的做法：对RGB通道乘以一个基于亮度的增益，但此处我们直接混合像素
+                        # 更安全：使用前后帧的平均值替换异常像素
+                        avg_adj = (prev + nxt) / 2.0
+                        # 混合：异常区域用 avg_adj，正常区域保持原样
+                        result = curr * (1 - mask) + avg_adj * mask
+                        out[f, ..., :3] = result.clamp(0.0, 1.0).to(out.dtype)
+                        print(f"[H3-Seam] 局部修正: 帧{f}，异常像素占比 {abnormal_ratio:.2%}")
+            else:
+                print("[H3-Seam] color后未检测到瞬态")
+
 
         # ---- 阶段 2：接缝局部光流 warp/blend ----
         if seam is not None or fix_flash:
