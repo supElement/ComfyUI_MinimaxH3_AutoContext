@@ -154,8 +154,6 @@ git clone https://github.com/supElement/ComfyUI_MinimaxH3_AutoContext.git
 
 | 输出 | 说明 |
 |------|------|
-
-
 | **latent** | 拼接后的音视频 latent，接 VAE Decode，或放大后接二采 |
 | **denoised_latent** | 干净的 latent 输出，用于二采接力 / 预览 |
 | **info** | 分段参数（Dict），传给下一个主节点的 info 输入，保证多采分段一致 |
