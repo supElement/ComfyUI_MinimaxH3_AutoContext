@@ -153,8 +153,6 @@ Search `ComfyUI_MinimaxH3_AutoContext` in ComfyUI Manager and click Install.
 
 | Output | Description |
 |------|------|
-
-
 | **latent** | Spliced audio/video latent; connect to VAE Decode, or upscale then connect to pass 2 |
 | **denoised_latent** | Clean latent output, used for pass-2 relay / preview |
 | **info** | Segmentation parameters (Dict), passed to the next main node's info input to keep chained passes' segmentation consistent |
@@ -189,24 +187,19 @@ Pass-2 node: sigmas ← low_sigmas (only run the low-sigma range to add detail)
 
 ## <a id="seam"></a> 🧵 Seam Correction Node (Minimax_H3_Seam_Correction)
 
-- Input `images` (decoded full video frames, connect to VAE Decode output), output corrected `images`
-- **Two-stage correction architecture**:
-  - **[Stage 1] Exposure/Color — whole-segment global alignment (the main workhorse)**: an inter-segment seam is essentially a "step" in the temporal signal (level shift / DC step), so the correction must be applied to the entire segment rather than locally blended near the seam (the latter only turns a hard step into a ramp over a few frames, producing a breathing/pumping feel). The transform uses the closed-form MKL (Monge–Kantorovich Linear) solution: the optimal 3×3 linear transform matching mean + covariance, which handles cross-channel color casts (warm/green) and is strictly stronger than per-channel gain/offset
-  - **[Stage 2] Motion/Flash — local seam warp/blend**: GPU optical-flow alignment + local blending, run after Stage 1 — once the DC step is removed, the residual at the boundary is the real structural discontinuity
-- Seam boundaries are detected **purely from content** (no dependency on the sampler's `info`): precise localization of single-frame transients (flash / segment-head warm-up) + exposure steps (windowed quantile step detection), with no reliance on the segment ledger
-- **Shot gate** (`cut_detection`): runs frame-by-frame cut detection over the whole video before correcting; exposure/color/motion corrections apply only within the same shot, and real cuts (including cuts inside a segment) are skipped, so corrections never leak into other shots
-- The three treatments are controlled independently and can each be turned off: `fix_color_preset` (exposure/color), `fix_motion_preset` (seam continuity), `fix_flash` (flash frames)
-
 | Parameter | Default | Description |
-|------|------|------|
-| fix_color_preset | medium | Exposure/color level: off = no processing; low = per-channel brightness gain to remove boundary steps (strength halved, most conservative, never introduces hue shift); medium = MKL linear color transfer (recommended starting point; only fixes the level jump at seams, fully preserving the picture's own brightness changes); high = same as medium but with a longer statistics window (more stable when there is large motion across the boundary); max = full-video per-frame level normalization (the only level that removes "intra-segment drift", but it also flattens the picture's own legitimate brightness changes — nightfall/lights off/tunnel — because the two are the same signal in pixels and cannot be distinguished; ineffective on frames already crushed to near-black, and the log reports the affected frame count) |
-| fix_motion_preset | off | Seam-continuity level: off = no processing (recommended default; first try the color level only); low/medium/high/max = optical-flow alignment + local blending — the higher the level, the more frames and the stronger the blend, the smoother the seam but the higher the risk of slight blur or pumping |
-| fix_flash | false | Fix flash frames separately (1–2 frame transient brightness jumps at a boundary). It is a separate switch because flash frames go through the local temporal blending logic, which is completely different from whole-segment color transforms; also, when the picture itself has legitimate fast brightness changes (lightning, explosions, light switches), suppressing flash frames flattens those effects too. Still effective when fix_motion_preset=off (uses medium-level parameters) |
-| blend_frames | 2 | Seam level-ramp window (frames, 0–8): after exposure alignment, pulls the brightness transition of blend_frames frames on each side of the boundary onto a smooth ramp; larger = smoother and more natural, but too large on motion-heavy shots brings slight blur/breathing; 0 = off |
-| cut_detection | true | Shot-detection gate: when enabled, runs frame-by-frame cut detection over the whole video (adjacent-frame RGB histogram correlation); exposure/color/motion corrections apply only within the same shot and real cuts (including cuts inside segments) are skipped; disabled = old behavior, process all segment boundaries |
-| cut_threshold | 0.6 | Cut-detection threshold (adjacent-frame RGB histogram correlation, 0–1): correlation below this is judged a cut; higher is more aggressive (fast motion within a shot may be misjudged as a cut), lower is more conservative (cuts may be missed) |
-| use_gpu | true | Use CUDA GPU for statistics, color transforms, and optical flow |
-| debug | false | Print diagnostics: full-video luma curve, per-segment head/mid/tail drift, per-frame luma around boundaries, 3×3 block luma difference — to identify the cause (step / intra-segment drift / segment-head transient / spatial unevenness). Set all three processing items to off and enable this for "diagnose only, no modification" |
+|-----------|---------|-------------|
+| `fix_color_preset` | `medium` | Color/exposure processing level. <br> `off`: no processing; <br> `low`: per‑channel luminance gain with correction halved, most conservative, no color shift; <br> `medium`: per‑channel luminance gain, only fixes seam level jumps (recommended); <br> `high`: MKL linear color transfer, longer statistical window, more stable with large motion; <br> `max`: per‑frame luminance normalization over the whole clip, eliminates gradual drift within segments, but flattens legitimate brightness changes (e.g., nightfall, tunnel entry); near‑black frames are ignored (logged). |
+| `fix_motion_preset` | `off` | Seam continuity level: <br> `off` = no processing (recommended default; try color preset first). <br> `low`/`medium`/`high`/`max` = optical flow alignment + local blending; higher levels blend more frames and with greater strength, but may introduce slight blur or pumping. |
+| `fix_flash` | `false` | Flash frame handling (instantaneous brightness spikes at boundaries). Independent toggle, uses seam temporal blending logic. If the scene contains legitimate rapid changes (lightning, explosions), suppression will flatten those effects. Remains active even when `fix_motion_preset=off`. |
+| `flash_threshold` | `0.30` | Threshold for transient correction (abnormal pixel ratio). Lower values are more aggressive (correct more frames). Recommended range: 0.20–0.40. |
+| `blend_frames` | `2` | Smoothing window for seam luminance transition (frames, 0–8). After exposure alignment, the brightness transition across the seam is flattened with a smooth ramp over ±`blend_frames` frames. Larger values give slower, more natural transitions, but may introduce slight blur/breathing in fast‑motion shots. `0` = off. |
+| `cut_detection` | `true` | Shot detection gate. When enabled, performs per‑frame shot‑cut detection (RGB histogram correlation) on the entire video. Exposure/color/motion corrections are applied only within the same shot; real cuts (including internal segment cuts) are skipped. When disabled, reverts to old behavior, processing all segment boundaries. |
+| `use_gpu` | `true` | Use CUDA GPU for statistics, color transforms, and optical flow. |
+| `debug` | `false` | Print diagnostic information. |
+
+⚠️Model (shot detection):
+Copy the model file from the models/transnetv2 folder to the ComfyUI model directory (.\ComfyUI\models\transnetv2\transnetv2.pth).
 
 > Usage: `VAE Decode → H3_Seam_Correction → Save/Video`.
 
