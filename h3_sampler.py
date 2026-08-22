@@ -60,6 +60,46 @@ def audio_latent_frames(pixel_frames, fps):
     return max(1, round(pixel_frames / fps * AUDIO_LATENTS_PER_SEC))
 
 
+# FRAME_PER_TOKEN = (1, 4, 4, 4, 4)：每 5 个 latent token 覆盖 17 个像素帧
+_FRAME_PER_TOKEN = (1, 4, 4, 4, 4)
+
+
+def _pixels_for_tokens(n_tokens):
+    """前 n_tokens 个 latent token 解码后产出的像素帧数。"""
+    return sum(_FRAME_PER_TOKEN[i % 5] for i in range(max(0, int(n_tokens))))
+
+
+def compute_seam_boundaries(seg_sizes, effective_context):
+    """算出 merged latent 解码后各段接缝所在的像素帧号。
+
+    必须与 _merge_segment_latents 的裁剪账目严格同源：非首段裁掉
+    n_i = min(ctx_v_tokens, seg_tokens_i - 2) 个头部 token。
+
+    由于 seg_tokens ≡ 2 (mod 5) 且 ctx_v_tokens ≡ 2 (mod 5)，
+    裁剪后 token 相位守恒，因此 token 数可直接换算为像素帧号。
+
+    返回 (boundaries, decoded_frames)：
+    boundaries 中每个 b 是"下一段新增内容的首帧索引"；
+    decoded_frames 是 merged latent 解码后的总像素帧数 (供下游校验 boundaries 是否过期)。
+    """
+    if not seg_sizes:
+        return [], 0
+    if len(seg_sizes) < 2:
+        return [], _pixels_for_tokens(video_latent_frames(seg_sizes[0]))
+
+    seg_tokens = [video_latent_frames(s) for s in seg_sizes]
+    ctx_v = video_latent_frames(effective_context) if effective_context > 5 else 2
+    ctx_v = max(2, ctx_v)
+
+    boundaries = []
+    cum_tokens = seg_tokens[0]
+    for i in range(1, len(seg_tokens)):
+        boundaries.append(_pixels_for_tokens(cum_tokens))
+        n_i = min(ctx_v, seg_tokens[i] - 2)
+        cum_tokens += seg_tokens[i] - n_i
+    return boundaries, _pixels_for_tokens(cum_tokens)
+
+
 _REF_MENTION_RE = re.compile(
     r'(?<![A-Za-z0-9<])'
     r'(?:'
@@ -350,7 +390,8 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
                                 decode_output=False,
                                 drive_audio=None, audio_drive=False,
                                 latent_input=None, sigmas=None, denoise=1.0,
-                                lock_audio=True, sampler=None):
+                                lock_audio=True, video_context_denoise=0.0,
+                                sampler=None):
     h3_patches.apply_patches()
 
     device = comfy.model_management.get_torch_device()
@@ -359,8 +400,10 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
     is_tag_mode = (clip_mode == "Clip_Tag")
 
     if is_tag_mode:
+        # Clip_Tag 模式下 chunk_frames 不约束总时长：无明确时长的段默认用 total_frames 作为
+        # 整段时长，使单段 (仅一个标签) 时总帧数贴合 total_frames，而非被 chunk_frames 顶成 90 帧。
         tag_schedule = h3_utils.build_tag_schedule(
-            long_prompt, clip_tag, default_seconds=chunk_frames / fps)
+            long_prompt, clip_tag, default_seconds=total_frames / fps)
         tag_segments = tag_schedule["segments"]
         tag_prefix = tag_schedule["prefix"]
 
@@ -587,11 +630,29 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
 
         if is_second_pass:
             seg_latent_dict = first_pass_segments[idx]
-            if lock_audio:
-                seg_latent_dict = _with_locked_audio(seg_latent_dict)
+            # 二采段: 非首段 video overlap 头按 mask 去噪 + 可选锁定音频 (首段无 overlap 头，仅锁音频)
+            ov_t = 0
+            if not is_first_chunk:
+                ov_t = max(2, video_latent_frames(effective_context)) if effective_context > 5 else 2
+            if ov_t > 0 or lock_audio:
+                if ov_t > 0:
+                    # 用二采本身推理后的干净 samples 尾部重写 overlap 头
+                    # (而非 input latent 放大后的复制，避免接缝扭曲破碎)
+                    seg_latent_dict = _copy_overlap_tail(
+                        seg_latent_dict, all_segments[idx - 1], ov_t)
+                seg_latent_dict = _with_locked_audio(
+                    seg_latent_dict, overlap_video_tokens=ov_t,
+                    lock_audio=lock_audio, overlap_video_denoise=video_context_denoise)
         else:
+            # 一采段: 非首段把上一段视频尾部逐 token 复制进 overlap 头并按 mask 去噪 (而非 keyframe 重演)
+            overlap_video = None
+            if not is_first_chunk and idx > 0:
+                overlap_video, _prev_a = h3_conditioning.unpack_nested_latent(
+                    all_segments[idx - 1])
             seg_latent_dict = _make_h3_empty_latent(
-                latent_w, latent_h, seg_frames, fps, drive_audio_latent=drive_aud_latent)
+                latent_w, latent_h, seg_frames, fps, drive_audio_latent=drive_aud_latent,
+                overlap_video=overlap_video, overlap_video_denoise=video_context_denoise,
+                overlap_frames=effective_context)
 
         segment_latent = _sample_segment(
             model, positive, seg_latent_dict, steps, cfg,
@@ -611,20 +672,31 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
     final_latent = _merge_segment_latents(all_segments, effective_context, fps)
     final_denoised = _merge_segment_latents(all_x0, effective_context, fps)
 
-    # 音频驱动模式：提前准备好"无损源音频" (裁齐到总时长)，供 audio 端口直接输出。
-    # 无论 decode_output 是否开启，audio 端口都返回源音频本身，绕过 VAE 有损往返。
+    # 段间接缝信息：供下游 Seam_Correction 节点精确定位边界 (token 相位换算，外部无法推算)
+    seam_boundaries, seam_decoded = compute_seam_boundaries(seg_sizes, effective_context)
+    seam_info = {
+        "boundaries": seam_boundaries,
+        "seg_sizes": [int(s) for s in seg_sizes],
+        "effective_context": int(effective_context),
+        "decoded_frames": int(seam_decoded),
+    }
+    if seam_boundaries:
+        print(f"[H3-Auto] 段间接缝 (解码后像素帧号): {seam_boundaries} "
+              f"/ 解码总帧数={seam_decoded} -> 已写入 info")
+
+    # 音频驱动模式：准备"无损源音频" (裁齐到总时长)。
+    # [注意] audio 输出端口已注释 (见 nodes.py)，这里的结果目前无人接收，
+    # 仅为将来恢复端口预留；用户请把源音频直接接到视频合成节点。
     drive_final_audio = None
     if drive_waveform is not None:
         target_samples = int(round(total_frames / fps * drive_sr))
         drive_final_audio = {"waveform": _align_length(drive_waveform, target_samples, dim=-1),
                              "sample_rate": drive_sr}
-        print(f"[H3-Auto] 音频驱动输出: 源音频裁齐到 {target_samples} 采样 "
-              f"({target_samples / drive_sr:.2f}s)")
+        print(f"[H3-Auto] 音频驱动: 源音频已锁进 latent，视频照它生成")
 
     if not decode_output:
-        print("[H3-Auto] decode_output=disable，跳过内部解码，仅输出 latent"
-              + (" (音频驱动: audio 端口输出源音频)" if drive_final_audio is not None else ""))
-        return None, drive_final_audio, final_latent, final_denoised
+        print("[H3-Auto] 跳过内部解码，仅输出 latent (像素请接外部 VAE Decode)")
+        return None, drive_final_audio, final_latent, final_denoised, seam_info
 
     print("[H3-Auto] 开始逐段 VAE 解码与拼接...")
     all_pixels, all_waveforms = [], []
@@ -661,7 +733,7 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
         final_audio = _crossfade_audio(all_waveforms, head_trims, effective_context,
                                        total_frames, fps)
 
-    return final_pixels, final_audio, final_latent, final_denoised
+    return final_pixels, final_audio, final_latent, final_denoised, seam_info
 
 
 def _prepare_ref_images(ref_images, vae, device, gen_w, gen_h, crop_mode="stretch"):
@@ -956,11 +1028,18 @@ def _decode_segment(vae, audio_vae, seg_latent, device):
     return pixels, waveform
 
 
-def _make_h3_empty_latent(latent_w, latent_h, pixel_frames, fps, drive_audio_latent=None):
+def _make_h3_empty_latent(latent_w, latent_h, pixel_frames, fps,
+                          drive_audio_latent=None,
+                          overlap_video=None, overlap_video_denoise=0.0,
+                          overlap_frames=0):
     """构建 H3 空 latent (NestedTensor: video + audio)。
 
-    drive_audio_latent 非空时：把音频半区替换为源音频 latent，并设 noise_mask
-    (视频=1 正常去噪，音频=0 锁定不生成)，实现"音频驱动视频"。
+    - drive_audio_latent 非空时：把音频半区替换为源音频 latent，并设 noise_mask
+      (视频=1 正常去噪，音频=0 锁定不生成)，实现"音频驱动视频"。
+    - overlap_video 非空时：把上一段视频尾部逐 token 复制到段首 overlap 头，
+      并用 noise_mask 冻结 (mask=overlap_video_denoise，0=精确保留、不去噪)。
+      overlap 头长度与 _merge_segment_latents 的裁剪账目严格同源。
+      冻结上一段真实结尾而非"重演"，消除接缝停顿/位置错位 (LongMedia frozen-overlap 同款)。
     """
     v_t = video_latent_frames(pixel_frames)
     a_t = audio_latent_frames(pixel_frames, fps)
@@ -978,18 +1057,34 @@ def _make_h3_empty_latent(latent_w, latent_h, pixel_frames, fps, drive_audio_lat
             audio_latent = fitted
             locked = True
 
+    # 段间续接 overlap 头：复制上一段视频尾部 (与 _merge_segment_latents 裁剪账目同源)
+    ov_t = 0
+    if overlap_video is not None and overlap_frames > 0:
+        ctx_v_tokens = video_latent_frames(overlap_frames) if overlap_frames > 5 else 2
+        ctx_v_tokens = max(2, ctx_v_tokens)
+        ov_t = min(ctx_v_tokens, v_t - 2)
+        ov_t = max(0, ov_t)
+        if ov_t > 0:
+            video_latent[:, :, :ov_t] = overlap_video[:, :, -ov_t:].to(
+                device=video_latent.device, dtype=video_latent.dtype)
+            print(f"[H3-Auto] 段间续接: overlap 头 mask={float(overlap_video_denoise):.2f} "
+                  f"({ov_t} latent token)")
+
     try:
         combined = comfy.nested_tensor.NestedTensor((video_latent, audio_latent))
     except Exception:
         combined = (video_latent, audio_latent)
 
     result = {"samples": combined}
-    if locked:
+    if locked or ov_t > 0:
+        video_mask = torch.ones_like(video_latent)
+        audio_mask = torch.zeros_like(audio_latent) if locked else torch.ones_like(audio_latent)
+        if ov_t > 0:
+            video_mask[:, :, :ov_t] = float(overlap_video_denoise)
         try:
-            result["noise_mask"] = comfy.nested_tensor.NestedTensor(
-                (torch.ones_like(video_latent), torch.zeros_like(audio_latent)))
+            result["noise_mask"] = comfy.nested_tensor.NestedTensor((video_mask, audio_mask))
         except Exception:
-            result["noise_mask"] = (torch.ones_like(video_latent), torch.zeros_like(audio_latent))
+            result["noise_mask"] = (video_mask, audio_mask)
     return result
 
 
@@ -1104,8 +1199,40 @@ def _pad_latent_spatial_even(latent_dict):
     return result
 
 
-def _with_locked_audio(latent_dict):
-    """二采锁定音频区：noise_mask video=1 (正常去噪) / audio=0 (原样保留一采音频)。"""
+def _copy_overlap_tail(latent_dict, prev_latent_dict, ov_t):
+    """把上一段 samples 的视频尾部复制到当前段 overlap 头 (二采段间续接用)。
+
+    二采的 input latent 可能经过二次放大、结构不完美；段间续接应使用二采本身推理后的
+    干净 samples 尾部 (完整去噪、正确结构)，而非 input latent 的放大复制。
+    """
+    v_cur, a_cur = h3_conditioning.unpack_nested_latent(latent_dict)
+    v_prev, _a_prev = h3_conditioning.unpack_nested_latent(prev_latent_dict)
+    if v_cur is None or v_prev is None:
+        return latent_dict
+    n = min(int(ov_t), int(v_cur.shape[2]) - 2, int(v_prev.shape[2]))
+    if n <= 0:
+        return latent_dict
+    v_cur = v_cur.clone()
+    v_cur[:, :, :n] = v_prev[:, :, -n:].to(device=v_cur.device, dtype=v_cur.dtype)
+    if a_cur is not None:
+        try:
+            combined = comfy.nested_tensor.NestedTensor((v_cur, a_cur))
+        except Exception:
+            combined = (v_cur, a_cur)
+    else:
+        combined = v_cur
+    result = dict(latent_dict)
+    result["samples"] = combined
+    return result
+
+
+def _with_locked_audio(latent_dict, overlap_video_tokens=0,
+                       lock_audio=True, overlap_video_denoise=0.0):
+    """二采段 noise_mask：video overlap 头按 mask 去噪 + 可选锁定音频。
+
+    - video: 前 overlap_video_tokens 个 token mask=overlap_video_denoise (0=精确保留、不去噪)，其余 1
+    - audio: lock_audio=True 时 mask=0 (原样保留一采音频)，否则 1 (正常去噪)
+    """
     samples = latent_dict.get("samples")
     if samples is None:
         return latent_dict
@@ -1118,9 +1245,15 @@ def _with_locked_audio(latent_dict):
     masks = []
     for t in tensors:
         if t.dim() == 5:
-            masks.append(torch.ones_like(t))
+            m = torch.ones_like(t)
+            n = min(int(overlap_video_tokens), int(t.shape[2]) - 2)
+            if n > 0:
+                m[:, :, :n] = float(overlap_video_denoise)
+                print(f"[H3-Auto] 段间续接: overlap 头 mask={float(overlap_video_denoise):.2f} "
+                      f"({n} latent token, 二采)")
+            masks.append(m)
         else:
-            masks.append(torch.zeros_like(t))
+            masks.append(torch.zeros_like(t) if lock_audio else torch.ones_like(t))
     try:
         combined = comfy.nested_tensor.NestedTensor(tuple(masks))
     except Exception:
