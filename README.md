@@ -9,7 +9,7 @@
 
 > 一键式 MiniMax H3 长视频自动化生成节点：**分段推理 + 段间续接锚定 + 提示词时间轴切片 + 二次采样（二采）+ 接缝修正**。
 
-在显存有限的情况下，将长视频拆分为多段独立推理，通过多帧 keyframe 锚定实现段间无缝衔接，同时按时间轴自动切分提示词，让每段生成内容与提示词节奏对齐。支持二采（低清一采 + 高清二采）。
+在显存有限的情况下，将长视频拆分为多段独立推理，通过叠加增强方法实现段间无缝衔接，同时按时间轴自动切分提示词，让每段生成内容与提示词节奏对齐。支持二采（低清一采 + 高清二采）。
 
 <img width="2230" height="976" alt="image" src="https://github.com/user-attachments/assets/5634914a-6f98-4d4f-b573-2c8b41e0c57e" />
 
@@ -42,23 +42,18 @@
 
 ### 🧩 分段推理
 
-- 按 `total_frames` / `chunk_frames`（帧单位）拆分为多段，参数步幅为 17（可选 5, 22, 39, 56, 73, 90, ...）
-- 每段帧数吸附到 H3 的 17n+5 VAE 时序网格
-- 末段优先加长吸收锚定亏空（≤30% 上限），避免产生微小尾段
+- 按 `total_frames` / `chunk_frames`（帧单位）拆分为多段，帧数建议取 5、22、39、56、73、90…
+- 末段自动加长补齐，避免出现过短的尾段
 - `fps` 仅用于音频同步和提示词内秒数换算
 
-### 🔗 段间续接锚定
+### 🔗 段间续接
 
-- 从上一段尾部提取 N 个 latent 帧作为独立 keyframe，锚定到当前段对应时间坐标
-- 模型看到真实运动序列而非单张静帧，正确延续运动方向与速度
-- 上下文音频通过 ref 通道传入（不插入 `<Audio j>` 标签），模型视为"之前的内容"而非参考素材
-- 段间音频 cosine 交叉淡化，与视频帧数严格对齐
+- **叠加增强**：非首段自动"接力"上一段的结尾画面，新增内容从上一段结束的位置和动作自然延续，消除接缝处的停顿或位置跳变
+- 上一段结尾作为运动参考传给当前段，帮助延续运动方向与速度
+- 上一段音频也作为"之前的内容"传入，帮助声音自然延续
+- 段间音频平滑淡化，与视频帧数对齐
 
-> 📐 **帧数账目**（H3 17n+5 网格）：
-> - 首段 = `17n+5`（含 5 帧"引子"）
-> - 非首段**新增帧数 = 17 的倍数**（如 68/85，是段中后部的"纯珠串"，无引子）
-> - `context_frames`（续接锚定）必须是 `17n+5` 形式（5/22/39/56…）
-> - 整条 latent 时间轴 = 引子(5) + N 串(17n)，整体满足 17n+5
+> 帧数规则：`total_frames` / `chunk_frames` / `context_frames` 都取 5、22、39、56、73、90…（17 的倍数加 5），节点会自动对齐，一般无需手动计算。
 
 ### ⏱️ 提示词时间轴
 
@@ -75,30 +70,28 @@
 - 段时长由提示词内容决定（三层优先级）：
   1. 标签行紧跟的时长（如 `段1:0-5秒` → 5 秒；`段1:3-8秒` → 5 秒）
   2. 段内时间标记的最大结束值（如 `【0-2秒】`+`【2-5秒】` → 5 秒）
-  3. `chunk_frames / fps` 默认值兜底
+  3. `total_frames / fps` 默认值兜底（单段时总帧数贴合 `total_frames`）
 - 段内时间标记是**相对时间**（每段从 0 开始），不是全局绝对时间
-- 续接锚定补偿：非首段多生成 `context_frames` 帧用于头部锚定，生成后自动裁掉
-- 总时长锚定：各段新增帧数之和与目标总帧数之差按 17 帧粒度从末段起补偿，尽量贴近目标总时长
+- 非首段会多生成一段重叠帧用于衔接，生成后自动裁掉
+- 总时长自动对齐目标总帧数，尽量贴近预期时长
 - 推理时标签本身会被去除，其余提示词内容根据 `prompt_format` 输出
 
 ### 🎯 参考智能过滤（图 / 视频 / 音频）
 
-- 解析每段提示词中的引用，只传被引用的参考给当前段
-- 编号自动重映射为连续序号，与模型原生标签对齐
-- 视频与其配对音轨绑定；音轨与独立音频统一计数为 `<Audio N>`
-- 避免所有参考同时传入导致的画面/声音串扰
+- 自动识别每段提示词里用到的参考图/视频/音频，只把被引用到的素材传给该段
+- 视频与其配对音轨绑定，避免画面/声音串扰
 
 ### 🖌️ 二次采样（二采）
 
 - 主节点 `latent_input` 接入一采 latent（或经 latent 放大节点）即进入二采模式
-- 二采空间分辨率**以输入 latent 为准**（忽略 parameter 的 width/height），实现低清一采 → 高清二采
+- 二采分辨率**以输入 latent 为准**（忽略 width/height），实现低清一采 → 高清二采
 - `denoise` 控制重绘强度；`sigmas` 支持自定义 sigma 序列（与 `SamplerCustomAdvanced` 同款）
-- `lock_audio` 锁住音频区（noise_mask audio=0），二采只重画 video、复用一采音频
+- `lock_audio`：二采只重画视频、复用一采音频
 
 ### 🎵 音频驱动（Audio Drive）
 
 - `drive_audio`（AUDIO，可选）+ `audio_drive` 开关
-- 开启后把 `drive_audio` 锁进 latent 音频半区（noise_mask audio=0），视频被音频驱动，输出音频 = 源音频本身
+- 开启后视频跟随这条音频生成，输出音频 = 源音频本身（口型/节奏由它驱动）
 
 ## <a id="install"></a> 📦 安装
 
@@ -128,13 +121,13 @@ git clone https://github.com/supElement/ComfyUI_MinimaxH3_AutoContext.git
 | crop_mode | stretch | 参考图/首尾帧/参考视频缩放裁剪：center / stretch / none |
 | ref_sync_mode | segmented | 参考视频/音频是否按段切片：global / segmented |
 | width × height | 960×544 | 一采分辨率（二采时被 latent_input 覆盖） |
-| total_frames | 362 | 生成总帧数（17n+5），Clip_Tag 下被各段之和覆盖 |
+| total_frames | 362 | 生成总帧数（17n+5）；Clip_Tag 下无明确时长的段以 total_frames 兜底，最终被各段之和覆盖 |
 | fps | 24 | 帧率，用于音频同步和提示词秒数换算 |
 | chunk_frames | 90 | 每段生成帧数（17n+5） |
 | context_frames | 22 | 段间续接帧数（17n+5：5/22/39/56…） |
 | lock_audio | enable | 锁定音频区，只重画 video |
 | audio_drive | disable | 音频驱动开关 |
-| decode_output | disable | 是否内部解码 |
+
 
 > 节点上实时显示「预计分段」预览（前端 JS 计算，不参与推理）。
 
@@ -149,10 +142,11 @@ git clone https://github.com/supElement/ComfyUI_MinimaxH3_AutoContext.git
 | latent_input | 可选 | 二采输入 latent（接入即开启二采） |
 | info | 可选 | 参数继承输入（多采串联，保证分段一致） |
 | first_frame / last_frame | 可选 | 首/尾帧锚定（FL2VA） |
+| video_context_denoise | 0.0 | 段间续接强度（仅非首段）：0=精确延续上一段结尾，1=重新生成，中间值=软混合。二采接 SplitSigmas 时建议设 1 避免花屏 |
 | seed | 0 | 随机种子（control_after_generate） |
 | steps / cfg | 30 / 1.0 | 采样步数 / CFG |
 | sampler_name / scheduler | euler / simple | 内置采样器 / 调度器 |
-| denoise | 1.0 | 重绘强度（接 sigmas 且 ≠1 时 final_sigmas = sigmas×denoise） |
+| denoise | 1.0 | 重绘强度（1=全量重采样，越小保留越多原结构） |
 | ref_image_N / ref_video_N / ref_video_audio_N / ref_audio_N | 可选 | 参考素材（Autogrow 动态端口） |
 | drive_audio | 可选 | 音频驱动源 |
 
@@ -160,13 +154,13 @@ git clone https://github.com/supElement/ComfyUI_MinimaxH3_AutoContext.git
 
 | 输出 | 说明 |
 |------|------|
-| **video_frames** | 拼接后的完整视频帧序列（`decode_output=enable` 时） |
-| **audio** | 拼接后的音频（段间 cosine 交叉淡化） |
-| **latent** | 音视频共用 latent（NestedTensor），裁掉段间重演区后拼接 |
-| **denoised_latent** | 干净 x0 预测（merge 后），用于二采接力 / 预览 |
+
+
+| **latent** | 拼接后的音视频 latent，接 VAE Decode，或放大后接二采 |
+| **denoised_latent** | 干净的 latent 输出，用于二采接力 / 预览 |
 | **info** | 分段参数（Dict），传给下一个主节点的 info 输入，保证多采分段一致 |
 
-> 💡 **推荐用法**：`latent → VAE Decode` ；二采时 `latent / denoised_latent → 放大 → 二采节点`。
+
 
 ## <a id="second-pass"></a> 🔄 二采与 SplitSigmas 高低频
 
@@ -182,22 +176,24 @@ parameter 节点 ──parameter──> 主节点(一采, 864×480)
 
 ### SplitSigmas 高低频（省时间提清晰度）
 
-> ⚠️ **audio 约束**：分段节点的 audio 段间 ref 锚定在「停在中间 sigma」下会失效（半成品），所以高低频**只对 video 生效**。audio 必须完整采样。
+> ⚠️ **音频约束**：高低频**只对视频生效**（音频段间衔接需要完整采样），音频请保持完整采样。
 
 ```
 一采节点: 完整采样 (不接 high_sigmas，audio 完整去噪)
           → denoised_latent → 分离放大 video (audio 不动) → 合并 → 二采.latent_input
 二采节点: sigmas ← low_sigmas (只跑低 sigma 段提细节)
           lock_audio = True (复用一采完整音频)
+          video_context_denoise = 1.0 (续接区随新增区一起重绘，避免花屏)
 ```
+
+> 💡 **二采 `video_context_denoise`**：接 SplitSigmas 时若设 0（精确延续），续接区与已重绘的新增区在边界可能花屏；设 1.0 让续接区同步重绘即可避免。接缝略有不连续时可降到 0.3~0.5 折中。一采保持默认 0。
 
 ## <a id="seam"></a> 🧵 接缝修正节点（Minimax_H3_Seam_Correction）
 
 - 输入 `images`（解码后的完整视频帧），输出修正后的 `images`
-- 自动检测段间接缝：降采样后相邻帧亮度差的局部峰值，超过 `threshold` 判定为候选接缝
-- 每个接缝分类：**场景切换（scene_cut）/ 瞬态闪光（flash）/ 曝光渐变（exposure）/ 运动接缝（motion）**
-- 对命中的接缝做 **GPU 光流对齐（warp）→ 局部颜色匹配 → 时间窗口内多帧混合**，而非简单 lerp
-- 各分类由对应开关独立控制，`fix_scene_cut` 默认关闭（场景切换通常不抹平）
+- 自动检测段间接缝，并按类型分类：**场景切换 / 瞬态闪光 / 曝光渐变 / 运动接缝**
+- 对命中的接缝做画面对齐与颜色匹配，多帧混合平滑过渡，而非简单硬切
+- 各类型由对应开关独立控制，`fix_scene_cut` 默认关闭（场景切换通常不抹平）
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
@@ -215,7 +211,7 @@ parameter 节点 ──parameter──> 主节点(一采, 864×480)
 
 > 用法：`VAE Decode → H3_Seam_Correction → Save/Video`。
 
-> ⚠️ 提示：本节点只做像素域接缝修正，无法修复二采上游产生的伪影。若二采输入 latent 因分辨率失配被补零（表现为底部光斑/条带），本节点可能把这条伪带误判为亮度跳变而放大闪烁——应先保证二采分辨率 32 对齐、latent 空间为偶数，再启用本节点。
+> ⚠️ 提示：本节点只做画面接缝修正，无法修复二采上游产生的伪影。
 
 ## <a id="prompt-examples"></a> ✍️ 提示词写法示例
 
@@ -297,9 +293,9 @@ overall_soundscape
 
 ```text
 段1：3秒
-"物体 A 向位置 B 移动"（覆盖时间段 0-5s）
+"物体 A 向位置 B 移动"
 段2：3-6秒
-"物体 A 移动到位置 B 后，正在位置 B 转身"（覆盖时间段 5-10s）
+"物体 A 移动到位置 B 后，正在位置 B 转身"
 ```
 
 > 问题分析：第 1 段结束时，锚定帧显示物体 A 已经到达位置 B 且刚停稳。但第 2 段提示词强行要求"物体 A 移动到位置 B"，这与锚定帧"已到达"的静态结果冲突，模型会试图"重新移动"，造成鬼畜或跳帧。
