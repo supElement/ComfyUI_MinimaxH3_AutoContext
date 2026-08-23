@@ -562,44 +562,39 @@ def _ssim(img1, img2, window_size=11, C1=0.01**2, C2=0.03**2):
 @torch.no_grad()
 def _refine_cuts_by_similarity(cuts, images, device, search_radius=2):
     """
-    在候选切点附近，选择相邻帧亮度绝对差最大的位置作为修正后的切点。
-    此方法专为曝光/场景跳变设计，对亮度变化极度敏感。
+    使用与台阶检测相同的度量（RGB均值绝对差之和）来修正切点。
+    在候选切点附近，选择该度量值最大的帧作为修正后的切点。
     """
     n_frames = images.shape[0]
-    refined = []
-
-    small = _downsample_rgb(images, long_side=128).to(device)
-    gray = _luma(small)   # [N, H, W]
-
-    lum_diff = torch.zeros(n_frames, device=device)
+    if n_frames < 2:
+        return []
+    
+    
+    stats = _frame_stats(images, device) 
+    rgb_means = stats[:, :3]  
+    diff = torch.zeros(n_frames, device=device)
     for t in range(1, n_frames):
-        lum_diff[t] = torch.abs(gray[t].mean() - gray[t-1].mean())
+        diff[t] = torch.sum(torch.abs(rgb_means[t] - rgb_means[t-1]))
 
-    print(f"[REFINE] 原始 cuts: {cuts}")
 
+    refined = []
     for c in cuts:
         if c < 1 or c >= n_frames - 1:
             refined.append(c)
             continue
-
         lo = max(1, c - search_radius)
         hi = min(n_frames - 1, c + search_radius)
-
         best_t = c
-        best_val = lum_diff[c].item()
-        print(f"[REFINE] 候选 {c}: 搜索范围 {lo}~{hi}")
+        best_val = diff[c].item()
         for t in range(lo, hi + 1):
-            val = lum_diff[t].item()
-            print(f"  t={t}, lum_diff={val:.6f}")
+            val = diff[t].item()
             if val > best_val:
                 best_val = val
                 best_t = t
-        print(f"[REFINE] 候选 {c} -> 修正为 {best_t} (差异值 {best_val:.6f})")
         refined.append(best_t)
 
     refined = sorted(set(refined))
     refined = [c for c in refined if 0 < c < n_frames]
-    print(f"[REFINE] 修正后的 cuts: {refined}")
     return refined
 
 
