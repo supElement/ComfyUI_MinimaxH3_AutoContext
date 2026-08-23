@@ -647,16 +647,22 @@ def _detect_shot_cuts(images, threshold, device, min_gap=_CUT_MIN_GAP):
             return _detect_shot_cuts_histogram(images, threshold, device, min_gap)
 
     import os
-    if 'TRANSVNET_CACHE' not in os.environ:
-        import folder_paths
-        model_dir = os.path.join(folder_paths.models_dir, "transnetv2")
-        if os.path.exists(os.path.join(model_dir, "transnetv2.pth")):
-            os.environ['TRANSVNET_CACHE'] = model_dir
-            print(f"[H3-Seam] TRANSVNET_CACHE set to {model_dir}")
+    from safetensors.torch import load_file
+    import folder_paths
 
+    # 构建模型文件路径（safetensors 格式）
+    model_dir = os.path.join(folder_paths.models_dir, "transnetv2")
+    model_path = os.path.join(model_dir, "transnetv2.safetensors")
+    
+    if not os.path.exists(model_path):
+        print(f"[H3-Seam] TransNetV2 safetensors file not found at {model_path}, falling back to histogram method.")
+        return _detect_shot_cuts_histogram(images, threshold, device, min_gap)
+
+    # 加载模型并强制在 CPU 上运行
     model = TransNetV2()
-    if torch.cuda.is_available():
-        model = model.cuda()
+    state_dict = load_file(model_path)
+    model.load_state_dict(state_dict, strict=False)
+    model = model.cpu()
     model.eval()
 
     import numpy as np
@@ -667,7 +673,7 @@ def _detect_shot_cuts(images, threshold, device, min_gap=_CUT_MIN_GAP):
         pil = Image.fromarray(frame)
         resized.append(np.array(pil.resize((48, 27), Image.BILINEAR), dtype=np.uint8))
     batch = np.stack(resized, axis=0)[np.newaxis, ...]
-    tensor = torch.from_numpy(batch).to(dtype=torch.uint8).to(model.device)
+    tensor = torch.from_numpy(batch).to(dtype=torch.uint8)
 
     with torch.no_grad():
         pred = model(tensor)
@@ -683,6 +689,8 @@ def _detect_shot_cuts(images, threshold, device, min_gap=_CUT_MIN_GAP):
             if not filtered or c - filtered[-1] >= min_gap:
                 filtered.append(c)
         cuts = filtered
+
+    del model
     return cuts
 
 
