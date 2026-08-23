@@ -199,7 +199,7 @@ parameter 节点 ──parameter──> 主节点(一采, 864×480)
 | use_gpu | true | 使用 CUDA GPU 进行统计、色彩变换与光流 |
 | debug | false | 打印诊断 |
 
-⚠️模型（检测分镜）：将models/transnetv2文件夹中的模型文件，拷贝到comfyUI的模型目录中（".\ComfyUI\models\transnetv2\transnetv2.safetensors"）
+⚠️模型（检测分镜）：将models/transnetv2文件夹中的模型文件，拷贝到comfyUI的模型目录中（".\ComfyUI\models\transnetv2\transnetv2.safetensors"），分镜检测在CPU上运行。
 
 > 用法：`VAE Decode → H3_Seam_Correction → Save/Video`。
 
