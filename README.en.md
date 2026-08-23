@@ -173,7 +173,7 @@ pass-2 node: shared parameter (or info inheritance); optional denoise 0.4~0.6
 
 ### SplitSigmas high/low frequency (save time, improve clarity)
 
-> ⚠️ **Audio constraint**: high/low frequency **only applies to video** (audio inter-segment continuity needs full sampling), so keep audio fully sampled.Shot detection runs on the CPU.
+> ⚠️ **Audio constraint**: high/low frequency **only applies to video** (audio inter-segment continuity needs full sampling), so keep audio fully sampled.
 
 ```
 Pass-1 node: full sampling (do not connect high_sigmas; audio fully denoised)
@@ -189,17 +189,16 @@ Pass-2 node: sigmas ← low_sigmas (only run the low-sigma range to add detail)
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `fix_color_preset` | `medium` | Color/exposure processing level. <br> `off`: no processing; <br> `low`: per‑channel luminance gain with correction halved, most conservative, no color shift; <br> `medium`: per‑channel luminance gain, only fixes seam level jumps (recommended); <br> `high`: MKL linear color transfer, longer statistical window, more stable with large motion; <br> `max`: per‑frame luminance normalization over the whole clip, eliminates gradual drift within segments, but flattens legitimate brightness changes (e.g., nightfall, tunnel entry); near‑black frames are ignored (logged). |
-| `fix_motion_preset` | `off` | Seam continuity level: <br> `off` = no processing (recommended default; try color preset first). <br> `low`/`medium`/`high`/`max` = optical flow alignment + local blending; higher levels blend more frames and with greater strength, but may introduce slight blur or pumping. |
-| `fix_flash` | `false` | Flash frame handling (instantaneous brightness spikes at boundaries). Independent toggle, uses seam temporal blending logic. If the scene contains legitimate rapid changes (lightning, explosions), suppression will flatten those effects. Remains active even when `fix_motion_preset=off`. |
-| `flash_threshold` | `0.30` | Threshold for transient correction (abnormal pixel ratio). Lower values are more aggressive (correct more frames). Recommended range: 0.20–0.40. |
-| `blend_frames` | `2` | Smoothing window for seam luminance transition (frames, 0–8). After exposure alignment, the brightness transition across the seam is flattened with a smooth ramp over ±`blend_frames` frames. Larger values give slower, more natural transitions, but may introduce slight blur/breathing in fast‑motion shots. `0` = off. |
-| `cut_detection` | `true` | Shot detection gate. When enabled, performs per‑frame shot‑cut detection (RGB histogram correlation) on the entire video. Exposure/color/motion corrections are applied only within the same shot; real cuts (including internal segment cuts) are skipped. When disabled, reverts to old behavior, processing all segment boundaries. |
-| `use_gpu` | `true` | Use CUDA GPU for statistics, color transforms, and optical flow. |
-| `debug` | `false` | Print diagnostic information. |
+| `fix_color_preset` | `"medium"` | **Color/Exposure correction level**<br>`off`: disabled;<br>`low`: per‑channel luminance gain with half‑strength correction, most conservative, no color cast;<br>`medium`: per‑channel luminance gain, only corrects seam level jumps (recommended);<br>`high`: MKL linear color transfer with a longer statistical window, more stable with large motion;<br>`max`: frame‑by‑frame luminance normalisation across the whole clip, eliminates gradual drift within segments, but flattens intentional brightness changes (e.g. sunset/tunnel entry); near‑black frames are ineffective (logged). |
+| `fix_motion_preset` | `"off"` | **Seam continuity (optical flow alignment + blending) level**<br>`off`: disabled (recommended to test with colour correction first);<br>`low/medium/high/max`: higher levels blend more frames with stronger effect, but may introduce slight blur or pumping. |
+| `fix_flash` | `false` | **Flash frame handling** (transient brightness jumps at boundaries). Independent switch, uses temporal fusion logic. May suppress legitimate rapid changes like lightning or explosions. Works even when `fix_motion_preset=off`. |
+| `flash_threshold` | `0.30` | Threshold for transient correction (abnormal pixel ratio). Lower values are more aggressive (correct more frames). Recommended range `0.20` – `0.40`. |
+| `blend_frames` | `2` | Level transition window around seams (frames, 0–8): after exposure alignment, smooths the brightness transition over `blend_frames` on each side of the boundary. Higher values give smoother transitions but may cause slight blur/breathing with fast motion; `0` disables. |
+| `cut_detection` | `true` | **Shot detection gate**: when enabled, automatically detects real scene cuts (using PySceneDetect), corrections are applied only within the same shot; real cuts are skipped to avoid colour contamination. When disabled, falls back to processing all detected segment boundaries (may incorrectly modify real cuts). |
+| `cut_threshold` | `15.0` | Sensitivity threshold for PySceneDetect (range `5.0` – `50.0`). Lower values are more sensitive. Recommended `10` – `20`. Only effective when `cut_detection=true`. |
+| `use_gpu` | `true` | Use CUDA GPU for statistics, colour transforms, and optical flow (falls back to CPU if unavailable). |
 
-⚠️Model (shot detection):
-Copy the model file from the models/transnetv2 folder to the ComfyUI model directory (.\ComfyUI\models\transnetv2\transnetv2.safetensors).
+⚠️ Removed the shot‑detection model dependency; now uses PySceneDetect (pure CPU, no potential pollution).
 
 > Usage: `VAE Decode → H3_Seam_Correction → Save/Video`.
 
