@@ -199,7 +199,7 @@ Pass-2 node: sigmas ← low_sigmas (only run the low-sigma range to add detail)
 | `debug` | `false` | Print diagnostic information. |
 
 ⚠️Model (shot detection):
-Copy the model file from the models/transnetv2 folder to the ComfyUI model directory (.\ComfyUI\models\transnetv2\transnetv2.pth).
+Copy the model file from the models/transnetv2 folder to the ComfyUI model directory (.\ComfyUI\models\transnetv2\transnetv2.safetensors).
 
 > Usage: `VAE Decode → H3_Seam_Correction → Save/Video`.
 
