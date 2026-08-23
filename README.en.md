@@ -173,7 +173,7 @@ pass-2 node: shared parameter (or info inheritance); optional denoise 0.4~0.6
 
 ### SplitSigmas high/low frequency (save time, improve clarity)
 
-> ⚠️ **Audio constraint**: high/low frequency **only applies to video** (audio inter-segment continuity needs full sampling), so keep audio fully sampled.
+> ⚠️ **Audio constraint**: high/low frequency **only applies to video** (audio inter-segment continuity needs full sampling), so keep audio fully sampled.Shot detection runs on the CPU.
 
 ```
 Pass-1 node: full sampling (do not connect high_sigmas; audio fully denoised)
