@@ -655,7 +655,8 @@ def _detect_shot_cuts(images, threshold, device, min_gap=_CUT_MIN_GAP):
         return cuts
 
     except Exception as e:
-        print(f"[H3-Seam] 临时文件检测失败: {e}")
+        print(f"[H3-Seam] PySceneDetect 依赖异常: {e}")
+        # 清理资源
         if video is not None:
             try:
                 if hasattr(video, 'close'):
@@ -669,9 +670,7 @@ def _detect_shot_cuts(images, threshold, device, min_gap=_CUT_MIN_GAP):
                 os.unlink(tmp_path)
             except:
                 pass
-        cuts = _detect_shot_cuts_histogram(images, threshold, device, min_gap)
-        cuts = _refine_cuts_by_similarity(cuts, images, device)
-        return cuts
+        return None
 
        
 def _detect_shot_cuts_histogram(images, threshold, device, min_gap=_CUT_MIN_GAP):
@@ -1151,12 +1150,6 @@ class H3SeamCorrection(io.ComfyNode):
                     step=0.01,
                     tooltip="瞬态修正筛选阈值,值越小越激进,推荐 0.20~0.40。",
                 ),
-
-                io.Boolean.Input(
-                    "cut_detection",
-                    default=True,
-                    tooltip=_CUT_DETECT_TOOLTIP,
-                ),
                 
                 io.Float.Input(
                     "cut_threshold",
@@ -1236,52 +1229,58 @@ class H3SeamCorrection(io.ComfyNode):
         )
 
         min_gap = max(4, _DETECT_WINDOW)
-        stats = _frame_stats(images, device)
-
-        steps, z = _detect_step_boundaries(stats, _DETECT_WINDOW, _DETECT_Z, min_gap)
-        steps = [s + 1 for s in steps if s + 1 < n_frames]
-
-        boundaries = sorted(set(steps))
-        transients = []
-
-        print(
-            f"[H3-Seam] 边界来源=内容检测: 台阶={steps} -> 合并={boundaries}"
-        )
-
-        if not boundaries:
-            print("[H3-Seam] 未检测到接缝，原样输出")
-            return io.NodeOutput(images)
-
+        
         if cut_detection:
+            print("[H3-Seam] 使用 PySceneDetect 进行镜头检测")
             cuts = _detect_shot_cuts(images, cut_threshold, device)
-            if cuts:
-                seams = []
-                edit_points = sorted(cuts)
-                for c in cuts:
-                    if c < 3 or c >= images.shape[0] - 3:
-                        continue
-                    corr = _spatial_similarity(
-                        images,
-                        left_start=max(0, c - 3),
-                        left_end=c,
-                        right_start=c,
-                        right_end=min(images.shape[0], c + 3),
-                        device=device
-                    )
-                    if corr > 0.60:
-                        seams.append(c)
-                        print(f"[H3-Seam] 边界 {c} 确认为同镜头色差 (空间相关系数={corr:.3f}) -> 启用色彩修正")
-                    else:
-                        print(f"[H3-Seam] 边界 {c} 为真实切镜 (空间相关系数={corr:.3f}) -> 跳过修正")
+        
+            if cuts is None:
+                print("[H3-Seam] PySceneDetect 异常，回退到台阶检测")
+                stats = _frame_stats(images, device)
+                steps, z = _detect_step_boundaries(stats, _DETECT_WINDOW, _DETECT_Z, min_gap)
+                steps = [s + 1 for s in steps if s + 1 < n_frames]
+                boundaries = sorted(set(steps))
+                seams = list(boundaries)
+                edit_points = sorted(boundaries)
                 if not seams:
-                    print("[H3-Seam] 所有边界均为真实切镜，无色彩修正执行")
+                    print("[H3-Seam] 台阶检测也未找到接缝，原样输出")
+                    return io.NodeOutput(images)
+
             else:
-                print("[H3-Seam] 镜头检测无输出，回退到内部台阶检测")
-                seams = [b for b in boundaries]
-                edit_points = sorted({int(b) for b in boundaries})
+                if not cuts:
+                    print("[H3-Seam] PySceneDetect 未检测到任何切点")
+                    seams = []
+                    edit_points = []
+                else:
+                    seams = []
+                    edit_points = sorted(cuts)
+                    for c in cuts:
+                        if c < 3 or c >= images.shape[0] - 3:
+                            continue
+                        corr = _spatial_similarity(
+                            images,
+                            left_start=max(0, c - 3),
+                            left_end=c,
+                            right_start=c,
+                            right_end=min(images.shape[0], c + 3),
+                            device=device
+                        )
+                        if corr > 0.60:
+                            seams.append(c)
+                            print(f"[H3-Seam] 边界 {c} 确认为同镜头色差 (相关系数={corr:.3f}) → 启用色彩修正")
+                        else:
+                            print(f"[H3-Seam] 边界 {c} 为真实切镜 (相关系数={corr:.3f}) → 跳过修正")
+                    if not seams:
+                        print("[H3-Seam] 所有边界均为真实切镜")
         else:
+            stats = _frame_stats(images, device)
+            steps, z = _detect_step_boundaries(stats, _DETECT_WINDOW, _DETECT_Z, min_gap)
+            steps = [s + 1 for s in steps if s + 1 < n_frames]
+            boundaries = sorted(set(steps))
             seams = list(boundaries)
-            edit_points = sorted({int(b) for b in boundaries})
+            edit_points = sorted(boundaries)
+            if not seams:
+                print("[H3-Seam] 未检测到接缝")
 
         if photo is None and seam is None and not fix_flash:
             print(
@@ -1294,7 +1293,7 @@ class H3SeamCorrection(io.ComfyNode):
         if photo is not None and photo["mode"] == "flatten":
             before = _luma_series(out, 0, n_frames, device)
             level, gain, clipped, ref = _correct_flatten(
-                out, boundaries, float(photo["strength"]), device)
+                out, seams, float(photo["strength"]), device)
             after = _luma_series(out, 0, n_frames, device)
             print(
                 f"[H3-Seam] color[max] 全片逐帧电平归一化 -> 锚点电平="
