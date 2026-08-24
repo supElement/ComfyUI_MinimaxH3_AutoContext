@@ -8,7 +8,7 @@
 # ComfyUI_MinimaxH3_AutoContext
 
 One-click MiniMax H3 long-video auto-generation node: **Segmented Inference + Inter-segment Continuation Anchoring + Prompt Timeline Slicing + Second Pass + Seam Correction**.
-To address VRAM limitations, long videos are split into multiple segments for independent inference; an overlapping enhancement method ensures seamless transitions between segments, while prompts are automatically segmented along the time axis to align content with the prompt rhythm. A two-stage processing workflow is supported (low-resolution initial sampling followed by high-resolution secondary sampling).It supports latent cache access, which makes it easy to quickly skip the inference segments if the inference is interrupted for some reason. The cache files are stored in units of segments, and the existing latent cache files can be read when the node parameters in the workflow remain unchanged.
+To address VRAM limitations, long videos are split into multiple segments for independent inference; an overlapping enhancement method ensures seamless transitions between segments, while prompts are automatically segmented along the time axis to align content with the prompt rhythm. A two-stage processing workflow is supported (low-resolution initial sampling followed by high-resolution secondary sampling).It supports latent cache access, which facilitates quickly skipping inference segments if inference is interrupted for some reason. The cache file is stored in units of segments, and the existing latent cache file can be read when the upstream parameters of the sampling node remain unchanged.
 
 <img width="2230" height="976" alt="image" src="https://github.com/user-attachments/assets/5634914a-6f98-4d4f-b573-2c8b41e0c57e" />
 
