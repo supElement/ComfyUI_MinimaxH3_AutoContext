@@ -7,9 +7,8 @@
 
 # ComfyUI_MinimaxH3_AutoContext
 
-> One-click MiniMax H3 long-video auto-generation node: **Segmented Inference + Inter-segment Continuation Anchoring + Prompt Timeline Slicing + Second Pass + Seam Correction**.
-
-To address VRAM limitations, long videos are split into multiple segments for independent inference; an overlapping enhancement method ensures seamless transitions between segments, while prompts are automatically segmented along the time axis to align content with the prompt rhythm. A two-stage processing workflow is supported (low-resolution initial sampling followed by high-resolution secondary sampling).
+One-click MiniMax H3 long-video auto-generation node: **Segmented Inference + Inter-segment Continuation Anchoring + Prompt Timeline Slicing + Second Pass + Seam Correction**.
+To address VRAM limitations, long videos are split into multiple segments for independent inference; an overlapping enhancement method ensures seamless transitions between segments, while prompts are automatically segmented along the time axis to align content with the prompt rhythm. A two-stage processing workflow is supported (low-resolution initial sampling followed by high-resolution secondary sampling).It supports latent cache access, which makes it easy to quickly skip the inference segments if the inference is interrupted for some reason. The cache files are stored in units of segments, and the existing latent cache files can be read when the node parameters in the workflow remain unchanged.
 
 <img width="2230" height="976" alt="image" src="https://github.com/user-attachments/assets/5634914a-6f98-4d4f-b573-2c8b41e0c57e" />
 
@@ -146,6 +145,8 @@ Search `ComfyUI_MinimaxH3_AutoContext` in ComfyUI Manager and click Install.
 | steps / cfg | 30 / 1.0 | Sampling steps / CFG |
 | sampler_name / scheduler | euler / simple | Built-in sampler / scheduler |
 | denoise | 1.0 | Redraw strength (1 = full resample, lower preserves more of the original structure) |
+| enable_cache | true | Stores and reads the latent cache. Existing latent cache files will be overwritten when upstream nodes or parameters change. |
+| cache_dir | Empty | Specifies any directory for the latent cache files, such as: "D:\SDcomfyUI\ComfyUI\output\cache" or "D:/SDcomfyUI/ComfyUI/output/cache". It is recommended to specify different directories for different sampling nodes.|
 | ref_image_N / ref_video_N / ref_video_audio_N / ref_audio_N | optional | Reference materials (Autogrow dynamic ports) |
 | drive_audio | optional | Audio drive source |
 
