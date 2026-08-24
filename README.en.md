@@ -194,7 +194,7 @@ Pass-2 node: sigmas ← low_sigmas (only run the low-sigma range to add detail)
 | `fix_motion_preset` | `"off"` | **Seam continuity (optical flow alignment + blending) level**<br>`off`: disabled (recommended to test with colour correction first);<br>`low/medium/high/max`: higher levels blend more frames with stronger effect, but may introduce slight blur or pumping. |
 | `fix_flash` | `false` | **Flash frame handling** (transient brightness jumps at boundaries). Independent switch, uses temporal fusion logic. May suppress legitimate rapid changes like lightning or explosions. Works even when `fix_motion_preset=off`. |
 | `flash_threshold` | `0.30` | Threshold for transient correction (abnormal pixel ratio). Lower values are more aggressive (correct more frames). Recommended range `0.20` – `0.40`. |
-| `cut_threshold` | `15.0` | Sensitivity threshold for PySceneDetect (range `5.0` – `50.0`). Lower values are more sensitive. Recommended `10` – `20`. Only effective when `cut_detection=true`. |
+| `cut_threshold` | `15.0` | Sensitivity threshold for PySceneDetect (range `5.0` – `50.0`). Lower values are more sensitive. Recommended `10` – `20`. |
 | `blend_frames` | `2` | Level transition window around seams (frames, 0–8): after exposure alignment, smooths the brightness transition over `blend_frames` on each side of the boundary. Higher values give smoother transitions but may cause slight blur/breathing with fast motion; `0` disables. |
 | `use_gpu` | `true` | Use CUDA GPU for statistics, colour transforms, and optical flow (falls back to CPU if unavailable). |
 
