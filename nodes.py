@@ -190,6 +190,15 @@ class H3AutoContextSampler(io.ComfyNode):
                 io.Combo.Input("scheduler", options=_SCHEDULERS, default="simple"),
                 io.Float.Input("denoise", default=1.0, min=0.0, max=1.0, step=0.05,
                     tooltip="重绘强度。1.0=全量重采样，越小保留越多原结构。连接 sigmas 且 denoise≠1 时 final_sigmas=sigmas*denoise"),
+                
+                io.Boolean.Input("enable_cache",
+                    default=True,
+                    tooltip="是否启用分段缓存。开启后，采样结果会保存到 cache_dir，后续运行时若参数一致则直接加载。"
+                ),
+                io.String.Input("cache_dir", multiline=False, dynamic_prompts=False,
+                    socketless=False, default="",
+                    tooltip="分段 Latent 缓存目录（留空禁用）。每段会保存为 seg_XXXX.pt，"
+                            "若存在且参数匹配则直接加载，跳过采样。"),
 
                 io.Autogrow.Input("ref_images", optional=True,
                     template=io.Autogrow.TemplatePrefix(
@@ -238,6 +247,8 @@ class H3AutoContextSampler(io.ComfyNode):
                 sampler=None,
                 video_context_denoise=0.0,
                 seed=0,
+                enable_cache=True, 
+                cache_dir="",
                 ref_images=None, ref_videos=None,
                 ref_video_audios=None, ref_audios=None,
                 drive_audio=None) -> io.NodeOutput:
@@ -350,6 +361,8 @@ class H3AutoContextSampler(io.ComfyNode):
             denoise=denoise, lock_audio=lock_audio,
             video_context_denoise=video_context_denoise,
             sampler=sampler,
+            enable_cache=enable_cache,
+            cache_dir=cache_dir,
         )
         # 段间接缝信息并入 info，供下游 Minimax_H3_Seam_Correction 精确定位边界 (可选消费)
         if seam_info:

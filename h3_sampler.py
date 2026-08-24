@@ -15,6 +15,9 @@ h3_sampler.py — H3 分段推理采样器
 import math
 import re
 import torch
+from . import latent_cache
+import threading
+import hashlib
 
 try:
     import torchaudio
@@ -391,7 +394,9 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
                                 drive_audio=None, audio_drive=False,
                                 latent_input=None, sigmas=None, denoise=1.0,
                                 lock_audio=True, video_context_denoise=0.0,
-                                sampler=None):
+                                sampler=None,
+                                cache_dir="",
+                                enable_cache=True):
     h3_patches.apply_patches()
 
     device = comfy.model_management.get_torch_device()
@@ -553,32 +558,33 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
 
     overall_pbar = comfy.utils.ProgressBar(len(chunks) * (2 if decode_output else 1))
 
+    # ==================== 段循环开始 ====================
     for idx, (start_f, end_f) in enumerate(chunks):
         comfy.model_management.throw_exception_if_processing_interrupted()
         is_first_chunk = (idx == 0)
         is_last_chunk = (idx == len(chunks) - 1)
         seg_frames = end_f - start_f
-
-        # 段间续接锚定用上一段的干净 x0 预测 (含残余噪声的 samples 不能直接当 keyframe)
+    
+        # 段间续接锚定用上一段的干净 x0 预测
         anchor_prev = None
         if not is_first_chunk:
             anchor_prev = prev_x0
-
+    
         account = f"帧数={seg_frames}"
         if not is_first_chunk:
             account += f" (锚定={effective_context} + 新增={seg_frames - effective_context})"
         print(f"[H3-Auto] 生成段 {idx+1}/{len(chunks)} (帧{start_f}-{end_f}) {account}")
-
+    
+        # ==================== 提示词构建（原有逻辑，不变） ====================
         if is_tag_mode:
             seg_text, _ = tag_segments[idx]
-            # 用实际新增帧数渲染时间，保证提示词时间坐标与实际产出帧数一致 (总时长补偿后)
             seg_seconds = new_frames[idx] / fps
             window_prompt = h3_utils.render_tag_segment(
                 seg_text, seg_seconds, prompt_format, tag_prefix)
         else:
             window_prompt = h3_utils.compose_window_prompt(
                 prompt_schedule, start_f / fps, end_f / fps, fmt=prompt_format)
-
+    
         seg_ref_vid, seg_ref_aud = ref_vid_data, ref_aud_data
         if ref_sync_mode == "segmented":
             if seg_ref_vid or seg_ref_aud:
@@ -591,14 +597,15 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
             seg_ref_aud = _slice_ref_audios_for_segment(
                 ref_aud_data, seg_start_ratio, seg_end_ratio,
                 audio_vae, device)
-
+    
         seg_ref_img, seg_ref_vid, seg_ref_aud, window_prompt = _filter_refs_for_prompt(
             window_prompt, ref_img_data, seg_ref_vid, seg_ref_aud, fmt=prompt_format)
-
-        print(f"[H3-Auto] ----- 段 {idx+1}/{len(chunks)} 完整提示词 ({len(window_prompt)}字) -----")
+    
+        print("\033[32m" + f"[H3-Auto] ----- 段 {idx+1}/{len(chunks)} 完整提示词 ({len(window_prompt)}字) -----" + "\033[0m")
         print(window_prompt)
         print(f"[H3-Auto] {'=' * 50}")
-
+    
+        # ==================== 构建 conditioning payload（原有逻辑，不变） ====================
         payload = h3_conditioning.build_conditioning_payload(
             seed=seed + idx, frame_count=seg_frames,
             first_latent=first_latent if is_first_chunk else None,
@@ -611,40 +618,36 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
             first_frame_pixel=first_frame if is_first_chunk else None,
             last_frame_pixel=last_frame if is_last_chunk else None,
         )
-
+    
         positive = h3_conditioning.encode_text_with_references(
             clip, window_prompt, payload["ref_items_for_clip"], device,
             images_for_clip=payload.get("images_for_clip"))
-
+    
         positive = h3_conditioning.inject_conditioning_data(positive, payload)
-
+    
         drive_aud_latent = None
         if drive_waveform is not None and not is_second_pass:
-            # 本段锁定的音频对应输出时间轴 [gen_start, gen_end)，含非首段的续接重演头
             gen_start = output_cursor - (effective_context if not is_first_chunk else 0)
             gen_end = gen_start + seg_frames
             drive_aud_latent = _encode_drive_audio(
                 audio_vae, drive_waveform, drive_sr, gen_start / fps, gen_end / fps, device)
             if drive_aud_latent is None:
                 print(f"[H3-Auto] 段 {idx+1}/{len(chunks)}: drive_audio 切片为空，本段不锁定音频")
-
+    
+        # ==================== 准备初始 latent（原有逻辑，不变） ====================
         if is_second_pass:
             seg_latent_dict = first_pass_segments[idx]
-            # 二采段: 非首段 video overlap 头按 mask 去噪 + 可选锁定音频 (首段无 overlap 头，仅锁音频)
             ov_t = 0
             if not is_first_chunk:
                 ov_t = max(2, video_latent_frames(effective_context)) if effective_context > 5 else 2
             if ov_t > 0 or lock_audio:
                 if ov_t > 0:
-                    # 用二采本身推理后的干净 samples 尾部重写 overlap 头
-                    # (而非 input latent 放大后的复制，避免接缝扭曲破碎)
                     seg_latent_dict = _copy_overlap_tail(
                         seg_latent_dict, all_segments[idx - 1], ov_t)
                 seg_latent_dict = _with_locked_audio(
                     seg_latent_dict, overlap_video_tokens=ov_t,
                     lock_audio=lock_audio, overlap_video_denoise=video_context_denoise)
         else:
-            # 一采段: 非首段把上一段视频尾部逐 token 复制进 overlap 头并按 mask 去噪 (而非 keyframe 重演)
             overlap_video = None
             if not is_first_chunk and idx > 0:
                 overlap_video, _prev_a = h3_conditioning.unpack_nested_latent(
@@ -653,21 +656,76 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
                 latent_w, latent_h, seg_frames, fps, drive_audio_latent=drive_aud_latent,
                 overlap_video=overlap_video, overlap_video_denoise=video_context_denoise,
                 overlap_frames=effective_context)
-
-        segment_latent = _sample_segment(
-            model, positive, seg_latent_dict, steps, cfg,
-            sampler_name, scheduler, seed + idx,
-            denoise=denoise, sigmas=sigmas,
-            sampler_obj=sampler)
-
+    
+        # ==================== 🔥 缓存逻辑开始 ====================
+        # 1. 准备当前段的元数据（用于缓存校验）
+        current_meta = {
+            "seed": seed + idx,
+            "steps": steps,
+            "cfg": cfg,
+            "sampler_name": sampler_name,
+            "scheduler": scheduler,
+            "denoise": denoise,
+            "video_context_denoise": video_context_denoise,
+        }
+        
+        # 如果有 sigmas，计算指纹（取前10个值）
+        if sigmas is not None:
+            if isinstance(sigmas, torch.Tensor):
+                sigmas_flat = sigmas.flatten()
+                if sigmas_flat.numel() > 0:
+                    sample = sigmas_flat[:10].cpu().numpy().tobytes()
+                    current_meta["sigmas_hash"] = hashlib.md5(sample).hexdigest()
+                else:
+                    current_meta["sigmas_hash"] = None
+            else:
+                current_meta["sigmas_hash"] = str(sigmas)
+        
+        if is_second_pass:
+            v_in, _ = h3_conditioning.unpack_nested_latent(latent_input)
+            if v_in is not None:
+                input_hash = latent_cache.compute_input_hash(v_in)
+                current_meta["input_hash"] = input_hash
+        
+        # 2. 尝试从缓存加载
+        cached_samples = None
+        cached_x0 = None
+        if enable_cache and cache_dir:
+            cached_samples, cached_x0 = latent_cache.load_segment_latent(
+                cache_dir, idx, current_meta)
+        
+        if cached_samples is not None:
+            # 缓存命中：直接使用，跳过采样
+            segment_latent = cached_samples
+            x0 = cached_x0
+            print("\033[33m" + f"[H3-Cache] 段 {idx+1}/{len(chunks)} 加载缓存，跳过采样" + "\033[0m")
+        else:
+            # 缓存未命中：执行正常采样
+            segment_latent = _sample_segment(
+                model, positive, seg_latent_dict, steps, cfg,
+                sampler_name, scheduler, seed + idx,
+                denoise=denoise, sigmas=sigmas,
+                sampler_obj=sampler)
+        
+            x0 = segment_latent.get("x0")
+        
+            # 3. 异步保存缓存（元数据与 current_meta 相同）
+            if enable_cache and cache_dir:
+                metadata = current_meta.copy()  # 直接使用 current_meta
+                latent_cache.save_segment_latent_async(
+                    cache_dir, idx, segment_latent, x0, metadata)
+                print("\033[33m" + f"[H3-Cache] 段 {idx+1}/{len(chunks)} 已提交异步保存" + "\033[0m")
+        # ==================== 🔥 缓存逻辑结束 ====================
+    
+        # ==================== 收集结果（原有逻辑，不变） ====================
         samples_dict = {"samples": segment_latent["samples"]}
-        x0 = segment_latent.get("x0")
         x0_dict = {"samples": x0} if x0 is not None else samples_dict
         prev_x0 = x0_dict
         all_segments.append(samples_dict)
         all_x0.append(x0_dict)
         output_cursor += new_frames[idx]
         overall_pbar.update(1)
+    # ==================== 段循环结束 ====================
 
     final_latent = _merge_segment_latents(all_segments, effective_context, fps)
     final_denoised = _merge_segment_latents(all_x0, effective_context, fps)
@@ -695,7 +753,6 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
         print(f"[H3-Auto] 音频驱动: 源音频已锁进 latent，视频照它生成")
 
     if not decode_output:
-        print("[H3-Auto] 跳过内部解码，仅输出 latent (像素请接外部 VAE Decode)")
         return None, drive_final_audio, final_latent, final_denoised, seam_info
 
     print("[H3-Auto] 开始逐段 VAE 解码与拼接...")
