@@ -7,8 +7,7 @@
 
 # ComfyUI_MinimaxH3_AutoContext
 
-> 一键式 MiniMax H3 长视频自动化生成节点：**分段推理 + 段间续接锚定 + 提示词时间轴切片 + 二次采样（二采）+ 接缝修正**。
-
+一键式 MiniMax H3 长视频自动化生成节点：**分段推理 + 段间续接锚定 + 提示词时间轴切片 + 二次采样（二采）+ 接缝修正**。
 在显存有限的情况下，将长视频拆分为多段独立推理，通过叠加增强方法实现段间无缝衔接，同时按时间轴自动切分提示词，让每段生成内容与提示词节奏对齐。支持二采（低清一采 + 高清二采）。
 支持latent缓存存取，方便推理过程中因某种原因导致推理中断后，快速跳过已推理分段，缓存文件以分段为单位存储，在工作流中的节点参数不变的情况下，读取已有latent cache 文件。
 
@@ -148,6 +147,8 @@ git clone https://github.com/supElement/ComfyUI_MinimaxH3_AutoContext.git
 | steps / cfg | 30 / 1.0 | 采样步数 / CFG |
 | sampler_name / scheduler | euler / simple | 内置采样器 / 调度器 |
 | denoise | 1.0 | 重绘强度（1=全量重采样，越小保留越多原结构） |
+| enable_cache | true | 存储\读取latent缓存，上游节点或参数发生变化时会覆盖已有latent缓存文件 |
+| cache_dir | 空 | 为latent缓存文件指定任意目录，如：“D:\SDcomfyUI\ComfyUI\output\cache” 或者 "D:/SDcomfyUI/ComfyUI/output/cache" 。推荐为不同采样节点指定不同目录|
 | ref_image_N / ref_video_N / ref_video_audio_N / ref_audio_N | 可选 | 参考素材（Autogrow 动态端口） |
 | drive_audio | 可选 | 音频驱动源 |
 
