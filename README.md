@@ -16,6 +16,12 @@
 
 <img width="2209" height="1030" alt="image" src="https://github.com/user-attachments/assets/9bbdda2a-d4ce-4836-b108-e359e72e31de" />
 
+## BUG修复
+
+V0.5.8
+- 完善哈希值检测参数，解决采样器上游节点parameter参数改变时导致的张量不匹配的错误。
+- Minimax_H3_Seam_Correction节点，去除镜头检测模型，检测模型会导致采样节点预览“白屏”，替换为 PySceneDetect 方法（纯 CPU，无潜在污染）。
+
 ## 📖 目录
 
 - [节点列表](#nodes)
