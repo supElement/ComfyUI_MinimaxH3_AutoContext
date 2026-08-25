@@ -114,11 +114,6 @@ class H3ParameterNode(io.ComfyNode):
                             "不重新生成音频)，视频照它生成。"
                             "注意：本节点不输出音频，请把同一条源音频直接接到视频合成节点 "
                             "(这样也避免了 VAE 有损往返)。不勾选 (默认): 音频照常生成"),
-                # [已注释] decode_output：内部解码仅为测试用途，封闭式实现无法适配社区新节点/新技术。
-                # 主节点固定只输出 latent，解码统一交给外部 VAE Decode 等标准节点处理。
-                # io.Boolean.Input("decode_output",
-                #     default=False,
-                #     tooltip="是否在节点内部解码输出 video_frames 和 audio。不勾选 (默认): 只输出 latent；勾选: 节点内部解码"),
             ],
             outputs=[
                 io.Dict.Output(display_name="parameter"),
@@ -131,7 +126,6 @@ class H3ParameterNode(io.ComfyNode):
                 prompt_format="official", crop_mode="stretch", ref_sync_mode="segmented",
                 width=960, height=544, total_frames=362, fps=24, chunk_frames=90,
                 context_frames=22, lock_audio=True, audio_drive=False,
-                # decode_output=False,  # [已注释] 见 define_schema 说明
                 ) -> io.NodeOutput:
         parameter = {
             "long_prompt": long_prompt,
@@ -142,7 +136,6 @@ class H3ParameterNode(io.ComfyNode):
             "width": width, "height": height, "total_frames": total_frames,
             "fps": fps, "chunk_frames": chunk_frames, "context_frames": context_frames,
             "lock_audio": lock_audio, "audio_drive": audio_drive,
-            # "decode_output": decode_output,  # [已注释] 不再下发，主节点固定只输出 latent
         }
         return io.NodeOutput(parameter)
 
@@ -225,11 +218,6 @@ class H3AutoContextSampler(io.ComfyNode):
                             "输出音频=这条音频本身 (口型/节奏由它驱动)。可与 ref_audio_0 接同一条音频"),
             ],
             outputs=[
-                # [已注释] video_frames / audio：内部解码输出仅为测试用途，属于封闭式实现，
-                # 社区出新解码/后处理节点时无法及时适配。本节点只输出 latent，
-                # 像素与音频请接外部 VAE Decode 等标准节点自行解码。
-                # io.Image.Output(display_name="video_frames"),
-                # io.Audio.Output(display_name="audio"),
                 io.Latent.Output(display_name="latent"),
                 io.Latent.Output(display_name="denoised_latent"),
                 io.Dict.Output(display_name="info"),
@@ -270,9 +258,6 @@ class H3AutoContextSampler(io.ComfyNode):
         context_frames = int(p.get("context_frames", 22))
         lock_audio = p.get("lock_audio", True)
         audio_drive = p.get("audio_drive", False)
-        # [已注释] decode_output 不再从 parameter 读取，固定 False：
-        # 节点只输出 latent，解码交给外部 VAE Decode 节点。
-        # decode_output = p.get("decode_output", False)
         decode_output = False
 
         # info 参数继承：info 中存在的分段参数覆盖 parameter 解包值 (保证多节点分段同步)
@@ -305,10 +290,6 @@ class H3AutoContextSampler(io.ComfyNode):
                 chunk_frames = total_frames
         width = max(32, (width // 32) * 32)
         height = max(32, (height // 32) * 32)
-        # 兼容旧版 combo 字符串值 ("disable"/"enable")，新版为布尔复选框
-        # [已注释] decode_output 已固定 False，无需字符串兼容
-        # if isinstance(decode_output, str):
-        #     decode_output = (decode_output == "enable")
         if isinstance(audio_drive, str):
             audio_drive = (audio_drive == "enable")
         if isinstance(lock_audio, str):
@@ -341,7 +322,6 @@ class H3AutoContextSampler(io.ComfyNode):
 
         ref_audio_list = _autogrow_to_list(ref_audios, "ref_audio_", 4)
 
-        # decode_output 固定 False，frames/audio 恒为 None (端口已注释，不再对外输出)
         _frames, _audio, latent, denoised_latent, seam_info = h3_sampler.run_auto_context_generation(
             model=model, vae=vae, audio_vae=audio_vae, clip=clip,
             first_frame=first_frame, last_frame=last_frame,
@@ -364,9 +344,7 @@ class H3AutoContextSampler(io.ComfyNode):
             enable_cache=enable_cache,
             cache_dir=cache_dir,
         )
-        # 段间接缝信息并入 info，供下游 Minimax_H3_Seam_Correction 精确定位边界 (可选消费)
         if seam_info:
             out_info.update(seam_info)
 
-        # [已注释] 原返回: io.NodeOutput(frames, audio, latent, denoised_latent, out_info)
         return io.NodeOutput(latent, denoised_latent, out_info)

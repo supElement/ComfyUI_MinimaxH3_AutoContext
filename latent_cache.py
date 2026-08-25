@@ -163,7 +163,15 @@ def load_segment_latent(cache_dir, seg_idx, current_metadata=None):
 
     # 参数校验（如果提供了 current_metadata）
     if current_metadata:
-        sensitive_keys = ["seed", "steps", "cfg", "sampler_name", "scheduler", "denoise", "video_context_denoise", "sigmas_hash", "input_hash"]
+        sensitive_keys = [
+            "seed", "steps", "cfg", "sampler_name", "scheduler",
+            "denoise", "video_context_denoise", "sigmas_hash", "input_hash",
+            "latent_w", "latent_h",
+            "total_frames", "fps", "chunk_frames", "context_frames",
+            "lock_audio", "audio_drive", 
+            "window_prompt_hash"
+        ]
+        
         mismatch = False
         for k in sensitive_keys:
             if saved_meta.get(k) != current_metadata.get(k):

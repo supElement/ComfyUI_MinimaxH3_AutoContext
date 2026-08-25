@@ -605,6 +605,14 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
         print(window_prompt)
         print(f"[H3-Auto] {'=' * 50}")
     
+        # ==================== 【新增】计算当前段实际使用的条件指纹 ====================
+        conditions_hash = _compute_conditions_hash(
+            seg_ref_img,                    # 已经过 crop_mode 处理
+            seg_ref_vid,                    # 已经过 crop_mode + ref_sync_mode 切片处理
+            first_frame if is_first_chunk else None,   # 只有首段才把首帧算进去
+            last_frame if is_last_chunk else None      # 只有末段才把尾帧算进去
+        )
+    
         # ==================== 构建 conditioning payload（原有逻辑，不变） ====================
         payload = h3_conditioning.build_conditioning_payload(
             seed=seed + idx, frame_count=seg_frames,
@@ -658,7 +666,17 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
                 overlap_frames=effective_context)
     
         # ==================== 🔥 缓存逻辑开始 ====================
+        
+        # 1. 计算最终提示词的哈希（这是最关键的文本指纹）
+        window_prompt_hash = hashlib.md5(window_prompt.encode('utf-8')).hexdigest()
+        
         # 1. 准备当前段的元数据（用于缓存校验）
+        if long_prompt:
+            prompt_sample = long_prompt[:1024].encode('utf-8')
+            prompt_hash = hashlib.md5(prompt_sample).hexdigest()
+        else:
+            prompt_hash = ""
+            
         current_meta = {
             "seed": seed + idx,
             "steps": steps,
@@ -667,19 +685,31 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
             "scheduler": scheduler,
             "denoise": denoise,
             "video_context_denoise": video_context_denoise,
+            "latent_w": latent_w,
+            "latent_h": latent_h,
+            "total_frames": total_frames,
+            "fps": fps,
+            "chunk_frames": chunk_frames,
+            "context_frames": context_frames,
+            "lock_audio": lock_audio,
+            "audio_drive": audio_drive,
+            "window_prompt_hash": window_prompt_hash,
+            "conditions_hash": conditions_hash,   
         }
         
-        # 如果有 sigmas，计算指纹（取前10个值）
+        # 如果有 sigmas，对整个序列计算哈希
         if sigmas is not None:
             if isinstance(sigmas, torch.Tensor):
-                sigmas_flat = sigmas.flatten()
-                if sigmas_flat.numel() > 0:
-                    sample = sigmas_flat[:10].cpu().numpy().tobytes()
-                    current_meta["sigmas_hash"] = hashlib.md5(sample).hexdigest()
+                # 对整个 sigmas 序列做哈希（而不是只取前10个）
+                sigmas_flat = sigmas.flatten().cpu().numpy()
+                if sigmas_flat.size > 0:
+                    # 使用 numpy 的 tobytes 对整个数组做哈希
+                    current_meta["sigmas_hash"] = hashlib.md5(sigmas_flat.tobytes()).hexdigest()
                 else:
                     current_meta["sigmas_hash"] = None
             else:
-                current_meta["sigmas_hash"] = str(sigmas)
+                # 如果 sigmas 不是 tensor，直接转为字符串哈希
+                current_meta["sigmas_hash"] = hashlib.md5(str(sigmas).encode('utf-8')).hexdigest()
         
         if is_second_pass:
             v_in, _ = h3_conditioning.unpack_nested_latent(latent_input)
@@ -822,6 +852,46 @@ def _prepare_ref_images(ref_images, vae, device, gen_w, gen_h, crop_mode="stretc
             result.append({"pixel": resized, "latent": lat})
     return result
 
+def _compute_conditions_hash(ref_img_data, ref_vid_data, first_frame=None, last_frame=None):
+    """
+    计算当前段实际使用的所有外部输入条件（像素）的指纹哈希。
+    只对当前段真正用到的素材取指纹，避免跨段误判。
+    """
+    import hashlib
+    import numpy as np
+    
+    hasher = hashlib.md5()
+    
+    # 如果没有任何条件，返回固定字符串
+    if not ref_img_data and not ref_vid_data and first_frame is None and last_frame is None:
+        return "no_external_conditions"
+    
+    # 1. 首帧（仅在当前段为首段时传入）
+    if first_frame is not None:
+        # 取第一帧左上角 8x8 像素块（所有条件都统一取此位置，保证一致性）
+        sample = first_frame[0, :8, :8, :3].cpu().numpy().tobytes()
+        hasher.update(sample)
+    
+    # 2. 尾帧（仅在当前段为末段时传入）
+    if last_frame is not None:
+        sample = last_frame[0, :8, :8, :3].cpu().numpy().tobytes()
+        hasher.update(sample)
+    
+    # 3. 所有参考图片（已经过 resize/crop 处理）
+    for img_data in (ref_img_data or []):
+        pixel = img_data.get("pixel")
+        if pixel is not None and pixel.shape[0] > 0:
+            sample = pixel[0, :8, :8, :3].cpu().numpy().tobytes()
+            hasher.update(sample)
+    
+    # 4. 所有参考视频（取第一帧）
+    for vid_data in (ref_vid_data or []):
+        pixel = vid_data.get("pixel")
+        if pixel is not None and pixel.shape[0] > 0:
+            sample = pixel[0, :8, :8, :3].cpu().numpy().tobytes()
+            hasher.update(sample)
+    
+    return hasher.hexdigest()
 
 def _prepare_ref_videos(ref_videos, vae, audio_vae, device, gen_w, gen_h, fps,
                         crop_mode="stretch", pre_encode=True):
