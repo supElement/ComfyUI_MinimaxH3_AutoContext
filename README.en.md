@@ -15,6 +15,14 @@ To address VRAM limitations, long videos are split into multiple segments for in
 
 <img width="2209" height="1030" alt="image" src="https://github.com/user-attachments/assets/9bbdda2a-d4ce-4836-b108-e359e72e31de" />
 
+## Bug Fixes
+
+V0.5.8
+
+- Improved hash value detection parameters to resolve tensor mismatch errors caused by changes in the parameter parameters of the upstream node of the sampler.
+
+- Minimax_H3_Seam_Correction node: Removed the camera detection model, which caused a "white screen" in the sampling node preview. Replaced it with the PySceneDetect method (pure CPU, no potential pollution).
+
 ## 📖 Table of Contents
 
 - [Node List](#nodes)
