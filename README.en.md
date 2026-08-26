@@ -7,13 +7,14 @@
 
 # ComfyUI_MinimaxH3_AutoContext
 
-One-click MiniMax H3 Long Video Auto-Generated Node: **Segmented Inference + Segment Transition Anchoring + Prompt Timeline Slicing + Secondary Sampling (SS) + Seam Correction**.
-Split long videos into multiple segments for independent inference under limited GPU memory, achieve seamless connection between segments through superposition enhancement, and automatically slice prompts along the time axis to align the generated content with the prompt rhythm. Also, slice and align audio-video references. Supports SS (Low-resolution One-pass + High-resolution SS).
-Supports latent caching and retrieval, making it convenient to quickly skip the already inferred segments and cache files when the inference is interrupted for some reason, storing cache files by segment. Reading the existing latent cache files under the same upstream parameters in the sampling node.
+One-click MiniMax H3 long-video automated generation node: **Segmented inference + inter-segment continuity anchoring + timeline-based prompt slicing + secondary sampling (upscaling pass) + seam correction**.
+To handle limited VRAM, the long video is split into multiple segments for independent inference. Seamless transitions are achieved via overlap-based enhancement, while prompts are automatically sliced ​​along the timeline to align generated content with the prompt's rhythm. Audio/video references are similarly sliced ​​and aligned; only the references relevant to the current segment participate in inference. Supports a two-pass sampling approach (low-res initial pass + high-res secondary pass).
+Supports latent cache read/write operations, allowing for quick resumption if inference is interrupted. Cache files are stored per segment; existing latent cache files are reused provided the upstream parameters of the sampling node remain unchanged.
 
-Note: When changing the model, including lora, sageattention, etc., latent detection will not find changes, so latent cache must be deleted. Two methods to delete latent cache:
-- Enable the clear_cache parameter on the Minimax_H3_AutoContext_Sampler node, which will force a complete re-establishment of the cache file of this node when the sampling starts.
-- Manually delete the corresponding folder in the cache directory (\ComfyUI\output\cache), named "node_" + "node ID".
+Note: Changing models—or acceleration nodes like LoRA or SageAttention—will not be detected by the latent check mechanism; therefore, the latent cache must be deleted. Two methods exist to delete the latent cache:
+- Enable the `clear_cache` parameter on the `Minimax_H3_AutoContext_Sampler` node; this forces the node to regenerate its cache file when sampling begins.
+- Manually delete the corresponding folder in the cache directory (`\ComfyUI\output\cache`); the folder is named "node_" followed by the "Node ID".
+- `ignore_latent_hash`: Ignores hash verification for the `input_latent` port. Use case: Certain latent processing nodes (e.g., `Minimax H3 Latent Upscaler (3D)`) alter latent metadata, causing minor changes that render the latent cache unusable and waste inference time; setting this to `true` is recommended in such cases. I have only tested this with the `Minimax_H3-LatentUpscaler_Adv` node from my other repository (`github.com/supElement/ComfyUI_Element_easy`); other similar nodes have not been tested. When using latent processing nodes that do not alter latent noise characteristics, the `ignore_latent_hash` parameter can be set to `false`.
 
 <img width="2230" height="976" alt="image" src="https://github.com/user-attachments/assets/5634914a-6f98-4d4f-b573-2c8b41e0c57e" />
 
