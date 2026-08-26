@@ -21,6 +21,20 @@ Note: Changing models—or acceleration nodes like LoRA or SageAttention—will 
 
 <img width="2209" height="1030" alt="image" src="https://github.com/user-attachments/assets/9bbdda2a-d4ce-4836-b108-e359e72e31de" />
 
+## Bug fixes and optimizations
+
+V0.6.5
+
+Optimized latent cache handling logic: removed the manual cache directory specification and switched to automatically assigning a unique cache directory (format: "node + node ID") for each node. This prevents accidental overwriting of latent caches between sampling nodes.
+Implemented segmented cache and validation logic: if an upstream node merely adds a prompt or a new segment—without altering prompts for existing segments submitted to the sampler or changing parameters linked to the sampling node—the existing cache remains valid and is reused, while a new latent cache is automatically created for the added segment. Downstream sampling nodes (e.g., a second sampling pass) also retain and utilize existing latent caches, creating new caches only for the newly added segments.
+The position of a prompt change determines which latent caches can be reused; segments following the modified one are forced to regenerate, and downstream nodes apply the same logic.
+`ignore_latent_hash`: Ignores hash verification for the `input_latent` port. Use case: Some latent processing nodes (such as the Minimax H3 Latent Upscaler (3D) node) alter latent metadata, causing minor changes that render the latent cache unusable and waste inference time; setting this to `true` is recommended in such cases. I have only tested this with the `Minimax_H3-LatentUpscaler_Adv` node from my other repository (github.com/supElement/ComfyUI_Element_easy) and have not tested similar nodes; for latent processing nodes that do not alter latent noise characteristics, the `ignore_latent_hash` parameter can be set to `false`.
+
+V0.5.8
+
+Refined hash verification parameters to resolve tensor mismatch errors caused by changes in parameters of nodes upstream of the sampler.
+`Minimax_H3_Seam_Correction` node: Removed the shot detection model—which previously caused a "white screen" in the sampling node's preview—and replaced it with the `PySceneDetect` method (CPU-only, avoiding potential contamination).
+
 ## 📖 Table of Contents
 
 - [Node List](#nodes)
