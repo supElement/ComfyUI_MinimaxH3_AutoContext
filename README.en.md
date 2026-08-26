@@ -32,8 +32,8 @@ V0.6.5
 
 V0.5.8
 
-Refined hash verification parameters to resolve tensor mismatch errors caused by changes in parameters of nodes upstream of the sampler.
-`Minimax_H3_Seam_Correction` node: Removed the shot detection model—which previously caused a "white screen" in the sampling node's preview—and replaced it with the `PySceneDetect` method (CPU-only, avoiding potential contamination).
+- Refined hash verification parameters to resolve tensor mismatch errors caused by changes in parameters of nodes upstream of the sampler.
+- `Minimax_H3_Seam_Correction` node: Removed the shot detection model—which previously caused a "white screen" in the sampling node's preview—and replaced it with the `PySceneDetect` method (CPU-only, avoiding potential contamination).
 
 ## 📖 Table of Contents
 
