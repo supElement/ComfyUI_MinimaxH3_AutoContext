@@ -5,7 +5,6 @@ ComfyUI-H3-Auto-Context
 
 from .nodes import H3AutoContextSampler, H3ParameterNode
 
-# 独立导入 seam_correction，失败不影响其他节点
 try:
     from .seam_correction import H3SeamCorrection
 except ImportError:

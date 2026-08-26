@@ -53,7 +53,6 @@ def _patch_packed_layout():
     from comfy.ldm.minimax.model import PackedLayout, FRAME_RESCALE
 
     if _is_new_comfyui():
-        print("[H3-Auto] PackedLayout patch 跳过：新版 ComfyUI 已原生支持任意关键帧位置")
         return None
 
     original_init = PackedLayout.__init__
@@ -106,7 +105,6 @@ def _patch_extra_conds():
     from comfy.model_base import MiniMaxH3
 
     if _is_new_comfyui():
-        print("[H3-Auto] extra_conds patch 跳过：新版 ComfyUI 已原生拼接 keyframe + ref latents")
         return None
 
     original_extra_conds = MiniMaxH3.extra_conds

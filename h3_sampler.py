@@ -63,7 +63,6 @@ def audio_latent_frames(pixel_frames, fps):
     return max(1, round(pixel_frames / fps * AUDIO_LATENTS_PER_SEC))
 
 
-# FRAME_PER_TOKEN = (1, 4, 4, 4, 4)：每 5 个 latent token 覆盖 17 个像素帧
 _FRAME_PER_TOKEN = (1, 4, 4, 4, 4)
 
 
@@ -298,7 +297,7 @@ def _filter_video_audio(prompt, ref_vid_data, ref_aud_data, fmt):
     if not video_mentions and not audio_mentions:
         return videos, audios, prompt
 
-    audio_slots = []  # ("soundtrack", vid_idx) / ("standalone", aud_idx)
+    audio_slots = []  
     for i, v in enumerate(videos):
         if v.get("audio_latent") is not None:
             audio_slots.append(("soundtrack", i))
@@ -336,7 +335,7 @@ def _filter_video_audio(prompt, ref_vid_data, ref_aud_data, fmt):
                 kept_audio_slots.append(slot_idx)
 
     if not kept_videos and not kept_audio_slots:
-        return videos, audios, prompt  # 引用全部越界 -> 全传 (与图片路径一致)
+        return videos, audios, prompt  
 
     video_map = {idx + 1: new for new, idx in enumerate(kept_videos, start=1)}
     audio_map = {slot + 1: new for new, slot in enumerate(kept_audio_slots, start=1)}
@@ -396,7 +395,10 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
                                 lock_audio=True, video_context_denoise=0.0,
                                 sampler=None,
                                 cache_dir="",
-                                enable_cache=True):
+                                enable_cache=True,
+                                ignore_latent_hash=False,
+                                unique_id=None,
+                                info=None):
     h3_patches.apply_patches()
 
     device = comfy.model_management.get_torch_device()
@@ -405,8 +407,6 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
     is_tag_mode = (clip_mode == "Clip_Tag")
 
     if is_tag_mode:
-        # Clip_Tag 模式下 chunk_frames 不约束总时长：无明确时长的段默认用 total_frames 作为
-        # 整段时长，使单段 (仅一个标签) 时总帧数贴合 total_frames，而非被 chunk_frames 顶成 90 帧。
         tag_schedule = h3_utils.build_tag_schedule(
             long_prompt, clip_tag, default_seconds=total_frames / fps)
         tag_segments = tag_schedule["segments"]
@@ -422,8 +422,7 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
         chunk_frames = seg_sizes[0] if seg_sizes else 0
 
         print(f"[H3-Auto] Clip_Tag 模式: {len(seg_sizes)} 段")
-        print(f"[H3-Auto] 各段目标帧数={seg_target_frames} 实际帧数={seg_sizes}")
-        print(f"[H3-Auto] 有效新增={effective_new}帧 ({effective_new/fps:.1f}s)")
+        print(f"[H3-Auto] 各段目标帧数={seg_target_frames} 实际采样={seg_sizes}")
     else:
         chunks, chunk_frames = h3_utils.compute_chunks(
             total_frames, chunk_frames, context_frames)
@@ -437,11 +436,10 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
 
     new_frames = [seg_sizes[0]] + [s - effective_context for s in seg_sizes[1:]]
     if is_tag_mode:
-        print(f"[H3-Auto] 帧数账目: 各段新增={new_frames} 合计={sum(new_frames)}帧 "
-              f"(实际输出={effective_new}帧)")
+        print(f"[H3-Auto] 各段实际输出={new_frames} 合计={sum(new_frames)}帧 ")
     else:
-        print(f"[H3-Auto] 总帧数={total_frames} 分段={len(chunks)} 各段帧数={seg_sizes} (基准={chunk_frames})")
-        print(f"[H3-Auto] 帧数账目: 各段新增={new_frames} 合计={sum(new_frames)}帧 "
+        print(f"[H3-Auto] 总帧数={total_frames} 分段={len(chunks)} 实际采样={seg_sizes} (基准={chunk_frames})")
+        print(f"[H3-Auto] 各段有效帧数={new_frames} 合计={sum(new_frames)}帧 "
               f"(目标={total_frames}, 超出部分从末段头部裁剪)")
         if len(seg_sizes) >= 2 and seg_sizes[-1] > chunk_frames:
             ext = seg_sizes[-1] - chunk_frames
@@ -456,7 +454,6 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
               f"全局段(前={bool(prompt_schedule['prefix'])} 后={bool(prompt_schedule['suffix'])})")
     else:
         prompt_schedule = None
-    # 二采：空间分辨率以输入 latent 为准 (忽略 widget width/height，社区一采低清二采高清)
     is_second_pass = latent_input is not None
     if is_second_pass:
         v_in, _ = h3_conditioning.unpack_nested_latent(latent_input)
@@ -468,7 +465,6 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
         else:
             latent_w = int(v_in.shape[4])
             latent_h = int(v_in.shape[3])
-            # H3 patch_size=(1,2,2) 要求空间偶数；奇数时按边缘复制对齐到偶数，否则段间续接 keyframe 的 patchify 会崩溃
             if latent_w % 2 != 0 or latent_h % 2 != 0:
                 print(f"[H3-Auto] 警告: 输入 latent 尺寸 {latent_w}x{latent_h} 为奇数，"
                       f"H3 需偶数 (patch_size=2)。已按边缘复制对齐到 "
@@ -512,11 +508,9 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
     ref_aud_data = _prepare_ref_audios(ref_audios, audio_vae, device,
                                        pre_encode=(ref_sync_mode != "segmented"))
 
-    # 音频驱动 (Audio Drive)：把源音频锁进 latent (noise_mask=0)，输出音频=源音频本身
     drive_waveform = None
     drive_sr = AUDIO_SAMPLE_RATE
     if audio_drive and drive_audio is not None:
-        # 音频可能是 dict，也可能是 Mapping 子类 (如 VHS 的 LazyAudioMap)，统一用 .get() 取值
         getter = getattr(drive_audio, "get", None)
         wf = getter("waveform") if callable(getter) else None
         if wf is None:
@@ -541,7 +535,6 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
         print("[H3-Auto] 提示: drive_audio 已连接但 audio_drive=disable，未启用音频锁定。"
               "如需让 audio 端口输出源音频，请把 audio_drive 设为 enable")
 
-    # 二采：把一采 merged latent 逆向切成逐段完整 latent (段间重叠头用前段尾部重建)
     first_pass_segments = None
     if is_second_pass:
         first_pass_segments = _split_first_pass_latent(
@@ -554,28 +547,36 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
     all_segments = []
     all_x0 = []
     prev_x0 = None
-    output_cursor = 0  # 累积"新增输出"帧数，用于音频驱动按输出时间轴切片
+    output_cursor = 0  
 
     overall_pbar = comfy.utils.ProgressBar(len(chunks) * (2 if decode_output else 1))
-
+    
+    segment_fingerprints = []
+    
     # ==================== 段循环开始 ====================
+    upstream_fingerprint = None
+    if info is not None:
+        upstream_fingerprint = info.get("upstream_fingerprint")
+        if upstream_fingerprint:
+            print(f"[H3-Auto] 从上游 info 获取到 fingerprint: {upstream_fingerprint[:8]}...")
+    
+    force_regenerate = False
     for idx, (start_f, end_f) in enumerate(chunks):
         comfy.model_management.throw_exception_if_processing_interrupted()
         is_first_chunk = (idx == 0)
         is_last_chunk = (idx == len(chunks) - 1)
         seg_frames = end_f - start_f
     
-        # 段间续接锚定用上一段的干净 x0 预测
         anchor_prev = None
         if not is_first_chunk:
             anchor_prev = prev_x0
     
         account = f"帧数={seg_frames}"
         if not is_first_chunk:
-            account += f" (锚定={effective_context} + 新增={seg_frames - effective_context})"
+            account += f" (锚定={effective_context}，有效帧数={seg_frames - effective_context})"
         print(f"[H3-Auto] 生成段 {idx+1}/{len(chunks)} (帧{start_f}-{end_f}) {account}")
     
-        # ==================== 提示词构建（原有逻辑，不变） ====================
+        # ==================== 提示词构建 ====================
         if is_tag_mode:
             seg_text, _ = tag_segments[idx]
             seg_seconds = new_frames[idx] / fps
@@ -605,15 +606,15 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
         print(window_prompt)
         print(f"[H3-Auto] {'=' * 50}")
     
-        # ==================== 【新增】计算当前段实际使用的条件指纹 ====================
+        # ==================== 计算当前段实际使用的条件指纹 ====================
         conditions_hash = _compute_conditions_hash(
-            seg_ref_img,                    # 已经过 crop_mode 处理
-            seg_ref_vid,                    # 已经过 crop_mode + ref_sync_mode 切片处理
-            first_frame if is_first_chunk else None,   # 只有首段才把首帧算进去
-            last_frame if is_last_chunk else None      # 只有末段才把尾帧算进去
+            seg_ref_img,
+            seg_ref_vid,
+            first_frame if is_first_chunk else None,
+            last_frame if is_last_chunk else None
         )
     
-        # ==================== 构建 conditioning payload（原有逻辑，不变） ====================
+        # ==================== 构建 conditioning payload ====================
         payload = h3_conditioning.build_conditioning_payload(
             seed=seed + idx, frame_count=seg_frames,
             first_latent=first_latent if is_first_chunk else None,
@@ -642,7 +643,7 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
             if drive_aud_latent is None:
                 print(f"[H3-Auto] 段 {idx+1}/{len(chunks)}: drive_audio 切片为空，本段不锁定音频")
     
-        # ==================== 准备初始 latent（原有逻辑，不变） ====================
+        # ==================== 准备初始 latent ====================
         if is_second_pass:
             seg_latent_dict = first_pass_segments[idx]
             ov_t = 0
@@ -666,88 +667,110 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
                 overlap_frames=effective_context)
     
         # ==================== 🔥 缓存逻辑开始 ====================
-        
-        # 1. 计算最终提示词的哈希（这是最关键的文本指纹）
+    
         window_prompt_hash = hashlib.md5(window_prompt.encode('utf-8')).hexdigest()
         
-        # 1. 准备当前段的元数据（用于缓存校验）
-        if long_prompt:
-            prompt_sample = long_prompt[:1024].encode('utf-8')
-            prompt_hash = hashlib.md5(prompt_sample).hexdigest()
+        if sigmas is not None:
+            if isinstance(sigmas, torch.Tensor):
+                actual_steps = max(0, len(sigmas) - 1) 
+            else:
+                actual_steps = steps  
         else:
-            prompt_hash = ""
-            
+            actual_steps = steps
+        
+        if sampler is not None:
+            effective_sampler_name = None
+            effective_scheduler = None
+        else:
+            effective_sampler_name = sampler_name
+            effective_scheduler = scheduler
+        
         current_meta = {
             "seed": seed + idx,
-            "steps": steps,
+            "steps": actual_steps,                   
             "cfg": cfg,
-            "sampler_name": sampler_name,
-            "scheduler": scheduler,
             "denoise": denoise,
             "video_context_denoise": video_context_denoise,
             "latent_w": latent_w,
             "latent_h": latent_h,
-            "total_frames": total_frames,
-            "fps": fps,
-            "chunk_frames": chunk_frames,
+            "seg_frames": seg_frames,
             "context_frames": context_frames,
+            "fps": fps,
             "lock_audio": lock_audio,
             "audio_drive": audio_drive,
             "window_prompt_hash": window_prompt_hash,
-            "conditions_hash": conditions_hash,   
+            "conditions_hash": conditions_hash,
         }
+    
+        if info is not None and "segment_fingerprints" in info and idx < len(info["segment_fingerprints"]):
+            current_meta["segment_fingerprint"] = info["segment_fingerprints"][idx]
         
-        # 如果有 sigmas，对整个序列计算哈希
+        if info is not None and "upstream_global_hash" in info:
+            current_meta["upstream_global_hash"] = info["upstream_global_hash"]
+        
+        if unique_id is not None:
+            current_meta["node_id"] = unique_id
+        
+        if effective_sampler_name is not None:
+            current_meta["sampler_name"] = effective_sampler_name
+            current_meta["scheduler"] = effective_scheduler
+        
+        # 如果有 sigmas，对整个序列计算哈希        
         if sigmas is not None:
             if isinstance(sigmas, torch.Tensor):
-                # 对整个 sigmas 序列做哈希（而不是只取前10个）
                 sigmas_flat = sigmas.flatten().cpu().numpy()
                 if sigmas_flat.size > 0:
-                    # 使用 numpy 的 tobytes 对整个数组做哈希
                     current_meta["sigmas_hash"] = hashlib.md5(sigmas_flat.tobytes()).hexdigest()
                 else:
                     current_meta["sigmas_hash"] = None
             else:
-                # 如果 sigmas 不是 tensor，直接转为字符串哈希
                 current_meta["sigmas_hash"] = hashlib.md5(str(sigmas).encode('utf-8')).hexdigest()
-        
-        if is_second_pass:
-            v_in, _ = h3_conditioning.unpack_nested_latent(latent_input)
-            if v_in is not None:
-                input_hash = latent_cache.compute_input_hash(v_in)
-                current_meta["input_hash"] = input_hash
-        
-        # 2. 尝试从缓存加载
+    
+        # ===== 二采输入切片哈希（受 ignore_latent_hash 控制） =====
+        if is_second_pass and not ignore_latent_hash:
+            v_slice, _ = h3_conditioning.unpack_nested_latent(seg_latent_dict)
+            if v_slice is not None:
+                flat = v_slice.flatten()
+                if flat.numel() > 0:
+                    sample = flat[:1024].cpu().numpy().tobytes()
+                    current_meta["input_slice_hash"] = hashlib.md5(sample).hexdigest()
+                else:
+                    current_meta["input_slice_hash"] = None
+            else:
+                current_meta["input_slice_hash"] = None
+    
+        # 3. 尝试从缓存加载
         cached_samples = None
         cached_x0 = None
-        if enable_cache and cache_dir:
+        if enable_cache and cache_dir and not force_regenerate:
             cached_samples, cached_x0 = latent_cache.load_segment_latent(
                 cache_dir, idx, current_meta)
-        
+    
         if cached_samples is not None:
-            # 缓存命中：直接使用，跳过采样
             segment_latent = cached_samples
             x0 = cached_x0
             print("\033[33m" + f"[H3-Cache] 段 {idx+1}/{len(chunks)} 加载缓存，跳过采样" + "\033[0m")
         else:
-            # 缓存未命中：执行正常采样
+            force_regenerate = True
             segment_latent = _sample_segment(
                 model, positive, seg_latent_dict, steps, cfg,
                 sampler_name, scheduler, seed + idx,
                 denoise=denoise, sigmas=sigmas,
                 sampler_obj=sampler)
-        
+    
             x0 = segment_latent.get("x0")
-        
-            # 3. 异步保存缓存（元数据与 current_meta 相同）
+    
+            # 4. 异步保存缓存
             if enable_cache and cache_dir:
-                metadata = current_meta.copy()  # 直接使用 current_meta
+                metadata = current_meta.copy()
                 latent_cache.save_segment_latent_async(
                     cache_dir, idx, segment_latent, x0, metadata)
                 print("\033[33m" + f"[H3-Cache] 段 {idx+1}/{len(chunks)} 已提交异步保存" + "\033[0m")
-        # ==================== 🔥 缓存逻辑结束 ====================
     
-        # ==================== 收集结果（原有逻辑，不变） ====================
+    
+        # ==================== 🔥 缓存逻辑结束 ====================
+        segment_fingerprints.append(f"{window_prompt_hash}_{conditions_hash}_{seg_frames}")
+        
         samples_dict = {"samples": segment_latent["samples"]}
         x0_dict = {"samples": x0} if x0 is not None else samples_dict
         prev_x0 = x0_dict
@@ -760,21 +783,32 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
     final_latent = _merge_segment_latents(all_segments, effective_context, fps)
     final_denoised = _merge_segment_latents(all_x0, effective_context, fps)
 
-    # 段间接缝信息：供下游 Seam_Correction 节点精确定位边界 (token 相位换算，外部无法推算)
     seam_boundaries, seam_decoded = compute_seam_boundaries(seg_sizes, effective_context)
+    
+    global_params = {
+        "steps": steps,
+        "cfg": cfg,
+        "sampler_name": sampler_name,
+        "scheduler": scheduler,
+        "denoise": denoise,
+        "seed_base": seed,
+    }
+    upstream_global_hash = hashlib.md5(str(sorted(global_params.items())).encode()).hexdigest()
+    
     seam_info = {
         "boundaries": seam_boundaries,
         "seg_sizes": [int(s) for s in seg_sizes],
         "effective_context": int(effective_context),
         "decoded_frames": int(seam_decoded),
+        "segment_fingerprints": segment_fingerprints,   
+        "upstream_global_hash": upstream_global_hash,   
     }
-    if seam_boundaries:
-        print(f"[H3-Auto] 段间接缝 (解码后像素帧号): {seam_boundaries} "
-              f"/ 解码总帧数={seam_decoded} -> 已写入 info")
+    
+    if not is_second_pass and len(segment_fingerprints) > 0:
+        combined = "".join(segment_fingerprints)
+        upstream_fingerprint_self = hashlib.md5(combined.encode()).hexdigest()
+        seam_info["upstream_fingerprint"] = upstream_fingerprint_self
 
-    # 音频驱动模式：准备"无损源音频" (裁齐到总时长)。
-    # [注意] audio 输出端口已注释 (见 nodes.py)，这里的结果目前无人接收，
-    # 仅为将来恢复端口预留；用户请把源音频直接接到视频合成节点。
     drive_final_audio = None
     if drive_waveform is not None:
         target_samples = int(round(total_frames / fps * drive_sr))
@@ -862,29 +896,23 @@ def _compute_conditions_hash(ref_img_data, ref_vid_data, first_frame=None, last_
     
     hasher = hashlib.md5()
     
-    # 如果没有任何条件，返回固定字符串
     if not ref_img_data and not ref_vid_data and first_frame is None and last_frame is None:
         return "no_external_conditions"
     
-    # 1. 首帧（仅在当前段为首段时传入）
     if first_frame is not None:
-        # 取第一帧左上角 8x8 像素块（所有条件都统一取此位置，保证一致性）
         sample = first_frame[0, :8, :8, :3].cpu().numpy().tobytes()
         hasher.update(sample)
     
-    # 2. 尾帧（仅在当前段为末段时传入）
     if last_frame is not None:
         sample = last_frame[0, :8, :8, :3].cpu().numpy().tobytes()
         hasher.update(sample)
     
-    # 3. 所有参考图片（已经过 resize/crop 处理）
     for img_data in (ref_img_data or []):
         pixel = img_data.get("pixel")
         if pixel is not None and pixel.shape[0] > 0:
             sample = pixel[0, :8, :8, :3].cpu().numpy().tobytes()
             hasher.update(sample)
     
-    # 4. 所有参考视频（取第一帧）
     for vid_data in (ref_vid_data or []):
         pixel = vid_data.get("pixel")
         if pixel is not None and pixel.shape[0] > 0:
@@ -1184,7 +1212,6 @@ def _make_h3_empty_latent(latent_w, latent_h, pixel_frames, fps,
             audio_latent = fitted
             locked = True
 
-    # 段间续接 overlap 头：复制上一段视频尾部 (与 _merge_segment_latents 裁剪账目同源)
     ov_t = 0
     if overlap_video is not None and overlap_frames > 0:
         ctx_v_tokens = video_latent_frames(overlap_frames) if overlap_frames > 5 else 2
@@ -1194,8 +1221,6 @@ def _make_h3_empty_latent(latent_w, latent_h, pixel_frames, fps,
         if ov_t > 0:
             video_latent[:, :, :ov_t] = overlap_video[:, :, -ov_t:].to(
                 device=video_latent.device, dtype=video_latent.dtype)
-            print(f"[H3-Auto] 段间续接: overlap 头 mask={float(overlap_video_denoise):.2f} "
-                  f"({ov_t} latent token)")
 
     try:
         combined = comfy.nested_tensor.NestedTensor((video_latent, audio_latent))
@@ -1226,7 +1251,6 @@ def _sample_segment(model, positive, latent_dict, steps, cfg, sampler_name, sche
     latent_tensor = latent_dict["samples"]
     noise = comfy.sample.prepare_noise(latent_tensor, seed)
 
-    # sigma 优先级最高：传入 sigmas 时接管采样序列；denoise≠1 则 final_sigmas = sigmas * denoise
     use_custom_sigmas = sigmas is not None
     kdenoise = denoise
     if use_custom_sigmas:
@@ -1234,7 +1258,6 @@ def _sample_segment(model, positive, latent_dict, steps, cfg, sampler_name, sche
         if denoise is not None and denoise < 0.9999:
             sigmas = sigmas * denoise
 
-    # sigmas 传入时 steps 失效：预览步数用 sigma 长度，采样步数完全由 sigmas 决定
     n_steps = max(1, int(len(sigmas)) - 1) if use_custom_sigmas else steps
     x0_output = {}
     callback = latent_preview.prepare_callback(model, n_steps, x0_output)
@@ -1244,7 +1267,6 @@ def _sample_segment(model, positive, latent_dict, steps, cfg, sampler_name, sche
     denoise_mask = latent_dict.get("noise_mask")
 
     if sampler_obj is not None:
-        # 外部 SAMPLER 对象 (SamplerCustom 同款)，需显式 sigmas
         if sigmas is None:
             _ks = comfy.samplers.KSampler(
                 model, steps=steps, device=model.load_device,
@@ -1272,7 +1294,6 @@ def _sample_segment(model, positive, latent_dict, steps, cfg, sampler_name, sche
                 denoise_mask=denoise_mask,
                 callback=callback, disable_pbar=disable_pbar)
 
-    # 提取最后一步去噪预测 x0 (干净内容)：含残余噪声的 samples 不能直接当段间 keyframe
     x0 = x0_output.get("x0")
     if x0 is not None:
         if hasattr(samples, "is_nested") and samples.is_nested \
@@ -1283,7 +1304,6 @@ def _sample_segment(model, positive, latent_dict, steps, cfg, sampler_name, sche
                     comfy.utils.unpack_latents(x0, latent_shapes))
             except Exception:
                 pass
-        # x0 需 process_latent_out (H3 音频流除以 audio_scale)，与 SamplerCustomAdvanced 的 denoised_output 一致
         try:
             x0 = model.model.process_latent_out(x0.cpu())
         except Exception:
@@ -1308,10 +1328,7 @@ def _pad_latent_spatial_even(latent_dict):
     if h % 2 == 0 and w % 2 == 0:
         return latent_dict
     pad_h, pad_w = h % 2, w % 2
-    # 5D latent [B,C,T,H,W] 用 replicate/reflect 时 pad 长度必须为 6 (补最后 3 维)，
-    # 故 T 维补 0、只补空间 H/W： (W左, W右, H上, H下, T前, T后)
     pad = (0, pad_w, 0, pad_h, 0, 0)
-    # replicate 要求补数 < 该维尺寸；极小 latent (单行/单列) 退化补零兜底
     mode = "replicate" if (h > pad_h and w > pad_w) else "constant"
     v_pad = torch.nn.functional.pad(v_lat, pad, mode=mode)
     if a_lat is not None:
@@ -1376,8 +1393,6 @@ def _with_locked_audio(latent_dict, overlap_video_tokens=0,
             n = min(int(overlap_video_tokens), int(t.shape[2]) - 2)
             if n > 0:
                 m[:, :, :n] = float(overlap_video_denoise)
-                print(f"[H3-Auto] 段间续接: overlap 头 mask={float(overlap_video_denoise):.2f} "
-                      f"({n} latent token, 二采)")
             masks.append(m)
         else:
             masks.append(torch.zeros_like(t) if lock_audio else torch.ones_like(t))
@@ -1408,7 +1423,6 @@ def _split_first_pass_latent(merged_latent, seg_sizes, effective_context, fps):
     ctx_v = max(2, ctx_v)
     ctx_a = max(1, int(effective_context / fps * AUDIO_LATENTS_PER_SEC))
 
-    # 账目校验：merged 各 token 数必须等于各段 (裁重叠后) 之和，否则 info/分段与输入 latent 不一致
     expected_v = seg_v_tokens[0] + sum(
         seg_v_tokens[i] - min(ctx_v, seg_v_tokens[i] - 2) for i in range(1, n_seg))
     if int(v_all.shape[2]) != expected_v:

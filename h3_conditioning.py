@@ -138,8 +138,8 @@ def build_conditioning_payload(seed, frame_count,
                 })
                 kf_pixel_indices.append(pixel_idx)
 
-            print(f"[H3-Auto] 段间续接: {n_latent} 个 latent 帧作为 keyframe "
-                  f"(pixel indices: {kf_pixel_indices})")
+            # print(f"[H3-Auto] 段间续接: {n_latent} 个 latent 帧作为 keyframe "
+                  # f"(pixel indices: {kf_pixel_indices})")
 
         if a_lat is not None:
             ctx_a = int(context_frames / fps * 40)
@@ -164,9 +164,6 @@ def build_conditioning_payload(seed, frame_count,
     max_user_slots = max(0, MAX_REF_SLOTS - used_slots)
     user_refs_added = 0
 
-    # 官方呈现顺序 (与 MiniMaxH3ReferenceToVideo 一致)：
-    #   images -> videos (每个音轨 <Audio j> 标签在其 <Video k> 之前) -> standalone audios
-    # 顺序必须与 Qwen3-VL tokenizer 的 minimax_ref_items 呈现一致，否则 <Video k>/<Picture i> 会错位关联。
     for img in (ref_img_data or []):
         if user_refs_added >= max_user_slots:
             break
@@ -186,7 +183,6 @@ def build_conditioning_payload(seed, frame_count,
             break
         v_lat = vid["video_latent"]
         a_lat = vid.get("audio_latent")
-        # 音轨标签先于视频标签 (官方顺序)
         if a_lat is not None:
             ref_items_for_clip.append({"type": "audio"})
         ref_entry = {
@@ -223,13 +219,13 @@ def build_conditioning_payload(seed, frame_count,
         ref_items_for_clip.append({"type": "audio"})
         user_refs_added += 1
 
-    print(f"[H3-Auto] Conditioning: keyframes={len(keyframes)} refs={len(refs)} "
-          f"images_for_clip={len(images_for_clip)} ref_items={len(ref_items_for_clip)}")
+    # print(f"[H3-Auto] Conditioning: keyframes={len(keyframes)} refs={len(refs)} "
+          # f"images_for_clip={len(images_for_clip)} ref_items={len(ref_items_for_clip)}")
     for i, r in enumerate(refs):
         shapes = {k: tuple(v.shape) for k, v in r.items()
                   if hasattr(v, "shape")}
         meta = {k: v for k, v in r.items() if not hasattr(v, "shape") and k != "kind"}
-        print(f"[H3-Auto]   ref[{i}] kind={r['kind']} shapes={shapes} meta={meta}")
+        # print(f"[H3-Auto]   ref[{i}] kind={r['kind']} shapes={shapes} meta={meta}")
 
     return {
         "seed": int(seed),

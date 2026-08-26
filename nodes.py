@@ -13,6 +13,9 @@ nodes.py - H3 Auto Context Sampler 节点定义
 通过 parameter (Dict) 单端口传入本节点；主节点只保留采样/提示词/参考素材相关输入。
 """
 
+import comfy.utils
+import os
+import folder_paths
 from comfy_api.latest import io
 from . import h3_sampler
 
@@ -186,12 +189,19 @@ class H3AutoContextSampler(io.ComfyNode):
                 
                 io.Boolean.Input("enable_cache",
                     default=True,
-                    tooltip="是否启用分段缓存。开启后，采样结果会保存到 cache_dir，后续运行时若参数一致则直接加载。"
+                    tooltip="是否启用分段缓存。开启后，采样结果会保存到 cache_dir，后续运行时若参数一致则直接加载。\n"
+                            "更换模型/LoRA/加速节点后请手动删除缓存文件。"
                 ),
-                io.String.Input("cache_dir", multiline=False, dynamic_prompts=False,
-                    socketless=False, default="",
-                    tooltip="分段 Latent 缓存目录（留空禁用）。每段会保存为 seg_XXXX.pt，"
-                            "若存在且参数匹配则直接加载，跳过采样。"),
+                io.Boolean.Input("clear_cache",
+                    default=False,
+                    tooltip="删除该节点的所有缓存文件。用于更换模型/LoRA/加速器后强制重新生成。"
+                ),
+
+                io.Boolean.Input("ignore_latent_hash",
+                    default=False,
+                    tooltip="⚠️ 高级选项：禁用二采输入 Latent 指纹校验。\n"
+                            "仅当latent放大节点导致哈希不稳定时启用。\n"
+                ),
 
                 io.Autogrow.Input("ref_images", optional=True,
                     template=io.Autogrow.TemplatePrefix(
@@ -221,27 +231,34 @@ class H3AutoContextSampler(io.ComfyNode):
                 io.Latent.Output(display_name="latent"),
                 io.Latent.Output(display_name="denoised_latent"),
                 io.Dict.Output(display_name="info"),
-            ],
+            ], 
+            hidden=[io.Hidden.unique_id],
         )
 
     @classmethod
     def execute(cls, model, vae, audio_vae, clip,
-                parameter=None,
-                sigmas=None, latent_input=None, info=None,
-                first_frame=None, last_frame=None,
-                denoise=1.0,
-                steps=30, cfg=1.0,
-                sampler_name="euler", scheduler="simple",
-                sampler=None,
-                video_context_denoise=0.0,
-                seed=0,
-                enable_cache=True, 
-                cache_dir="",
-                ref_images=None, ref_videos=None,
-                ref_video_audios=None, ref_audios=None,
-                drive_audio=None) -> io.NodeOutput:
-
-        # 从 parameter dict 解包参数 (缺失项用默认值兜底)
+            parameter=None,
+            sigmas=None, latent_input=None, info=None,
+            first_frame=None, last_frame=None,
+            denoise=1.0,
+            steps=30, cfg=1.0,
+            sampler_name="euler", scheduler="simple",
+            sampler=None,
+            video_context_denoise=0.0,
+            seed=0,
+            enable_cache=True,
+            clear_cache=False,
+            ignore_latent_hash=False,
+            ref_images=None, ref_videos=None,
+            ref_video_audios=None, ref_audios=None,
+            drive_audio=None) -> io.NodeOutput:
+                
+        
+        try:
+            unique_id = cls.hidden.unique_id
+        except AttributeError:
+            unique_id = None
+            
         p = parameter or {}
         long_prompt = p.get("long_prompt", "")
         prompt_mode = p.get("prompt_mode", "auto")
@@ -260,7 +277,7 @@ class H3AutoContextSampler(io.ComfyNode):
         audio_drive = p.get("audio_drive", False)
         decode_output = False
 
-        # info 参数继承：info 中存在的分段参数覆盖 parameter 解包值 (保证多节点分段同步)
+        # info 参数继承：info 中存在的分段参数覆盖 parameter 解包值
         if info:
             _inherited = {}
             for _k in ("total_frames", "chunk_frames", "context_frames",
@@ -322,6 +339,36 @@ class H3AutoContextSampler(io.ComfyNode):
 
         ref_audio_list = _autogrow_to_list(ref_audios, "ref_audio_", 4)
 
+        # ===== 强制清除缓存（若 clear_cache=True） =====
+        if clear_cache and unique_id is not None:
+            try:
+                output_dir = folder_paths.get_output_directory()
+                target_cache_dir = os.path.join(output_dir, "cache", f"node_{unique_id}")
+                if os.path.exists(target_cache_dir):
+                    import shutil
+                    shutil.rmtree(target_cache_dir)
+                    print(f"[H3-Auto] 🗑️  缓存已清除: {target_cache_dir}")
+                else:
+                    print("[H3-Auto] ℹ️  缓存目录不存在，无需清除")
+            except Exception as e:
+                print(f"[H3-Auto] ⚠️  清除缓存失败: {e}")
+
+        # 自动缓存目录逻辑
+        cache_dir = ""
+        
+        if enable_cache and unique_id is not None:
+            try:
+                output_dir = folder_paths.get_output_directory()
+                cache_dir = os.path.join(output_dir, "cache", f"node_{unique_id}")
+                out_info["cache_dir"] = cache_dir
+                print(f"[H3-Auto] 缓存目录: {cache_dir}")
+            except Exception as e:
+                print(f"[H3-Auto] 缓存目录生成失败: {e}，已禁用缓存")
+                enable_cache = False
+        elif enable_cache:
+            print("[H3-Auto] 警告: 无法获取节点ID，缓存功能不可用，请升级 ComfyUI")
+            enable_cache = False
+
         _frames, _audio, latent, denoised_latent, seam_info = h3_sampler.run_auto_context_generation(
             model=model, vae=vae, audio_vae=audio_vae, clip=clip,
             first_frame=first_frame, last_frame=last_frame,
@@ -343,6 +390,8 @@ class H3AutoContextSampler(io.ComfyNode):
             sampler=sampler,
             enable_cache=enable_cache,
             cache_dir=cache_dir,
+            ignore_latent_hash=ignore_latent_hash,
+            info=info, 
         )
         if seam_info:
             out_info.update(seam_info)

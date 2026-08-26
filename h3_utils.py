@@ -910,7 +910,6 @@ def compute_tag_chunks(seg_target_frames_list, context_frames):
     if n == 0:
         return [], []
 
-    # 各段"新增帧数" (merge 后实际保留的帧数)
     new_frames = [snap_to_grid_nearest(targets[0])]
     for t in targets[1:]:
         new_frames.append(_snap_to_17_multiple_nearest(t))
@@ -919,7 +918,6 @@ def compute_tag_chunks(seg_target_frames_list, context_frames):
     total_new = sum(new_frames)
     diff = target_total - total_new
 
-    # 从未段起逐段 ±17 帧补偿总时长 (17 帧粒度，保持首段 17n+5 / 非首段 17 倍数)
     if diff != 0 and n >= 2:
         k = int(round(diff / 17.0))
         step = 17 if k > 0 else -17
@@ -943,7 +941,7 @@ def compute_tag_chunks(seg_target_frames_list, context_frames):
         start += s
 
     print(f"[H3-Auto] Clip_Tag 分块: 目标总帧数={target_total} "
-          f"实际总新增={total_new} (偏差 {total_new - target_total:+d}帧)")
+          f"实际输出={total_new} (偏差 {total_new - target_total:+d}帧)")
 
     return chunks, seg_sizes
 

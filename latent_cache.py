@@ -13,7 +13,6 @@ def compute_input_hash(input_latent):
     """
     if input_latent is None:
         return None
-    # 尝试提取视频 latent（5维）
     v_lat = None
     if hasattr(input_latent, "is_nested") and input_latent.is_nested:
         tensors = list(input_latent.unbind())
@@ -39,7 +38,6 @@ def compute_input_hash(input_latent):
     flat = v_lat.flatten()
     if flat.numel() == 0:
         return None
-    # 取前1024个字节计算MD5
     sample = flat[:1024].cpu().numpy().tobytes()
     return hashlib.md5(sample).hexdigest()
 
@@ -48,7 +46,6 @@ def normalize_cache_dir(raw_dir):
     """将路径统一为系统标准格式，支持正/反斜杠"""
     if not raw_dir:
         return ""
-    # 替换反斜杠为正斜杠，然后规范化
     normalized = os.path.normpath(raw_dir.replace('\\', '/'))
     return normalized
 
@@ -69,36 +66,8 @@ def _wrap_nested(tensors):
         try:
             return NestedTensor(tuple(tensors))
         except:
-            # 如果打包失败，返回原始列表（降级处理）
             return tensors
     return tensors
-
-def _compute_input_hash(input_latent):
-    """计算输入 Latent 的指纹哈希（仅取视频部分的前1024个元素）"""
-    if input_latent is None:
-        return None
-    # 尝试取出视频 latent
-    if hasattr(input_latent, "is_nested") and input_latent.is_nested:
-        tensors = list(input_latent.unbind())
-        v_lat = None
-        for t in tensors:
-            if t.dim() == 5:  # 视频 latent
-                v_lat = t
-                break
-        if v_lat is None:
-            return None
-    elif isinstance(input_latent, dict):
-        # 可能是 dict
-        return None  # 简单处理，忽略
-    else:
-        v_lat = input_latent
-
-    # 取前1024个元素（或全部，如果小于1024）
-    flat = v_lat.flatten()
-    if flat.numel() == 0:
-        return None
-    sample = flat[:1024].cpu().numpy().tobytes()
-    return hashlib.md5(sample).hexdigest()
 
 # ------------------ 缓存文件操作 ------------------
 def get_cache_path(cache_dir, seg_idx):
@@ -117,13 +86,11 @@ def save_segment_latent_sync(cache_dir, seg_idx, samples, x0, metadata=None):
     if not path:
         return
 
-    # 提取 samples 内部张量
     if isinstance(samples, dict):
         samples_tensor = samples.get("samples")
     else:
         samples_tensor = samples
 
-    # 解包并移至 CPU
     samples_unwrapped = _unwrap_nested(samples_tensor)
     x0_unwrapped = _unwrap_nested(x0) if x0 is not None else None
 
@@ -132,11 +99,10 @@ def save_segment_latent_sync(cache_dir, seg_idx, samples, x0, metadata=None):
         "x0": x0_unwrapped,
         "metadata": metadata or {},
     }
-    # 原子保存（先写临时文件，再重命名，防止写入中断导致半文件）
     temp_path = path + ".tmp"
     try:
         torch.save(data, temp_path)
-        os.replace(temp_path, path)  # 原子替换
+        os.replace(temp_path, path)  
     except Exception as e:
         print(f"[H3-Cache] 保存段 {seg_idx} 失败: {e}")
         if os.path.exists(temp_path):
@@ -161,31 +127,35 @@ def load_segment_latent(cache_dir, seg_idx, current_metadata=None):
 
     saved_meta = data.get("metadata", {})
 
-    # 参数校验（如果提供了 current_metadata）
     if current_metadata:
         sensitive_keys = [
             "seed", "steps", "cfg", "sampler_name", "scheduler",
-            "denoise", "video_context_denoise", "sigmas_hash", "input_hash",
+            "denoise", "video_context_denoise", "sigmas_hash", "input_slice_hash",
             "latent_w", "latent_h",
-            "total_frames", "fps", "chunk_frames", "context_frames",
-            "lock_audio", "audio_drive", 
-            "window_prompt_hash"
+            "seg_frames", "context_frames", "fps",
+            "lock_audio", "audio_drive",
+            "window_prompt_hash",
+            "conditions_hash",
+            "segment_fingerprint",      
+            "upstream_global_hash",
         ]
-        
+
         mismatch = False
-        for k in sensitive_keys:
-            if saved_meta.get(k) != current_metadata.get(k):
-                mismatch = True
-                break
+        for k in current_metadata.keys():
+            if k in sensitive_keys:
+                if saved_meta.get(k) != current_metadata[k]:
+                    print(f"   Mismatch on key: {k}, saved={saved_meta.get(k)}, current={current_metadata[k]}")
+                    mismatch = True
+                    break
+
         if mismatch:
-            print(f"[H3-Cache] 段 {seg_idx} 参数或输入指纹变更，删除旧缓存")
+            print("\033[33m" + f"[H3-Cache] 段 {seg_idx+1} 参数或输入指纹变更，删除旧缓存" + "\033[0m")
             try:
                 os.remove(path)
             except:
                 pass
             return None, None
 
-    # 重建张量
     samples_unwrapped = data["samples"]
     x0_unwrapped = data.get("x0")
 
@@ -193,7 +163,6 @@ def load_segment_latent(cache_dir, seg_idx, current_metadata=None):
     x0_tensor = _wrap_nested(x0_unwrapped) if x0_unwrapped is not None else None
 
     samples_dict = {"samples": samples_tensor}
-    # 如果有 noise_mask，可以重建，但缓存中通常不存，忽略
     return samples_dict, x0_tensor
 
 # ------------------ 异步保存队列 ------------------
@@ -205,7 +174,7 @@ def _save_worker():
     while True:
         try:
             cache_dir, seg_idx, samples, x0, metadata = _save_queue.get(timeout=1)
-            if cache_dir is None:  # 结束信号
+            if cache_dir is None:  
                 break
             save_segment_latent_sync(cache_dir, seg_idx, samples, x0, metadata)
         except queue.Empty:
