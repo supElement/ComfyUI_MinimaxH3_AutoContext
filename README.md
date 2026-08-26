@@ -14,7 +14,6 @@
 注意：更改模型,包括lora、sageattention等加速节点时，latent检测不会发现更改，所以必须删除latent缓存，两种删除latent缓存的方法：
 - 开启Minimax_H3_AutoContext_Sampler节点上的 clear_cache 参数，这会在采样开始时，强制重新建立本节点缓存文件。
 - 手动删除缓存目录中的对应文件夹（\ComfyUI\output\cache），文件夹名为“node_” + “节点ID”。
-- ignore_latent_hash，忽略输入端口input_latent 的哈希值校验。实用场景：有些latent处理节点会改变latent判断信息（比如：Minimax H3 Latent Upscaler (3D)节点），使latent的微小变化导致latent缓存不可用，浪费推理时间，此时建议设置为true。我只测试了我的另一个仓库 github.com/supElement/ComfyUI_Element_easy 扩展中的 Minimax_H3-LatentUpscaler_Adv节点，类似节点没有测试，在使用不改变latent噪声特征的latent处理节点时，可以将ignore_latent_hash参数设置为false。
 
 <img width="2230" height="976" alt="image" src="https://github.com/user-attachments/assets/5634914a-6f98-4d4f-b573-2c8b41e0c57e" />
 
@@ -28,6 +27,7 @@ V0.6.5
 - 优化latent缓存处理逻辑，去除手动指定缓存目录，更改为自动为每个节点指定唯一缓存目录（“node + 节点ID”），防止因误操作导致采样节点的latent缓存逻辑互相覆盖。
 - 以分段方式建立缓存与校验逻辑，若上游节点只添加了提示词，或增加了分段，没有改变提交到采样的其它分段提示词，同时与采样节点关联的其它参数没有改变，则已有的对应缓存依然视为有效被调用，新加分段也会自动建立latent缓存。下游采样节点（二采）也会保留原有latent缓存并调用，只新建增加的分段缓存。
 - 提示词的改变位置决定哪些latent缓存可以复用，被改变提示词的分段之后的分段将强行重建，下游节点采用同样的处理逻辑。
+- ignore_latent_hash，忽略输入端口input_latent 的哈希值校验。实用场景：有些latent处理节点会改变latent判断信息（比如：Minimax H3 Latent Upscaler (3D)节点），使latent的微小变化导致latent缓存不可用，浪费推理时间，此时建议设置为true。我只测试了我的另一个仓库 github.com/supElement/ComfyUI_Element_easy 扩展中的 Minimax_H3-LatentUpscaler_Adv节点，类似节点没有测试，在使用不改变latent噪声特征的latent处理节点时，可以将ignore_latent_hash参数设置为false。
 
 V0.5.8
 - 完善哈希值检测参数，解决采样器上游节点parameter参数改变时导致的张量不匹配的错误。
