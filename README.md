@@ -8,15 +8,25 @@
 # ComfyUI_MinimaxH3_AutoContext
 
 一键式 MiniMax H3 长视频自动化生成节点：**分段推理 + 段间续接锚定 + 提示词时间轴切片 + 二次采样（二采）+ 接缝修正**。
-在显存有限的情况下，将长视频拆分为多段独立推理，通过叠加增强方法实现段间无缝衔接，同时按时间轴自动切分提示词，让每段生成内容与提示词节奏对齐。支持二采（低清一采 + 高清二采）。
+在显存有限的情况下，将长视频拆分为多段独立推理，通过叠加增强方法实现段间无缝衔接，同时按时间轴自动切分提示词，让每段生成内容与提示词节奏对齐；对音视频参考做同样切片并对齐。支持二采（低清一采 + 高清二采）。
 支持latent缓存存取，方便推理过程中因某种原因导致推理中断后，快速跳过已推理分段，缓存文件以分段为单位存储，在采样节点上游参数不变的情况下，读取已有latent cache 文件。
+
+注意：更改模型,包括lora、sageattention等加速节点时，latent检测不会发现更改，所以必须删除latent缓存，两种删除latent缓存的方法：
+- 开启Minimax_H3_AutoContext_Sampler节点上的 clear_cache 参数，这会在采样开始时，强制重新建立本节点缓存文件。
+- 手动删除缓存目录中的对应文件夹（\ComfyUI\output\cache），文件夹名为“node_” + “节点ID”。
 
 <img width="2230" height="976" alt="image" src="https://github.com/user-attachments/assets/5634914a-6f98-4d4f-b573-2c8b41e0c57e" />
 
 
 <img width="2209" height="1030" alt="image" src="https://github.com/user-attachments/assets/9bbdda2a-d4ce-4836-b108-e359e72e31de" />
 
-## BUG修复
+## BUG修复及优化
+
+V0.6.5
+
+- 优化latent缓存处理逻辑，去除手动指定缓存目录，更改为自动为每个节点指定唯一缓存目录（“node + 节点ID”），防止因误操作导致采样节点的latent缓存逻辑互相覆盖。
+- 以分段方式建立缓存与校验逻辑，若上游节点只添加了提示词，或增加了分段，没有改变提交到采样的其它分段提示词，同时与采样节点关联的其它参数没有改变，则已有的对应缓存依然视为有效被调用，新加分段也会自动建立latent缓存。下游采样节点（二采）也会保留原有latent缓存并调用，只新建增加的分段缓存。
+- 提示词的改变位置决定哪些latent缓存可以复用，被改变提示词的分段之后的分段将强行重建，下游节点也是同样的处理逻辑。
 
 V0.5.8
 - 完善哈希值检测参数，解决采样器上游节点parameter参数改变时导致的张量不匹配的错误。
@@ -153,8 +163,9 @@ git clone https://github.com/supElement/ComfyUI_MinimaxH3_AutoContext.git
 | steps / cfg | 30 / 1.0 | 采样步数 / CFG |
 | sampler_name / scheduler | euler / simple | 内置采样器 / 调度器 |
 | denoise | 1.0 | 重绘强度（1=全量重采样，越小保留越多原结构） |
-| enable_cache | true | 存储\读取latent缓存，上游节点或参数发生变化时会覆盖已有latent缓存文件 |
-| cache_dir | 空 | 为latent缓存文件指定任意目录，如：“D:\SDcomfyUI\ComfyUI\output\cache” 或者 "D:/SDcomfyUI/ComfyUI/output/cache" 。推荐为不同采样节点指定不同目录|
+| enable_cache | true | 存储\读取latent缓存，自动在 “\ComfyUI\output\cache” 目录下创建以“node+节点ID” 命名的文件夹，上游节点或参数发生变化时会覆盖已有latent缓存文件 |
+| clear_cache | false | 强制重建latent缓存文件|
+| ignore_latent_hash | false | 忽略输入端口input_latent 的哈希值校验。实用场景：有些latent处理节点会改变latent判断信息，使latent的微小变化导致缓存不可用，浪费推理时间，此时建议设置为true |
 | ref_image_N / ref_video_N / ref_video_audio_N / ref_audio_N | 可选 | 参考素材（Autogrow 动态端口） |
 | drive_audio | 可选 | 音频驱动源 |
 
