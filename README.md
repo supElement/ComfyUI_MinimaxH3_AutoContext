@@ -76,10 +76,12 @@ V0.5.8
 
 | 模式 | 说明 |
 |------|------|
-| **auto** | 段落含时间标记（如 `0-5s`）自动切分，无标记段落（风格/音效/禁止项）拼入每个窗口 |
-| **timeline** | 强制按时间标记切分 |
-| **global** | 整段提示词用于所有窗口（适合全程同质动作的一镜到底） |
-| **sequential** | 按句读顺序铺到时间轴，以 `全局:`/`[全局]` 开头的段落拼入每个窗口 |
+| **Clip_Tag** | 按用户自定义标签（如 `段1`/`段2`）切分提示词，每个标签对应一个独立视频段；段时长由提示词内容决定（标签后时长 > 段内时间标记 > `total_frames/fps` 兜底）。 |
+| **timeline** | 按显式时间标记（如 `0-2s`/`2-6s`）切分提示词，每个时间区间对应一个视频段；段时长 = 区间长度 × `fps` 并自动吸附到合法网格；**忽略 `total_frames` 和 `chunk_frames`**，完全由提示词决定总时长。全局段（`【全局】`）保留在原始位置，不会集中提取。 |
+| **sequential** | 将提示词按句读顺序均匀分配到整个视频时间轴上，不切分提示词本身；视频分段仍按 `chunk_frames` 进行。 | 
+| **global** | 整段提示词用于所有视频段（剥离 `【全局】` 标记后），视频分段按 `chunk_frames` 进行。 |
+
+> 在 `Clip_Tag` 和 `timeline` 模式下，`total_frames` 和 `chunk_frames` 参数被忽略（段长由提示词决定），仅当模式降级（如未检测到标签/时间标记）时才会回退使用这些值。
 
 ### 🏷️ Clip_Tag 标签分段模式
 
@@ -131,20 +133,18 @@ git clone https://github.com/supElement/ComfyUI_MinimaxH3_AutoContext.git
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | long_prompt | — | 提示词（传给主节点推理，同时用于「预计分段」预览） |
-| prompt_mode | auto | 提示词时间轴模式（仅 Clip_Frame 生效） |
-| clip_mode | Clip_Frame | 分段模式：Clip_Frame / Clip_Tag |
-| clip_tag | 段1 | Clip_Tag 分割标签模板（必须以数字序号结尾） |
-| prompt_format | official | 提示词输出格式：official / legacy / raw |
-| crop_mode | stretch | 参考图/首尾帧/参考视频缩放裁剪：center / stretch / none |
-| ref_sync_mode | segmented | 参考视频/音频是否按段切片：global / segmented |
+| **clip_mode** | `Clip_Tag` | 提示词映射到视频段的方式：`Clip_Tag` / `timeline` / `sequential` / `global`。`Clip_Tag` 和 `timeline` 模式下忽略 `total_frames` 和 `chunk_frames`。 |
+| clip_tag | `段1` | Clip_Tag 分割标签模板（必须以数字序号结尾），仅 `clip_mode=Clip_Tag` 时生效 |
+| prompt_format | `official` | 提示词输出格式：`official` / `legacy` / `raw`。`official` 使用 MiniMax H3 官方 [Shot] 格式，`legacy` 为旧式时间标签，`raw` 原样输出（用于 Clip_Tag 模式） |
+| crop_mode | `stretch` | 参考图/首尾帧/参考视频缩放裁剪：`center` / `stretch` / `none` |
+| ref_sync_mode | `segmented` | 参考视频/音频是否按段切片：`global`（每段使用完整素材） / `segmented`（按段的时间比例切片） |
 | width × height | 960×544 | 一采分辨率（二采时被 latent_input 覆盖） |
-| total_frames | 362 | 生成总帧数（17n+5）；Clip_Tag 下无明确时长的段以 total_frames 兜底，最终被各段之和覆盖 |
+| total_frames | 362 | 生成总帧数（17n+5）；在 `Clip_Tag`/`timeline` 模式下仅作为兜底（无标签/无时间标记时），最终被各段之和覆盖 |
 | fps | 24 | 帧率，用于音频同步和提示词秒数换算 |
-| chunk_frames | 90 | 每段生成帧数（17n+5） |
-| context_frames | 22 | 段间续接帧数（17n+5：5/22/39/56…） |
-| lock_audio | enable | 锁定音频区，只重画 video |
-| audio_drive | disable | 音频驱动开关 |
-
+| chunk_frames | 90 | 每段生成帧数（17n+5），仅在 `sequential` / `global` 模式下生效 |
+| context_frames | 22 | 段间续接帧数（17n+5：5/22/39/56…），建议 22 以上 |
+| lock_audio | `true` | 二采时锁定音频区（noise_mask audio=0）：只重新采样视频、保持一采音频不变 |
+| audio_drive | `false` | 音频驱动开关，开启后视频跟随 drive_audio 生成 |
 
 > 节点上实时显示「预计分段」预览（前端 JS 计算，不参与推理）。
 
