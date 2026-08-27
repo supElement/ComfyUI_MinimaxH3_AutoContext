@@ -167,7 +167,7 @@ def cosine_crossfade(audio_a: torch.Tensor, audio_b: torch.Tensor,
 
 _TIME_PATTERN = re.compile(
     r'(?:^|[\s，。；;,.：:、【】\[\]（）()<>「」『』])'
-    r'(\d+(?:\.\d+)?)\s*[-–—~至到]\s*(\d+(?:\.\d+)?)\s*[s秒]'
+    r'(\d+(?:\.\d+)?)\s*[s秒]?\s*[-–—~至到]\s*(\d+(?:\.\d+)?)\s*[s秒]?'
     r'\s*[:：]?\s*'
 )
 
@@ -211,7 +211,8 @@ _SHOT_PATTERN = re.compile(
     r'\[Shot\s*(\d+)\](?:\s*At\s*(\d+):(\d+(?:\.\d+)?))?\s*,?\s*')
 
 _LINE_START_TIME = re.compile(
-    r'^\s*[【\[]?\s*\d+(?:\.\d+)?\s*[-–—~至到]\s*\d+(?:\.\d+)?\s*[s秒]')
+    r'^\s*[【\[]?\s*\d+(?:\.\d+)?\s*[s秒]?\s*[-–—~至到]\s*\d+(?:\.\d+)?\s*[s秒]?'
+)
 _LINE_START_SHOT = re.compile(r'^\s*\[Shot\s*\d+\]')
 
 
@@ -940,7 +941,7 @@ def compute_tag_chunks(seg_target_frames_list, context_frames):
         chunks.append((start, start + s))
         start += s
 
-    print(f"[H3-Auto] Clip_Tag 分块: 目标总帧数={target_total} "
+    print(f"[H3-Auto] 分段计算: 目标总帧数={target_total} "
           f"实际输出={total_new} (偏差 {total_new - target_total:+d}帧)")
 
     return chunks, seg_sizes
@@ -963,3 +964,98 @@ def render_tag_segment(seg_text, seg_seconds, fmt, prefix=""):
     if prefix:
         window_prompt = window_prompt + "\n\n" + prefix
     return window_prompt
+    
+
+def parse_prompt_with_globals(long_prompt):
+    """
+    解析提示词，返回所有段落的列表，每个段落为 dict：
+        {
+            "type": "global" 或 "timeline",
+            "start": float (仅 timeline 有),
+            "end": float (仅 timeline 有),
+            "text": str (已剥离标记的内容),
+            "order": int  # 原始顺序，用于保持相对位置
+        }
+    全局段：标记 【全局】 或等效，文本内容剥离标记。
+    时间轴段：匹配时间范围。
+    """
+
+    paragraphs = re.split(r'\n+', long_prompt)
+    result = []
+    order = 0
+
+    for para in paragraphs:
+        para = para.strip()
+        if not para:
+            continue
+
+        global_match = _GLOBAL_MARK.match(para)
+        if global_match:
+            text = _strip_global_mark(para)
+            result.append({
+                "type": "global",
+                "text": text,
+                "order": order,
+                "start": None,
+                "end": None,
+            })
+            order += 1
+            continue
+
+        time_match = _TIME_PATTERN.search(para)
+        if time_match:
+            start = float(time_match.group(1))
+            end = float(time_match.group(2))
+            label = para[time_match.end():].strip()
+            label = label.lstrip('：:，,。；; ')
+            if not label:
+                label = para
+            result.append({
+                "type": "timeline",
+                "start": start,
+                "end": end,
+                "text": label,
+                "order": order,
+            })
+            order += 1
+        else:
+            result.append({
+                "type": "global",
+                "text": para,
+                "order": order,
+                "start": None,
+                "end": None,
+            })
+            order += 1
+
+    return result
+
+
+def compose_timeline_window(parsed_list, win_start, win_end, fmt="official"):
+    """
+    从解析列表中生成单个窗口的提示词。
+    保留全局段顺序，时间轴段只包含与窗口重叠的（重叠率 ≥ 25%）。
+    返回字符串。
+    """
+    win_dur = max(1e-6, win_end - win_start)
+    selected = []
+
+    for item in parsed_list:
+        if item["type"] == "global":
+            selected.append(item["text"])
+        else: 
+            cs = max(item["start"], win_start)
+            ce = min(item["end"], win_end)
+            if ce - cs >= 0.25 * win_dur:
+                rel_s = cs - win_start
+                rel_e = ce - win_start
+                if fmt == "official":
+                    time_str = f"[{rel_s:.1f}-{rel_e:.1f}s]"
+                else:
+                    time_str = f"{rel_s:.1f}-{rel_e:.1f}秒"
+                text = item["text"]
+                if text:
+                    selected.append(f"{time_str} {text}")
+                else:
+                    selected.append(time_str)
+    return "\n".join(selected)

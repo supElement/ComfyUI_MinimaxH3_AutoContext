@@ -386,8 +386,8 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
                                 long_prompt, width, height,
                                 total_frames, fps, chunk_frames, context_frames,
                                 steps, cfg, sampler_name, scheduler, seed,
-                                prompt_mode="auto", prompt_format="official",
-                                clip_mode="Clip_Frame", clip_tag="段1",
+                                clip_mode="Clip_Tag", prompt_format="official",
+                                clip_tag="段1",
                                 crop_mode="stretch", ref_sync_mode="global",
                                 decode_output=False,
                                 drive_audio=None, audio_drive=False,
@@ -404,56 +404,7 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
     device = comfy.model_management.get_torch_device()
     total_seconds_for_prompt = total_frames / fps
 
-    is_tag_mode = (clip_mode == "Clip_Tag")
-
-    if is_tag_mode:
-        tag_schedule = h3_utils.build_tag_schedule(
-            long_prompt, clip_tag, default_seconds=total_frames / fps)
-        tag_segments = tag_schedule["segments"]
-        tag_prefix = tag_schedule["prefix"]
-
-        seg_target_frames = [int(d * fps) for _, d in tag_segments]
-        chunks, seg_sizes = h3_utils.compute_tag_chunks(
-            seg_target_frames, context_frames)
-
-        effective_new = seg_sizes[0] + sum(
-            s - context_frames for s in seg_sizes[1:]) if seg_sizes else 0
-        total_frames = effective_new
-        chunk_frames = seg_sizes[0] if seg_sizes else 0
-
-        print(f"[H3-Auto] Clip_Tag 模式: {len(seg_sizes)} 段")
-        print(f"[H3-Auto] 各段目标帧数={seg_target_frames} 实际采样={seg_sizes}")
-    else:
-        chunks, chunk_frames = h3_utils.compute_chunks(
-            total_frames, chunk_frames, context_frames)
-        seg_sizes = [end - start for start, end in chunks]
-
-    min_seg = min(seg_sizes) if seg_sizes else chunk_frames
-    max_context = min_seg - 5
-    effective_context = max(5, min(context_frames, max_context))
-    if effective_context != context_frames:
-        print(f"[H3-Auto] context_frames {context_frames} -> {effective_context} (上限保护)")
-
-    new_frames = [seg_sizes[0]] + [s - effective_context for s in seg_sizes[1:]]
-    if is_tag_mode:
-        print(f"[H3-Auto] 各段实际输出={new_frames} 合计={sum(new_frames)}帧 ")
-    else:
-        print(f"[H3-Auto] 总帧数={total_frames} 分段={len(chunks)} 实际采样={seg_sizes} (基准={chunk_frames})")
-        print(f"[H3-Auto] 各段有效帧数={new_frames} 合计={sum(new_frames)}帧 "
-              f"(目标={total_frames}, 超出部分从末段头部裁剪)")
-        if len(seg_sizes) >= 2 and seg_sizes[-1] > chunk_frames:
-            ext = seg_sizes[-1] - chunk_frames
-            print(f"[H3-Auto] 末段加长 {ext} 帧 ({ext / chunk_frames * 100:.0f}%) 吸收锚定亏空 "
-                  f"(<=30% 上限, 避免新增分段)")
-
-    if not is_tag_mode:
-        prompt_schedule = h3_utils.build_prompt_schedule(
-            long_prompt, total_seconds_for_prompt, mode=prompt_mode)
-        print(f"[H3-Auto] 提示词模式={prompt_schedule['mode']} "
-              f"时间段数={len(prompt_schedule['segments'])} "
-              f"全局段(前={bool(prompt_schedule['prefix'])} 后={bool(prompt_schedule['suffix'])})")
-    else:
-        prompt_schedule = None
+    # ==================== VAE 编码首尾帧等（不变） ====================
     is_second_pass = latent_input is not None
     if is_second_pass:
         v_in, _ = h3_conditioning.unpack_nested_latent(latent_input)
@@ -537,13 +488,110 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
 
     first_pass_segments = None
     if is_second_pass:
+        pass  
+
+    # ==================== 根据 clip_mode 确定分段方式 ====================
+    seg_sizes = []
+    chunks = []
+    prompt_getter = None  
+
+    if clip_mode == "Clip_Tag":
+        tag_schedule = h3_utils.build_tag_schedule(long_prompt, clip_tag, default_seconds=total_frames / fps)
+        tag_segments = tag_schedule["segments"]
+        tag_prefix = tag_schedule["prefix"]
+        seg_target_frames = [int(d * fps) for _, d in tag_segments]
+        chunks, seg_sizes = h3_utils.compute_tag_chunks(seg_target_frames, context_frames)
+        total_frames = sum([seg_sizes[0]] + [s - context_frames for s in seg_sizes[1:]])
+        def prompt_getter(idx):
+            seg_text, _ = tag_segments[idx]
+            seg_seconds = (seg_sizes[idx] - (context_frames if idx > 0 else 0)) / fps
+            return h3_utils.render_tag_segment(seg_text, seg_seconds, prompt_format, tag_prefix)
+
+    elif clip_mode == "timeline":
+        parsed = h3_utils.parse_prompt_with_globals(long_prompt)
+        timeline_items = [item for item in parsed if item["type"] == "timeline"]
+        if not timeline_items:
+            print("[H3-Auto] timeline 模式下未检测到时间标记，降级为 global 模式")
+            total_seconds = total_frames / fps
+            schedule = h3_utils.build_prompt_schedule(long_prompt, total_seconds, mode="global")
+            chunks, _ = h3_utils.compute_chunks(total_frames, chunk_frames, context_frames)
+            seg_sizes = [end - start for start, end in chunks]
+            total_frames = sum([seg_sizes[0]] + [s - context_frames for s in seg_sizes[1:]])
+            def prompt_getter(idx):
+                start_sec = chunks[idx][0] / fps
+                end_sec = chunks[idx][1] / fps
+                return h3_utils.compose_window_prompt(schedule, start_sec, end_sec, fmt=prompt_format)
+        else:
+            seg_target_frames = []
+            for item in timeline_items:
+                duration = item["end"] - item["start"]
+                target = max(5, duration * fps)
+                seg_frames = h3_utils.snap_to_grid_up(target)
+                seg_target_frames.append(seg_frames)
+            chunks, seg_sizes = h3_utils.compute_tag_chunks(seg_target_frames, context_frames)
+            total_frames = sum([seg_sizes[0]] + [s - context_frames for s in seg_sizes[1:]])
+
+            def prompt_getter(idx):
+                parts = []
+                time_idx = 0
+                for item in parsed:
+                    if item["type"] == "global":
+                        parts.append(item["text"])
+                    else:  # timeline
+                        if time_idx == idx:
+                            rel_start = 0.0
+                            rel_end = item["end"] - item["start"]
+                            text = item["text"]
+                            if prompt_format == "official":
+                                time_str = h3_utils._fmt_shot_time(rel_start)
+                                if text:
+                                    shot_line = f"integrated_multimodal_description: [Shot 1] At {time_str}, {text}"
+                                else:
+                                    shot_line = f"integrated_multimodal_description: [Shot 1] At {time_str}"
+                            else:
+                                if text:
+                                    shot_line = f"[{rel_start:.1f}-{rel_end:.1f}s] {text}"
+                                else:
+                                    shot_line = f"[{rel_start:.1f}-{rel_end:.1f}s]"
+                            parts.append(shot_line)
+                        time_idx += 1
+                return "\n".join(parts)
+
+    elif clip_mode == "sequential":
+        total_seconds = total_frames / fps
+        schedule = h3_utils.build_prompt_schedule(long_prompt, total_seconds, mode="sequential")
+        chunks, _ = h3_utils.compute_chunks(total_frames, chunk_frames, context_frames)
+        seg_sizes = [end - start for start, end in chunks]
+        total_frames = sum([seg_sizes[0]] + [s - context_frames for s in seg_sizes[1:]])
+        def prompt_getter(idx):
+            start_sec = chunks[idx][0] / fps
+            end_sec = chunks[idx][1] / fps
+            return h3_utils.compose_window_prompt(schedule, start_sec, end_sec, fmt=prompt_format)
+
+    else:  # global
+        total_seconds = total_frames / fps
+        schedule = h3_utils.build_prompt_schedule(long_prompt, total_seconds, mode="global")
+        chunks, _ = h3_utils.compute_chunks(total_frames, chunk_frames, context_frames)
+        seg_sizes = [end - start for start, end in chunks]
+        total_frames = sum([seg_sizes[0]] + [s - context_frames for s in seg_sizes[1:]])
+        def prompt_getter(idx):
+            start_sec = chunks[idx][0] / fps
+            end_sec = chunks[idx][1] / fps
+            return h3_utils.compose_window_prompt(schedule, start_sec, end_sec, fmt=prompt_format)
+
+    effective_new = [seg_sizes[0]] + [s - context_frames for s in seg_sizes[1:]]
+    print(f"[H3-Auto] clip_mode={clip_mode}, 段数={len(chunks)}, 实际采样={seg_sizes}, 实际输出={effective_new}, 总帧数={total_frames}")
+
+    # ==================== 二采切分（现在 seg_sizes 已知） ====================
+    if is_second_pass:
         first_pass_segments = _split_first_pass_latent(
-            latent_input, seg_sizes, effective_context, fps)
+            latent_input, seg_sizes, context_frames, fps)
         if first_pass_segments is None or len(first_pass_segments) != len(chunks):
             print("[H3-Auto] 错误: 二采切分失败 (输入 latent 与分段账目不匹配)，回退一采")
             is_second_pass = False
             first_pass_segments = None
 
+    # ==================== 采样循环 ====================
     all_segments = []
     all_x0 = []
     prev_x0 = None
@@ -553,7 +601,6 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
     
     segment_fingerprints = []
     
-    # ==================== 段循环开始 ====================
     upstream_fingerprint = None
     if info is not None:
         upstream_fingerprint = info.get("upstream_fingerprint")
@@ -573,18 +620,11 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
     
         account = f"帧数={seg_frames}"
         if not is_first_chunk:
-            account += f" (锚定={effective_context}，有效帧数={seg_frames - effective_context})"
+            account += f" (锚定={context_frames}，有效帧数={seg_frames - context_frames})"
         print(f"[H3-Auto] 生成段 {idx+1}/{len(chunks)} (帧{start_f}-{end_f}) {account}")
     
         # ==================== 提示词构建 ====================
-        if is_tag_mode:
-            seg_text, _ = tag_segments[idx]
-            seg_seconds = new_frames[idx] / fps
-            window_prompt = h3_utils.render_tag_segment(
-                seg_text, seg_seconds, prompt_format, tag_prefix)
-        else:
-            window_prompt = h3_utils.compose_window_prompt(
-                prompt_schedule, start_f / fps, end_f / fps, fmt=prompt_format)
+        window_prompt = prompt_getter(idx)
     
         seg_ref_vid, seg_ref_aud = ref_vid_data, ref_aud_data
         if ref_sync_mode == "segmented":
@@ -620,7 +660,7 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
             first_latent=first_latent if is_first_chunk else None,
             last_latent=last_latent if is_last_chunk else None,
             prev_segment=anchor_prev,
-            context_frames=effective_context, fps=fps,
+            context_frames=context_frames, fps=fps,
             ref_img_data=seg_ref_img,
             ref_vid_data=seg_ref_vid,
             ref_aud_latents=[a.get("latent") for a in seg_ref_aud if a.get("latent") is not None],
@@ -636,7 +676,7 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
     
         drive_aud_latent = None
         if drive_waveform is not None and not is_second_pass:
-            gen_start = output_cursor - (effective_context if not is_first_chunk else 0)
+            gen_start = output_cursor - (context_frames if not is_first_chunk else 0)
             gen_end = gen_start + seg_frames
             drive_aud_latent = _encode_drive_audio(
                 audio_vae, drive_waveform, drive_sr, gen_start / fps, gen_end / fps, device)
@@ -648,7 +688,7 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
             seg_latent_dict = first_pass_segments[idx]
             ov_t = 0
             if not is_first_chunk:
-                ov_t = max(2, video_latent_frames(effective_context)) if effective_context > 5 else 2
+                ov_t = max(2, video_latent_frames(context_frames)) if context_frames > 5 else 2
             if ov_t > 0 or lock_audio:
                 if ov_t > 0:
                     seg_latent_dict = _copy_overlap_tail(
@@ -664,10 +704,9 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
             seg_latent_dict = _make_h3_empty_latent(
                 latent_w, latent_h, seg_frames, fps, drive_audio_latent=drive_aud_latent,
                 overlap_video=overlap_video, overlap_video_denoise=video_context_denoise,
-                overlap_frames=effective_context)
+                overlap_frames=context_frames)
     
-        # ==================== 🔥 缓存逻辑开始 ====================
-    
+        # ==================== 缓存逻辑 ====================
         window_prompt_hash = hashlib.md5(window_prompt.encode('utf-8')).hexdigest()
         
         if sigmas is not None:
@@ -715,7 +754,6 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
             current_meta["sampler_name"] = effective_sampler_name
             current_meta["scheduler"] = effective_scheduler
         
-        # 如果有 sigmas，对整个序列计算哈希        
         if sigmas is not None:
             if isinstance(sigmas, torch.Tensor):
                 sigmas_flat = sigmas.flatten().cpu().numpy()
@@ -726,7 +764,6 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
             else:
                 current_meta["sigmas_hash"] = hashlib.md5(str(sigmas).encode('utf-8')).hexdigest()
     
-        # ===== 二采输入切片哈希（受 ignore_latent_hash 控制） =====
         if is_second_pass and not ignore_latent_hash:
             v_slice, _ = h3_conditioning.unpack_nested_latent(seg_latent_dict)
             if v_slice is not None:
@@ -739,7 +776,6 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
             else:
                 current_meta["input_slice_hash"] = None
     
-        # 3. 尝试从缓存加载
         cached_samples = None
         cached_x0 = None
         if enable_cache and cache_dir and not force_regenerate:
@@ -760,15 +796,12 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
     
             x0 = segment_latent.get("x0")
     
-            # 4. 异步保存缓存
             if enable_cache and cache_dir:
                 metadata = current_meta.copy()
                 latent_cache.save_segment_latent_async(
                     cache_dir, idx, segment_latent, x0, metadata)
                 print("\033[33m" + f"[H3-Cache] 段 {idx+1}/{len(chunks)} 已提交异步保存" + "\033[0m")
     
-    
-        # ==================== 🔥 缓存逻辑结束 ====================
         segment_fingerprints.append(f"{window_prompt_hash}_{conditions_hash}_{seg_frames}")
         
         samples_dict = {"samples": segment_latent["samples"]}
@@ -776,14 +809,14 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
         prev_x0 = x0_dict
         all_segments.append(samples_dict)
         all_x0.append(x0_dict)
-        output_cursor += new_frames[idx]
+        output_cursor += effective_new[idx]
         overall_pbar.update(1)
     # ==================== 段循环结束 ====================
 
-    final_latent = _merge_segment_latents(all_segments, effective_context, fps)
-    final_denoised = _merge_segment_latents(all_x0, effective_context, fps)
+    final_latent = _merge_segment_latents(all_segments, context_frames, fps)
+    final_denoised = _merge_segment_latents(all_x0, context_frames, fps)
 
-    seam_boundaries, seam_decoded = compute_seam_boundaries(seg_sizes, effective_context)
+    seam_boundaries, seam_decoded = compute_seam_boundaries(seg_sizes, context_frames)
     
     global_params = {
         "steps": steps,
@@ -798,7 +831,7 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
     seam_info = {
         "boundaries": seam_boundaries,
         "seg_sizes": [int(s) for s in seg_sizes],
-        "effective_context": int(effective_context),
+        "effective_context": int(context_frames),
         "decoded_frames": int(seam_decoded),
         "segment_fingerprints": segment_fingerprints,   
         "upstream_global_hash": upstream_global_hash,   
@@ -832,7 +865,7 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
     n_segs = len(all_pixels)
     head_trims = [0] * n_segs
     for i in range(1, n_segs):
-        head_trims[i] = min(effective_context, all_pixels[i].shape[0] - 1)
+        head_trims[i] = min(context_frames, all_pixels[i].shape[0] - 1)
 
     total_after = sum(all_pixels[i].shape[0] - head_trims[i] for i in range(n_segs))
     excess = total_after - total_frames
@@ -851,11 +884,10 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
     if drive_final_audio is not None:
         final_audio = drive_final_audio
     else:
-        final_audio = _crossfade_audio(all_waveforms, head_trims, effective_context,
+        final_audio = _crossfade_audio(all_waveforms, head_trims, context_frames,
                                        total_frames, fps)
 
     return final_pixels, final_audio, final_latent, final_denoised, seam_info
-
 
 def _prepare_ref_images(ref_images, vae, device, gen_w, gen_h, crop_mode="stretch"):
     """预处理参考图片：按 crop_mode 缩放 + 32x 对齐 + VAE 编码"""

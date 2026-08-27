@@ -28,18 +28,12 @@ _SAMPLERS = [
 _SCHEDULERS = ["simple", "normal", "karras", "exponential",
                "sgm_uniform", "beta", "linear_quadratic"]
 
-_PROMPT_MODE_TOOLTIP = (
-    "提示词时间轴模式 (仅 Clip_Frame 模式生效，Clip_Tag 模式下自动忽略)。"
-    "auto: 段落含时间标记(如0-5s)自动切分，无标记的段落(风格/音效/禁止项)自动拼入每个窗口; "
-    "timeline: 强制按时间标记切分; global: 整段提示词用于所有窗口(适合全程同质动作); "
-    "sequential: 按句读顺序铺到时间轴，以 '全局:'/'[全局]'/'[global]' 开头的段落不平铺、拼入每个窗口"
-)
 _CONTEXT_FRAMES_TOOLTIP = (
     "段间续接用的上一段尾部帧数。值越大连续性越强。建议 22 以上防硬切。有效网格点: 5,22,39,56,73,90,107,124"
 )
 _CLIP_MODE_TOOLTIP = (
-    "分段模式。Clip_Frame: 按 chunk_frames 均匀切分视频时间轴，提示词按时间标记匹配各窗口 (原有逻辑); "
-    "Clip_Tag: 按用户自定义标签切分提示词，每段=一个 chunk=该段全部提示词，段时长由提示词内容决定"
+    "提示词映射到视频段的方式：Clip_Tag按自定义标签分段；timeline按时间标记分段；sequential按句读顺序平铺；global整段用于所有段。"
+    "Clip_Tag和timeline模式下，total_frames和chunk_frames无效，段长由提示词决定。"
 )
 _CLIP_TAG_TOOLTIP = (
     "Clip_Tag 模式的分割标签模板 (仅 Clip_Tag 模式生效)。必须以数字序号结尾，"
@@ -77,12 +71,10 @@ class H3ParameterNode(io.ComfyNode):
                 io.String.Input("long_prompt", multiline=True, dynamic_prompts=True,
                     socketless=False, default="",
                     tooltip="提示词 (传给主节点推理，同时用于「预计分段」预览)"),
-                io.Combo.Input("prompt_mode",
-                    options=["auto", "timeline", "global", "sequential"],
-                    default="auto", tooltip=_PROMPT_MODE_TOOLTIP),
                 io.Combo.Input("clip_mode",
-                    options=["Clip_Frame", "Clip_Tag"],
-                    default="Clip_Frame", tooltip=_CLIP_MODE_TOOLTIP),
+                    options=["Clip_Tag", "timeline", "sequential", "global"],
+                    default="Clip_Tag",
+                    tooltip=_CLIP_MODE_TOOLTIP),
                 io.String.Input("clip_tag", multiline=False, dynamic_prompts=True,
                     socketless=False, default="段1",
                     tooltip=_CLIP_TAG_TOOLTIP),
@@ -101,11 +93,13 @@ class H3ParameterNode(io.ComfyNode):
                 io.Int.Input("width", default=960, min=64, max=4096, step=32),
                 io.Int.Input("height", default=544, min=64, max=4096, step=32),
                 io.Int.Input("total_frames", default=362, min=5, max=2880, step=17,
-                    tooltip="生成总帧数，需满足 17n+5 (5,22,39,56,73,90,...)。提示词内时间仍按秒解析"),
+                    tooltip="生成总帧数，需满足 17n+5 (5,22,39,56,73,90,...)。提示词内时间仍按秒解析。"
+                            "在 Clip_Tag 和 timeline 模式下，该值被忽略，由提示词内容自动计算。"),
                 io.Int.Input("fps", default=24, min=8, max=60, step=1,
                     tooltip="帧率，仅用于音频同步和提示词内秒数换算"),
                 io.Int.Input("chunk_frames", default=90, min=5, max=2880, step=17,
-                    tooltip="每段生成帧数，需满足 17n+5 (5,22,39,...)。设为 ≥ total_frames 时不拆分，整个视频作为一段生成"),
+                    tooltip="每段生成帧数，需满足 17n+5 (5,22,39,...)。设为 ≥ total_frames 时不拆分，整个视频作为一段生成。"
+                            "在 Clip_Tag 和 timeline 模式下，该值被忽略，由提示词内容自动计算。"),
                 io.Int.Input("context_frames", default=22, min=5, max=124, step=1,
                     tooltip=_CONTEXT_FRAMES_TOOLTIP),
                 io.Boolean.Input("lock_audio",
@@ -124,21 +118,26 @@ class H3ParameterNode(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, long_prompt="", prompt_mode="auto",
-                clip_mode="Clip_Frame", clip_tag="段1",
+    def execute(cls, long_prompt="", clip_mode="Clip_Tag", clip_tag="段1",
                 prompt_format="official", crop_mode="stretch", ref_sync_mode="segmented",
                 width=960, height=544, total_frames=362, fps=24, chunk_frames=90,
                 context_frames=22, lock_audio=True, audio_drive=False,
                 ) -> io.NodeOutput:
         parameter = {
             "long_prompt": long_prompt,
-            "prompt_mode": prompt_mode,
-            "clip_mode": clip_mode, "clip_tag": clip_tag,
-            "prompt_format": prompt_format, "crop_mode": crop_mode,
+            "clip_mode": clip_mode,
+            "clip_tag": clip_tag,
+            "prompt_format": prompt_format,
+            "crop_mode": crop_mode,
             "ref_sync_mode": ref_sync_mode,
-            "width": width, "height": height, "total_frames": total_frames,
-            "fps": fps, "chunk_frames": chunk_frames, "context_frames": context_frames,
-            "lock_audio": lock_audio, "audio_drive": audio_drive,
+            "width": width,
+            "height": height,
+            "total_frames": total_frames,
+            "fps": fps,
+            "chunk_frames": chunk_frames,
+            "context_frames": context_frames,
+            "lock_audio": lock_audio,
+            "audio_drive": audio_drive,
         }
         return io.NodeOutput(parameter)
 
@@ -261,8 +260,7 @@ class H3AutoContextSampler(io.ComfyNode):
             
         p = parameter or {}
         long_prompt = p.get("long_prompt", "")
-        prompt_mode = p.get("prompt_mode", "auto")
-        clip_mode = p.get("clip_mode", "Clip_Frame")
+        clip_mode = p.get("clip_mode", "Clip_Tag")
         clip_tag = p.get("clip_tag", "段1")
         prompt_format = p.get("prompt_format", "official")
         crop_mode = p.get("crop_mode", "stretch")
@@ -302,9 +300,7 @@ class H3AutoContextSampler(io.ComfyNode):
             "clip_tag": str(clip_tag),
         }
 
-        if clip_mode != "Clip_Tag":
-            if chunk_frames <= 0:
-                chunk_frames = total_frames
+        # 参数归一化
         width = max(32, (width // 32) * 32)
         height = max(32, (height // 32) * 32)
         if isinstance(audio_drive, str):
@@ -339,7 +335,7 @@ class H3AutoContextSampler(io.ComfyNode):
 
         ref_audio_list = _autogrow_to_list(ref_audios, "ref_audio_", 4)
 
-        # ===== 强制清除缓存（若 clear_cache=True） =====
+        # ===== 强制清除缓存 =====
         if clear_cache and unique_id is not None:
             try:
                 output_dir = folder_paths.get_output_directory()
@@ -378,9 +374,10 @@ class H3AutoContextSampler(io.ComfyNode):
             total_frames=total_frames, fps=fps,
             chunk_frames=chunk_frames, context_frames=int(context_frames),
             steps=steps, cfg=cfg, sampler_name=sampler_name,
-            scheduler=scheduler, seed=seed, prompt_mode=prompt_mode,
+            scheduler=scheduler, seed=seed,
+            clip_mode=clip_mode,
             prompt_format=prompt_format,
-            clip_mode=clip_mode, clip_tag=clip_tag,
+            clip_tag=clip_tag,
             crop_mode=crop_mode, ref_sync_mode=ref_sync_mode,
             decode_output=decode_output,
             drive_audio=drive_audio, audio_drive=audio_drive,
@@ -391,7 +388,7 @@ class H3AutoContextSampler(io.ComfyNode):
             enable_cache=enable_cache,
             cache_dir=cache_dir,
             ignore_latent_hash=ignore_latent_hash,
-            info=info, 
+            info=info,
         )
         if seam_info:
             out_info.update(seam_info)
