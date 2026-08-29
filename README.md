@@ -8,7 +8,7 @@
 # ComfyUI_MinimaxH3_AutoContext
 
 一键式 MiniMax H3 长视频自动化生成节点：**分段推理 + 段间续接锚定 + 提示词时间轴切片 + 二次采样（二采）+ 接缝修正**。
-在显存有限的情况下，将长视频拆分为多段独立推理，通过叠加增强方法实现段间无缝衔接，同时按时间轴自动切分提示词，让每段生成内容与提示词节奏对齐；对音视频参考做同样切片并对齐；当前段只有被引用的参考参与推理。支持二采（低清一采 + 高清二采）。
+在显存有限的情况下，将长视频拆分为多段独立推理，通过叠加增强方法实现段间无缝衔接，同时按时间轴自动切分提示词，让每段生成内容与提示词节奏对齐；对音视频参考做同样切片并对齐；当前段只有被引用的参考参与推理。支持二次采样。视频延长、视频前推、双视频衔接。
 支持latent缓存存取，方便推理过程中因某种原因导致推理中断后，快速跳过已推理分段，缓存文件以分段为单位存储，在采样节点上游参数不变的情况下，读取已有latent cache 文件。
 
 注意：更改模型,包括lora、sageattention等加速节点时，latent检测不会发现更改，所以必须删除latent缓存，两种删除latent缓存的方法：
@@ -145,6 +145,7 @@ git clone https://github.com/supElement/ComfyUI_MinimaxH3_AutoContext.git
 | context_frames | 22 | 段间续接帧数（17n+5：5/22/39/56…），建议 22 以上 |
 | lock_audio | `true` | 二采时锁定音频区（noise_mask audio=0）：只重新采样视频、保持一采音频不变 |
 | audio_drive | `false` | 音频驱动开关，开启后视频跟随 drive_audio 生成 |
+| video_guide | `none` | 视频延长参数，支持分段。 none: 不启用；pre_guide: 视频续写（采样节点 ref_video_0 或 + ref_video_audio_0 端口）；post_guide: 视频前推（采样节点 ref_video_0 或 + ref_video_audio_0 端口）；pre_post_guide: 双视频中间衔接（采样节点 ref_video_0 或 + ref_video_audio_0 端口，ref_video_1 或 + ref_video_audio_1 端口）。锚定帧数由 context_frames 决定。注意：非none时，采样节点的对应参考端口的参考会被强行剪切为context_frames参数中设置的数值。参考引用逻辑与普通参考相同（提示词中声明了，才会引用）|
 
 > 节点上实时显示「预计分段」预览（前端 JS 计算，不参与推理）。
 
