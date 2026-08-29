@@ -1,109 +1,109 @@
 name: Translate Readme
 
-on:
-  push:
-    branches: ['main']
-    paths:
-      - 'README.md'  # 只在 README.md 变化时触发，避免死循环
+# on:
+  # push:
+    # branches: ['main']
+    # paths:
+      # - 'README.md'  # 只在 README.md 变化时触发，避免死循环
 
-jobs:
-  translate:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write  # 确保有写入权限
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}  # 使用你的 token
-          fetch-depth: 0  # 获取完整历史，便于 rebase
+# jobs:
+  # translate:
+    # runs-on: ubuntu-latest
+    # permissions:
+      # contents: write  # 确保有写入权限
+    # steps:
+      # - uses: actions/checkout@v4
+        # with:
+          # token: ${{ secrets.GITHUB_TOKEN }}  # 使用你的 token
+          # fetch-depth: 0  # 获取完整历史，便于 rebase
 
-      - name: Translate with Zhipu (Free Forever)
-        env:
-          ZHIPU_KEY: ${{ secrets.ZHIPU_API_KEY }}
-        run: |
-          python << 'PYEOF'
-          import requests, os, json
+      # - name: Translate with Zhipu (Free Forever)
+        # env:
+          # ZHIPU_KEY: ${{ secrets.ZHIPU_API_KEY }}
+        # run: |
+          # python << 'PYEOF'
+          # import requests, os, json
           
-          # 读取中文README
-          with open('README.md', 'r', encoding='utf-8') as f:
-              text = f.read()
+          # # 读取中文README
+          # with open('README.md', 'r', encoding='utf-8') as f:
+              # text = f.read()
           
-          # 调用智谱 GLM-4-Flash
-          api_key = os.environ.get('ZHIPU_KEY', '')
-          if not api_key:
-              raise SystemExit(
-                  "ZHIPU_KEY 未设置: 请在仓库 Settings -> Secrets and variables -> Actions "
-                  "中配置名为 ZHIPU_API_KEY 的 secret"
-              )
+          # # 调用智谱 GLM-4-Flash
+          # api_key = os.environ.get('ZHIPU_KEY', '')
+          # if not api_key:
+              # raise SystemExit(
+                  # "ZHIPU_KEY 未设置: 请在仓库 Settings -> Secrets and variables -> Actions "
+                  # "中配置名为 ZHIPU_API_KEY 的 secret"
+              # )
 
-          r = requests.post(
-              "https://open.bigmodel.cn/api/paas/v4/chat/completions",
-              headers={"Authorization": f"Bearer {api_key}"},
-              json={
-                  "model": "glm-4-flash",
-                  "messages": [
-                      {"role": "system", "content": "将中文README翻译成英文。要求：1.保留原始markdown格式；2.代码块内的注释可翻译，代码本身不翻译；3.图片链接格式 ![描述](url) 保持原样；4.不要添加任何代码块标记包裹整个输出；5.直接返回翻译后的markdown文本"},
-                      {"role": "user", "content": text}
-                  ]
-              },
-              timeout=120
-          )
+          # r = requests.post(
+              # "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+              # headers={"Authorization": f"Bearer {api_key}"},
+              # json={
+                  # "model": "glm-4-flash",
+                  # "messages": [
+                      # {"role": "system", "content": "将中文README翻译成英文。要求：1.保留原始markdown格式；2.代码块内的注释可翻译，代码本身不翻译；3.图片链接格式 ![描述](url) 保持原样；4.不要添加任何代码块标记包裹整个输出；5.直接返回翻译后的markdown文本"},
+                      # {"role": "user", "content": text}
+                  # ]
+              # },
+              # timeout=120
+          # )
 
-          # 诊断: 非 2xx 或缺少 choices 时, 打印完整错误响应并退出, 便于定位问题
-          try:
-              resp = r.json()
-          except ValueError:
-              print("=" * 60)
-              print(f"HTTP status: {r.status_code}")
-              print("Non-JSON response:")
-              print(r.text[:2000])
-              print("=" * 60)
-              raise SystemExit(f"Zhipu API returned a non-JSON response (HTTP {r.status_code})")
+          # # 诊断: 非 2xx 或缺少 choices 时, 打印完整错误响应并退出, 便于定位问题
+          # try:
+              # resp = r.json()
+          # except ValueError:
+              # print("=" * 60)
+              # print(f"HTTP status: {r.status_code}")
+              # print("Non-JSON response:")
+              # print(r.text[:2000])
+              # print("=" * 60)
+              # raise SystemExit(f"Zhipu API returned a non-JSON response (HTTP {r.status_code})")
 
-          if r.status_code != 200 or 'choices' not in resp:
-              print("=" * 60)
-              print(f"HTTP status: {r.status_code}")
-              print("Full response:")
-              print(json.dumps(resp, ensure_ascii=False, indent=2))
-              code = resp.get('error', {}).get('code', '')
-              hints = {
-                  '1210': "API Key 无效或已过期，请检查 ZHIPU_API_KEY",
-                  '1000': "认证失败，请检查 ZHIPU_API_KEY 格式是否正确",
-                  '1304': "账户余额不足或免费额度已用完",
-                  '1302': "请求过于频繁，被限流，稍后重试",
-                  '1106': "模型名不存在，请检查 model 字段",
-              }
-              if code in hints:
-                  print(f"Hint: {hints[code]}")
-              print("=" * 60)
-              raise SystemExit(f"Zhipu API error (HTTP {r.status_code}, code={code or 'N/A'})")
+          # if r.status_code != 200 or 'choices' not in resp:
+              # print("=" * 60)
+              # print(f"HTTP status: {r.status_code}")
+              # print("Full response:")
+              # print(json.dumps(resp, ensure_ascii=False, indent=2))
+              # code = resp.get('error', {}).get('code', '')
+              # hints = {
+                  # '1210': "API Key 无效或已过期，请检查 ZHIPU_API_KEY",
+                  # '1000': "认证失败，请检查 ZHIPU_API_KEY 格式是否正确",
+                  # '1304': "账户余额不足或免费额度已用完",
+                  # '1302': "请求过于频繁，被限流，稍后重试",
+                  # '1106': "模型名不存在，请检查 model 字段",
+              # }
+              # if code in hints:
+                  # print(f"Hint: {hints[code]}")
+              # print("=" * 60)
+              # raise SystemExit(f"Zhipu API error (HTTP {r.status_code}, code={code or 'N/A'})")
 
-          content = resp['choices'][0]['message']['content']
+          # content = resp['choices'][0]['message']['content']
           
-          # 后处理：去掉模型可能错误添加的外层代码块
-          content = content.strip()
-          if content.startswith('```markdown'):
-              content = content[11:].strip()
-          elif content.startswith('```'):
-              # 找到第一个换行，去掉开头的 ``` 和语言标记
-              first_newline = content.find('\n')
-              if first_newline != -1:
-                  content = content[first_newline+1:].strip()
-          if content.endswith('```'):
-              content = content[:-3].strip()
+          # # 后处理：去掉模型可能错误添加的外层代码块
+          # content = content.strip()
+          # if content.startswith('```markdown'):
+              # content = content[11:].strip()
+          # elif content.startswith('```'):
+              # # 找到第一个换行，去掉开头的 ``` 和语言标记
+              # first_newline = content.find('\n')
+              # if first_newline != -1:
+                  # content = content[first_newline+1:].strip()
+          # if content.endswith('```'):
+              # content = content[:-3].strip()
           
-          # 写入英文README
-          with open('README.en.md', 'w', encoding='utf-8') as f:
-              f.write(content)
-          PYEOF
+          # # 写入英文README
+          # with open('README.en.md', 'w', encoding='utf-8') as f:
+              # f.write(content)
+          # PYEOF
           
-      - name: Push changes
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add README.en.md
-          git diff --staged --quiet || (
-            git commit -m "docs: auto translate" &&
-            git pull --rebase origin main &&  # 先拉取最新，避免冲突
-            git push
-          )
+      # - name: Push changes
+        # run: |
+          # git config user.name "github-actions[bot]"
+          # git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # git add README.en.md
+          # git diff --staged --quiet || (
+            # git commit -m "docs: auto translate" &&
+            # git pull --rebase origin main &&  # 先拉取最新，避免冲突
+            # git push
+          # )
