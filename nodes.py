@@ -111,6 +111,16 @@ class H3ParameterNode(io.ComfyNode):
                             "不重新生成音频)，视频照它生成。"
                             "注意：本节点不输出音频，请把同一条源音频直接接到视频合成节点 "
                             "(这样也避免了 VAE 有损往返)。不勾选 (默认): 音频照常生成"),
+                
+                io.Combo.Input("video_guide",
+                    options=["none", "pre_guide", "post_guide", "pre_post_guide"],
+                    default="none",
+                    tooltip="利用 ref_video 端口输入的视频进行多帧强锚定。\n"
+                            "none: 常规生成（默认），即使 ref_video 有输入也只作普通参考；\n"
+                            "pre_guide: 用 ref_video_0 的尾部锚定开头（视频续写）；\n"
+                            "post_guide: 用 ref_video_0 的头部锚定结尾（视频前推）；\n"
+                            "pre_post_guide: 用 ref_video_0 尾部锚定开头 + ref_video_1 头部锚定结尾（中间衔接）。\n"
+                            "锚定帧数由 context_frames 决定。"),
             ],
             outputs=[
                 io.Dict.Output(display_name="parameter"),
@@ -122,6 +132,7 @@ class H3ParameterNode(io.ComfyNode):
                 prompt_format="official", crop_mode="stretch", ref_sync_mode="segmented",
                 width=960, height=544, total_frames=362, fps=24, chunk_frames=90,
                 context_frames=22, lock_audio=True, audio_drive=False,
+                video_guide="none",
                 ) -> io.NodeOutput:
         parameter = {
             "long_prompt": long_prompt,
@@ -138,6 +149,7 @@ class H3ParameterNode(io.ComfyNode):
             "context_frames": context_frames,
             "lock_audio": lock_audio,
             "audio_drive": audio_drive,
+            "video_guide": video_guide,
         }
         return io.NodeOutput(parameter)
 
@@ -259,6 +271,7 @@ class H3AutoContextSampler(io.ComfyNode):
             unique_id = None
             
         p = parameter or {}
+        video_guide = p.get("video_guide", "none")
         long_prompt = p.get("long_prompt", "")
         clip_mode = p.get("clip_mode", "Clip_Tag")
         clip_tag = p.get("clip_tag", "段1")
@@ -389,6 +402,7 @@ class H3AutoContextSampler(io.ComfyNode):
             cache_dir=cache_dir,
             ignore_latent_hash=ignore_latent_hash,
             info=info,
+            video_guide=video_guide,
         )
         if seam_info:
             out_info.update(seam_info)

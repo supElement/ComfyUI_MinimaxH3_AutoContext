@@ -138,6 +138,7 @@ def load_segment_latent(cache_dir, seg_idx, current_metadata=None):
             "conditions_hash",
             "segment_fingerprint",      
             "upstream_global_hash",
+            "video_guide",
         ]
 
         mismatch = False

@@ -89,76 +89,68 @@ def build_conditioning_payload(seed, frame_count,
                                prev_segment=None, context_frames=22, fps=24,
                                ref_img_data=None, ref_vid_data=None, ref_aud_latents=None,
                                first_frame_pixel=None, last_frame_pixel=None,
-                               video_latent_frames_fn=None, audio_latent_frames_fn=None):
+                               video_latent_frames_fn=None, audio_latent_frames_fn=None,
+                               external_keyframes=None):
     """
     统一构建 H3 Conditioning 载荷。
-
-    返回 dict 包含:
-      - keyframes: list of {"resolved_frame_index": int, "latent": tensor}
-      - refs: list of ref block dicts
-      - ref_items_for_clip: list of {"type": ..., "data": ...} for Qwen3-VL (ref 通道)
-      - images_for_clip: list of [1, H, W, C] tensors for Qwen3-VL (keyframe 通道, 官方 images 参数)
-      - seed, frame_count
+    如果 external_keyframes 不为空，则直接使用它们作为 keyframes，
+    忽略 first_latent / last_latent / prev_segment。
     """
     keyframes = []
     refs = []
     ref_items_for_clip = []
     images_for_clip = []
 
+    if external_keyframes:
+        pass  
 
-    if first_latent is not None:
-        keyframes.append({"resolved_frame_index": 0, "latent": first_latent})
-        if first_frame_pixel is not None:
-            images_for_clip.append(first_frame_pixel[:1])
-        print(f"[H3-Auto] 首帧 keyframe: pixel_index=0")
+    if external_keyframes is None:
+        if first_latent is not None:
+            keyframes.append({"resolved_frame_index": 0, "latent": first_latent})
+            if first_frame_pixel is not None:
+                images_for_clip.append(first_frame_pixel[:1])
+            print(f"[H3-Auto] 首帧 keyframe: pixel_index=0")
 
-    if prev_segment is not None:
-        v_lat, a_lat = unpack_nested_latent(prev_segment)
-
-        if v_lat is not None:
-            n_latent = _latent_frames_for_pixel_frames(context_frames)
-            n_latent = min(n_latent, v_lat.shape[2])
-            n_latent = max(n_latent, 2)
-
-            while n_latent > 2:
-                max_pixel = _pixel_index_for_latent_frame(n_latent - 1)
-                if max_pixel < frame_count:
-                    break
-                n_latent -= 1
-
-            tail_latents = v_lat[:, :, -n_latent:, :, :]
-
-            kf_pixel_indices = []
-            for i in range(n_latent):
-                kf_latent = tail_latents[:, :, i:i + 1, :, :]
-                pixel_idx = _pixel_index_for_latent_frame(i)
-                keyframes.append({
-                    "resolved_frame_index": pixel_idx,
-                    "latent": kf_latent,
+        if prev_segment is not None:
+            v_lat, a_lat = unpack_nested_latent(prev_segment)
+            if v_lat is not None:
+                n_latent = _latent_frames_for_pixel_frames(context_frames)
+                n_latent = min(n_latent, v_lat.shape[2])
+                n_latent = max(n_latent, 2)
+                while n_latent > 2:
+                    max_pixel = _pixel_index_for_latent_frame(n_latent - 1)
+                    if max_pixel < frame_count:
+                        break
+                    n_latent -= 1
+                tail_latents = v_lat[:, :, -n_latent:, :, :]
+                for i in range(n_latent):
+                    kf_latent = tail_latents[:, :, i:i + 1, :, :]
+                    pixel_idx = _pixel_index_for_latent_frame(i)
+                    keyframes.append({
+                        "resolved_frame_index": pixel_idx,
+                        "latent": kf_latent,
+                    })
+            if a_lat is not None:
+                ctx_a = int(context_frames / fps * 40)
+                ctx_a = min(ctx_a, a_lat.shape[-1])
+                tail_a = a_lat[..., -ctx_a:]
+                refs.append({
+                    "kind": "audio",
+                    "audio_latent": tail_a,
+                    "ref_audio_t": tail_a.shape[-1],
                 })
-                kf_pixel_indices.append(pixel_idx)
 
-            # print(f"[H3-Auto] 段间续接: {n_latent} 个 latent 帧作为 keyframe "
-                  # f"(pixel indices: {kf_pixel_indices})")
-
-        if a_lat is not None:
-            ctx_a = int(context_frames / fps * 40)
-            ctx_a = min(ctx_a, a_lat.shape[-1])
-            tail_a = a_lat[..., -ctx_a:]
-            refs.append({
-                "kind": "audio",
-                "audio_latent": tail_a,
-                "ref_audio_t": tail_a.shape[-1],
+        if last_latent is not None:
+            keyframes.append({
+                "resolved_frame_index": frame_count - 1,
+                "latent": last_latent,
             })
-
-    if last_latent is not None:
-        keyframes.append({
-            "resolved_frame_index": frame_count - 1,
-            "latent": last_latent,
-        })
-        if last_frame_pixel is not None:
-            images_for_clip.append(last_frame_pixel[:1])
-        print(f"[H3-Auto] 尾帧 keyframe: pixel_index={frame_count - 1} (段帧数={frame_count})")
+            if last_frame_pixel is not None:
+                images_for_clip.append(last_frame_pixel[:1])
+            print(f"[H3-Auto] 尾帧 keyframe: pixel_index={frame_count - 1} (段帧数={frame_count})")
+    else:
+        keyframes = external_keyframes
+        print(f"[H3-Auto] 使用外部多帧强锚定: {len(keyframes)} 个 Keyframes")
 
     used_slots = len(refs)
     max_user_slots = max(0, MAX_REF_SLOTS - used_slots)
@@ -196,7 +188,6 @@ def build_conditioning_payload(seed, frame_count,
         if a_lat is not None:
             ref_entry["audio_latent"] = a_lat
         refs.append(ref_entry)
-
         pixel = vid["pixel"]
         fps_val = vid.get("fps", 24)
         sample_idx = list(range(0, pixel.shape[0], max(1, fps_val // 2)))
@@ -218,14 +209,6 @@ def build_conditioning_payload(seed, frame_count,
         })
         ref_items_for_clip.append({"type": "audio"})
         user_refs_added += 1
-
-    # print(f"[H3-Auto] Conditioning: keyframes={len(keyframes)} refs={len(refs)} "
-          # f"images_for_clip={len(images_for_clip)} ref_items={len(ref_items_for_clip)}")
-    for i, r in enumerate(refs):
-        shapes = {k: tuple(v.shape) for k, v in r.items()
-                  if hasattr(v, "shape")}
-        meta = {k: v for k, v in r.items() if not hasattr(v, "shape") and k != "kind"}
-        # print(f"[H3-Auto]   ref[{i}] kind={r['kind']} shapes={shapes} meta={meta}")
 
     return {
         "seed": int(seed),

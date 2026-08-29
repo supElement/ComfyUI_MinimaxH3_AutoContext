@@ -18,6 +18,7 @@ import torch
 from . import latent_cache
 import threading
 import hashlib
+import cv2
 
 try:
     import torchaudio
@@ -209,8 +210,11 @@ def _filter_refs_official(window_prompt, ref_img_data, ref_vid_data, ref_aud_lat
             print(f"[H3-Auto] 警告: <Subject {s}> 未在 subject_definitions 中定义, "
                   f"无法确定对应参考图")
 
+    # if not referenced_pics:
+        # return ref_img_data, ref_vid_data, ref_aud_latents, window_prompt
+        
     if not referenced_pics:
-        return ref_img_data, ref_vid_data, ref_aud_latents, window_prompt
+        return [], ref_vid_data, ref_aud_latents, window_prompt
 
     missing = sorted(i for i in referenced_pics if i >= len(all_imgs))
     if missing:
@@ -257,8 +261,11 @@ def _filter_pictures_simple(prompt, ref_img_data, fmt):
     """
     all_imgs = ref_img_data or []
     mentions = [m for m in _parse_ref_mentions(prompt) if m[0] == "picture"]
+    # if not mentions:
+        # return all_imgs, prompt
+    
     if not mentions:
-        return all_imgs, prompt
+        return [], prompt
 
     referenced = set()
     for _, num, *_ in mentions:
@@ -294,8 +301,11 @@ def _filter_video_audio(prompt, ref_vid_data, ref_aud_data, fmt):
     video_mentions = [m for m in mentions if m[0] == "video"]
     audio_mentions = [m for m in mentions if m[0] == "audio"]
 
+    # if not video_mentions and not audio_mentions:
+        # return videos, audios, prompt
+    
     if not video_mentions and not audio_mentions:
-        return videos, audios, prompt
+        return [], [], prompt
 
     audio_slots = []  
     for i, v in enumerate(videos):
@@ -380,6 +390,67 @@ def _filter_refs_for_prompt(window_prompt, ref_img_data, ref_vid_data, ref_aud_l
     return filtered_img, filtered_vid, filtered_aud, window_prompt
 
 
+def _load_video_clip(video_tensor, num_frames, from_end=False, target_w=None, target_h=None, crop_mode="stretch"):
+    """
+    从视频张量 [T, H, W, C] 中截取指定数量的帧，并缩放到目标尺寸。
+    如果 from_end=True，取尾部；否则取头部。
+    如果视频帧数不足，循环复制补齐（并给出警告）。
+    """
+    if video_tensor is None or video_tensor.shape[0] == 0:
+        return None
+    total = video_tensor.shape[0]
+    if total < num_frames:
+        print(f"[H3-Auto] 警告: 视频帧数 {total} < 需求 {num_frames}，将循环复制补齐（建议提供足够帧数）")
+        indices = list(range(total)) * (num_frames // total + 1)
+        video_tensor = video_tensor[indices[:num_frames]]
+    if from_end:
+        clip = video_tensor[-num_frames:]
+    else:
+        clip = video_tensor[:num_frames]
+    if target_w is not None and target_h is not None:
+        clip = _resize_image(clip, target_w, target_h, crop_mode)
+    return clip
+
+def _pixel_index_for_latent_frame(k):
+    """latent frame k 对应的第一个像素帧索引（与 h3_conditioning 保持一致）"""
+    FRAME_PER_TOKEN = (1, 4, 4, 4, 4)
+    return sum(FRAME_PER_TOKEN[i % 5] for i in range(k))
+
+def _build_keyframes_from_clip(vae, clip_tensor, device, base_frame_index):
+    """
+    将截取的视频片段编码为 H3 Keyframes 列表。
+    clip_tensor: [T, H, W, C], base_frame_index: 该片段在时间轴上的起始像素帧索引。
+    """
+    if clip_tensor is None:
+        return []
+    lat = _encode_video_latent(vae, clip_tensor, device)
+    if lat is None:
+        return []
+    t_lat = lat.shape[2]
+    keyframes = []
+    for i in range(t_lat):
+        pixel_idx = base_frame_index + _pixel_index_for_latent_frame(i)
+        kf_latent = lat[:, :, i:i+1, :, :]
+        keyframes.append({
+            "resolved_frame_index": int(pixel_idx),
+            "latent": kf_latent,
+        })
+    return keyframes
+
+def _build_keyframes_from_latent(latent, base_frame_index):
+    if latent is None:
+        return []
+    t_lat = latent.shape[2]
+    keyframes = []
+    for i in range(t_lat):
+        pixel_idx = base_frame_index + _pixel_index_for_latent_frame(i)
+        kf_latent = latent[:, :, i:i+1, :, :]
+        keyframes.append({
+            "resolved_frame_index": int(pixel_idx),
+            "latent": kf_latent,
+        })
+    return keyframes
+
 def run_auto_context_generation(model, vae, audio_vae, clip,
                                 first_frame, last_frame,
                                 ref_images, ref_videos, ref_audios,
@@ -398,11 +469,75 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
                                 enable_cache=True,
                                 ignore_latent_hash=False,
                                 unique_id=None,
-                                info=None):
+                                info=None,
+                                video_guide="none" ):
     h3_patches.apply_patches()
 
     device = comfy.model_management.get_torch_device()
     total_seconds_for_prompt = total_frames / fps
+    pre_guide_full_latent = None
+    post_guide_full_latent = None
+    ctx_frames = context_frames
+
+
+    # ============================================================
+    # 第一阶段：处理视频引导（编码完整视频并裁剪参考，不生成 Keyframes）
+    # ============================================================
+    external_keyframes = []  # 稍后在第二阶段填充
+    guide_indices = set()
+    extra_ref_audios = []
+
+    if video_guide != "none" and ref_videos:
+        total_frames = h3_utils.snap_to_grid_up(total_frames)
+        ctx_frames = h3_utils.snap_to_grid_up(context_frames)
+
+        def process_guide(vid_entry, from_end, base_frame_index, vid_idx, is_pre=True):
+            nonlocal pre_guide_full_latent, post_guide_full_latent, extra_ref_audios
+            clip = _load_video_clip(vid_entry["video"], ctx_frames, from_end,
+                                    target_w=width, target_h=height, crop_mode=crop_mode)
+            if clip is None:
+                return False
+
+            full_lat = _encode_video_latent(vae, clip, device)
+            if full_lat is not None:
+                if is_pre:
+                    pre_guide_full_latent = full_lat
+                else:
+                    post_guide_full_latent = full_lat
+            else:
+                return False
+
+            # 处理音频：提取后置空，防止重复编码
+            if vid_entry.get("audio") is not None:
+                vid_entry["audio"] = None
+
+            # 裁剪参考视频（方案B）
+            vid_entry["video"] = clip
+            return True
+
+        # 1. 前段引导（锚定开头）
+        if video_guide in ["pre_guide", "pre_post_guide"]:
+            if len(ref_videos) >= 1:
+                if process_guide(ref_videos[0], from_end=True, base_frame_index=0, vid_idx=0, is_pre=True):
+                    guide_indices.add(0)
+                    print(f"[H3-Auto] 前段锚定: 取video 1尾部 {ctx_frames} 帧")
+            else:
+                print(f"[H3-Auto] 警告: pre_guide/pre_post_guide 需要至少1个参考视频，当前为0，已忽略前段引导")
+
+        # 2. 后段引导（锚定结尾）
+        if video_guide in ["post_guide", "pre_post_guide"]:
+            vid_idx = 1 if video_guide == "pre_post_guide" else 0
+            if len(ref_videos) > vid_idx:
+                # 注意：这里不计算 start_idx，只处理视频，稍后在第二阶段生成 Keyframes
+                if process_guide(ref_videos[vid_idx], from_end=False, base_frame_index=0, vid_idx=vid_idx, is_pre=False):
+                    guide_indices.add(vid_idx)
+                    print(f"[H3-Auto] 后段锚定: 取video {vid_idx+1}头部 {ctx_frames} 帧")
+            else:
+                print(f"[H3-Auto] 警告: post_guide/pre_post_guide 需要索引{vid_idx+1}的视频，当前只有 {len(ref_videos)} 个，已忽略后段引导")
+
+    else:
+        pass
+
 
     # ==================== VAE 编码首尾帧等（不变） ====================
     is_second_pass = latent_input is not None
@@ -458,6 +593,9 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
             print(f"[H3-Auto] 正在 VAE 编码独立参考音频 ({len(ref_audios)} 个)...")
     ref_aud_data = _prepare_ref_audios(ref_audios, audio_vae, device,
                                        pre_encode=(ref_sync_mode != "segmented"))
+    if extra_ref_audios:
+        ref_aud_data.extend(extra_ref_audios)
+        print(f"[H3-Auto] 已将 {len(extra_ref_audios)} 段引导视频的音频合并到参考音频中")
 
     drive_waveform = None
     drive_sr = AUDIO_SAMPLE_RATE
@@ -591,6 +729,13 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
             is_second_pass = False
             first_pass_segments = None
 
+    # ============================================================
+    # 第二阶段：根据最终确定的 total_frames 生成外部 Keyframes
+    # ============================================================
+    external_keyframes = []  # 始终为空
+    if video_guide != "none" and (pre_guide_full_latent is not None or post_guide_full_latent is not None):
+        print("[H3-Auto] 使用填充 Latent 进行头尾锚定，不额外生成 Keyframes")
+
     # ==================== 采样循环 ====================
     all_segments = []
     all_x0 = []
@@ -654,6 +799,20 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
             last_frame if is_last_chunk else None
         )
     
+        # ----- 新增：筛选属于当前段的外部 Keyframes -----
+        seg_external_kfs = None
+        if external_keyframes:
+            seg_kfs = []
+            for kf in external_keyframes:
+                abs_idx = kf["resolved_frame_index"]
+                if start_f <= abs_idx < end_f:
+                    kf_copy = kf.copy()
+                    kf_copy["resolved_frame_index"] = int(abs_idx - start_f)
+                    seg_kfs.append(kf_copy)
+            if seg_kfs:
+                seg_external_kfs = seg_kfs
+                print(f"[H3-Auto] 段 {idx+1}/{len(chunks)} 注入 {len(seg_kfs)} 个外部 Keyframes (相对索引: {[k['resolved_frame_index'] for k in seg_kfs]})")
+
         # ==================== 构建 conditioning payload ====================
         payload = h3_conditioning.build_conditioning_payload(
             seed=seed + idx, frame_count=seg_frames,
@@ -666,6 +825,7 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
             ref_aud_latents=[a.get("latent") for a in seg_ref_aud if a.get("latent") is not None],
             first_frame_pixel=first_frame if is_first_chunk else None,
             last_frame_pixel=last_frame if is_last_chunk else None,
+            external_keyframes=seg_external_kfs,
         )
     
         positive = h3_conditioning.encode_text_with_references(
@@ -697,14 +857,37 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
                     seg_latent_dict, overlap_video_tokens=ov_t,
                     lock_audio=lock_audio, overlap_video_denoise=video_context_denoise)
         else:
-            overlap_video = None
-            if not is_first_chunk and idx > 0:
-                overlap_video, _prev_a = h3_conditioning.unpack_nested_latent(
-                    all_segments[idx - 1])
+            head_overlap_video = None
+            head_overlap_frames = 0
+            head_denoise = 0.0
+            tail_overlap_video = None
+            tail_overlap_frames = 0
+            tail_denoise = 0.0
+
+            if is_first_chunk and pre_guide_full_latent is not None:
+                head_overlap_video = pre_guide_full_latent
+                head_overlap_frames = ctx_frames
+                head_denoise = video_context_denoise
+            elif not is_first_chunk and idx > 0:
+                # 段间续接：从上一段尾部取
+                head_overlap_video, _prev_a = h3_conditioning.unpack_nested_latent(all_segments[idx - 1])
+                head_overlap_frames = context_frames
+                head_denoise = video_context_denoise
+
+            if is_last_chunk and post_guide_full_latent is not None:
+                tail_overlap_video = post_guide_full_latent
+                tail_overlap_frames = ctx_frames
+                tail_denoise = video_context_denoise
+
             seg_latent_dict = _make_h3_empty_latent(
-                latent_w, latent_h, seg_frames, fps, drive_audio_latent=drive_aud_latent,
-                overlap_video=overlap_video, overlap_video_denoise=video_context_denoise,
-                overlap_frames=context_frames)
+                latent_w, latent_h, seg_frames, fps,
+                drive_audio_latent=drive_aud_latent,
+                head_overlap_video=head_overlap_video,
+                head_overlap_frames=head_overlap_frames,
+                head_denoise=head_denoise,
+                tail_overlap_video=tail_overlap_video,
+                tail_overlap_frames=tail_overlap_frames,
+                tail_denoise=tail_denoise)
     
         # ==================== 缓存逻辑 ====================
         window_prompt_hash = hashlib.md5(window_prompt.encode('utf-8')).hexdigest()
@@ -739,6 +922,7 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
             "audio_drive": audio_drive,
             "window_prompt_hash": window_prompt_hash,
             "conditions_hash": conditions_hash,
+            "video_guide": video_guide,
         }
     
         if info is not None and "segment_fingerprints" in info and idx < len(info["segment_fingerprints"]):
@@ -781,7 +965,44 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
         if enable_cache and cache_dir and not force_regenerate:
             cached_samples, cached_x0 = latent_cache.load_segment_latent(
                 cache_dir, idx, current_meta)
-    
+        
+        # # ===== 调试打印：紧贴推理之前 =====
+        # print(f"[H3-Auto] 段 {idx+1} 最终输入状态:")
+        # print(f"  - video_guide: {video_guide}")
+        # print(f"  - pre_guide_full_latent is None? {pre_guide_full_latent is None}")
+        # print(f"  - post_guide_full_latent is None? {post_guide_full_latent is None}")
+        # print(f"  - 过滤后参考视频数量: {len(seg_ref_vid)}")
+        # print(f"  - 外部 Keyframes: {len(seg_external_kfs) if seg_external_kfs else 0}")
+
+        # print(f"[H3-Auto]  拼接锚定详情:")
+        # if head_overlap_video is not None:
+            # # 计算实际复制的 token 数（与 _make_h3_empty_latent 一致）
+            # head_tokens = video_latent_frames(head_overlap_frames) if head_overlap_frames > 5 else 2
+            # head_tokens = max(2, min(head_tokens, video_latent_frames(seg_frames) - 2))
+            # src_total_tokens = head_overlap_video.shape[2]  # 仅用于显示源总长度
+            # if is_first_chunk and pre_guide_full_latent is not None:
+                # src_type = "pre_guide 外部视频 (开头锚定)"
+            # else:
+                # src_type = "上一段生成结果 (接缝锚定)"
+            # print(f"    - 头部锚定: 来自 {src_type}")
+            # print(f"      源张量总 Token: {src_total_tokens}（仅参考）")
+            # print(f"      实际复制: head_tokens末尾 {head_tokens} 个 Token（对应 {head_overlap_frames} 像素帧 0~{head_overlap_frames-1}）")
+            # print(f"      写入本段开头: 像素帧 0~{head_overlap_frames-1}")
+        # else:
+            # print(f"    - 头部锚定: 无")
+
+        # if tail_overlap_video is not None:
+            # tail_tokens = video_latent_frames(tail_overlap_frames) if tail_overlap_frames > 5 else 2
+            # tail_tokens = max(2, min(tail_tokens, video_latent_frames(seg_frames) - 2))
+            # src_total_tokens = tail_overlap_video.shape[2]
+            # print(f"    - 尾部锚定: 来自 post_guide 外部视频 (结尾锚定)")
+            # print(f"      源张量总 Token: {src_total_tokens}（仅参考）")
+            # print(f"      实际复制: 开头 {tail_tokens} 个 Token（对应 {tail_overlap_frames} 像素帧）")
+            # print(f"      写入本段末尾: 像素帧 {seg_frames - tail_overlap_frames}~{seg_frames-1}")
+        # else:
+            # print(f"    - 尾部锚定: 无")
+        # # ================================   
+        
         if cached_samples is not None:
             segment_latent = cached_samples
             x0 = cached_x0
@@ -1217,16 +1438,12 @@ def _decode_segment(vae, audio_vae, seg_latent, device):
 
 def _make_h3_empty_latent(latent_w, latent_h, pixel_frames, fps,
                           drive_audio_latent=None,
-                          overlap_video=None, overlap_video_denoise=0.0,
-                          overlap_frames=0):
-    """构建 H3 空 latent (NestedTensor: video + audio)。
-
-    - drive_audio_latent 非空时：把音频半区替换为源音频 latent，并设 noise_mask
-      (视频=1 正常去噪，音频=0 锁定不生成)，实现"音频驱动视频"。
-    - overlap_video 非空时：把上一段视频尾部逐 token 复制到段首 overlap 头，
-      并用 noise_mask 冻结 (mask=overlap_video_denoise，0=精确保留、不去噪)。
-      overlap 头长度与 _merge_segment_latents 的裁剪账目严格同源。
-      冻结上一段真实结尾而非"重演"，消除接缝停顿/位置错位 (LongMedia frozen-overlap 同款)。
+                          head_overlap_video=None, head_overlap_frames=0, head_denoise=0.0,
+                          tail_overlap_video=None, tail_overlap_frames=0, tail_denoise=0.0):
+    """
+    构建 H3 空 latent，支持头部和尾部填充。
+    - head_overlap: 填充在开头（来自上一段尾部或前导视频）
+    - tail_overlap: 填充在结尾（来自后段视频）
     """
     v_t = video_latent_frames(pixel_frames)
     a_t = audio_latent_frames(pixel_frames, fps)
@@ -1244,14 +1461,28 @@ def _make_h3_empty_latent(latent_w, latent_h, pixel_frames, fps,
             audio_latent = fitted
             locked = True
 
-    ov_t = 0
-    if overlap_video is not None and overlap_frames > 0:
-        ctx_v_tokens = video_latent_frames(overlap_frames) if overlap_frames > 5 else 2
+    # ----- 头部填充 -----
+    head_tokens = 0
+    if head_overlap_video is not None and head_overlap_frames > 0:
+        ctx_v_tokens = video_latent_frames(head_overlap_frames) if head_overlap_frames > 5 else 2
         ctx_v_tokens = max(2, ctx_v_tokens)
-        ov_t = min(ctx_v_tokens, v_t - 2)
-        ov_t = max(0, ov_t)
-        if ov_t > 0:
-            video_latent[:, :, :ov_t] = overlap_video[:, :, -ov_t:].to(
+        head_tokens = min(ctx_v_tokens, v_t - 2)
+        head_tokens = max(0, head_tokens)
+        if head_tokens > 0:
+            print(f"[H3-Auto] 头部填充: 写入 {head_tokens} 个 Token (对应 {head_overlap_frames} 帧)")
+            video_latent[:, :, :head_tokens] = head_overlap_video[:, :, -head_tokens:].to(
+                device=video_latent.device, dtype=video_latent.dtype)
+
+    # ----- 尾部填充 -----
+    tail_tokens = 0
+    if tail_overlap_video is not None and tail_overlap_frames > 0:
+        ctx_v_tokens = video_latent_frames(tail_overlap_frames) if tail_overlap_frames > 5 else 2
+        ctx_v_tokens = max(2, ctx_v_tokens)
+        tail_tokens = min(ctx_v_tokens, v_t - 2)
+        tail_tokens = max(0, tail_tokens)
+        if tail_tokens > 0:
+            print(f"[H3-Auto] 尾部填充: 写入 {tail_tokens} 个 Token (对应 {tail_overlap_frames} 帧)")
+            video_latent[:, :, -tail_tokens:] = tail_overlap_video[:, :, :tail_tokens].to(
                 device=video_latent.device, dtype=video_latent.dtype)
 
     try:
@@ -1260,17 +1491,21 @@ def _make_h3_empty_latent(latent_w, latent_h, pixel_frames, fps,
         combined = (video_latent, audio_latent)
 
     result = {"samples": combined}
-    if locked or ov_t > 0:
+
+    # ----- 构建 noise_mask -----
+    if locked or head_tokens > 0 or tail_tokens > 0:
         video_mask = torch.ones_like(video_latent)
         audio_mask = torch.zeros_like(audio_latent) if locked else torch.ones_like(audio_latent)
-        if ov_t > 0:
-            video_mask[:, :, :ov_t] = float(overlap_video_denoise)
+        if head_tokens > 0:
+            video_mask[:, :, :head_tokens] = float(head_denoise)
+        if tail_tokens > 0:
+            video_mask[:, :, -tail_tokens:] = float(tail_denoise)
         try:
             result["noise_mask"] = comfy.nested_tensor.NestedTensor((video_mask, audio_mask))
         except Exception:
             result["noise_mask"] = (video_mask, audio_mask)
-    return result
 
+    return result
 
 def _sample_segment(model, positive, latent_dict, steps, cfg, sampler_name, scheduler, seed,
                     denoise=1.0, sigmas=None, sampler_obj=None):
