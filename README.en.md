@@ -7,7 +7,7 @@
 
 # ComfyUI_MinimaxH3_AutoContext
 
-One-click MiniMax H3 long-video automation node: features segmented inference, seamless inter-segment anchoring, timeline-based prompt slicing, secondary sampling, and seam correction. To handle VRAM limitations, the process splits long videos into independent inference segments, achieving seamless transitions via overlap-based enhancement while automatically slicing prompts along the timeline to align generated content with the prompt rhythm; audio-visual references undergo corresponding slicing and alignment, ensuring only the relevant reference for the current segment is used during inference. Supports secondary sampling, video extension, video prepending, and dual-video merging. Includes latent cache management to enable quick resumption after interruptions; cache files are stored per segment, allowing the system to load existing latent cache files provided the upstream sampling parameters remain unchanged.
+A one-click automated generation node for long videos using MiniMax H3, featuring: segmented inference, seamless inter-segment anchoring, timeline-based prompt slicing, secondary sampling, and seam correction. To handle VRAM limitations, the process splits long videos into independent inference segments and achieves seamless transitions via overlap-based enhancement. Prompts are automatically sliced ​​along the timeline to align generated content with the prompt's rhythm; audio-visual references undergo corresponding slicing and alignment, ensuring only the relevant reference for the current segment is used during inference. Secondary sampling is supported, as are video extension (continuation), video prepending, and dual-video merging. The system supports latent cache management, allowing for quick resumption after interruptions by skipping already-processed segments; cache files are stored segment-by-segment, enabling the reuse of existing latent cache files provided the upstream sampling parameters remain unchanged.
 
 Note: Changing models—or acceleration nodes like LoRA or SageAttention—will not be detected by the latent check mechanism; therefore, the latent cache must be deleted. Two methods exist to delete the latent cache:
 - Enable the `clear_cache` parameter on the `Minimax_H3_AutoContext_Sampler` node; this forces the node to regenerate its cache file when sampling begins.
@@ -20,6 +20,10 @@ Note: Changing models—or acceleration nodes like LoRA or SageAttention—will 
 <img width="2209" height="1030" alt="image" src="https://github.com/user-attachments/assets/9bbdda2a-d4ce-4836-b108-e359e72e31de" />
 
 ## Bug fixes and optimizations
+
+V0.7.1
+
+- The `video_guide` parameter has been added to optimize video continuation, video extrapolation, and dual-video bridging (generating intermediate segments), with support for segmentation. Note: When this parameter is not set to `none`, the reference length at the corresponding reference port of the sampling node is forcibly truncated to the value specified by the `context_frames` parameter. The reference logic remains the same as for standard references (i.e., the reference is utilized only if declared in the prompt).
 
 V0.6.5
 
