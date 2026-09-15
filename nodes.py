@@ -92,7 +92,7 @@ class H3ParameterNode(io.ComfyNode):
                     tooltip=_REF_SYNC_MODE_TOOLTIP),
                 io.Int.Input("width", default=960, min=64, max=4096, step=32),
                 io.Int.Input("height", default=544, min=64, max=4096, step=32),
-                io.Int.Input("total_frames", default=362, min=5, max=2880, step=17,
+                io.Int.Input("total_frames", default=362, min=5, max=16376, step=17,
                     tooltip="生成总帧数，需满足 17n+5 (5,22,39,56,73,90,...)。提示词内时间仍按秒解析。"
                             "在 Clip_Tag 和 timeline 模式下，该值被忽略，由提示词内容自动计算。"),
                 io.Int.Input("fps", default=24, min=8, max=60, step=1,
