@@ -24,7 +24,7 @@
 
 V0.7.2
 
-- 修复当 H3Parameter 参数节点的输入端点（total_frames / chunk_frames / context_frames）连接类似 Math Expression 节点后，预计分段的请求会陷入死循环，ComfyUI 网页卡死的bug。
+- 修复当 H3Parameter 参数节点的输入端点（total_frames / chunk_frames / context_frames）连接类似 Math Expression 节点后，预计分段的请求会陷入死循环，ComfyUI 网页卡死的 bug。
 
 V0.7.1
 
