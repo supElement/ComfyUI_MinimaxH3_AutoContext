@@ -147,7 +147,7 @@ git clone https://github.com/supElement/ComfyUI_MinimaxH3_AutoContext.git
 | crop_mode | `stretch` | 参考图/首尾帧/参考视频缩放裁剪：`center` / `stretch` / `none` |
 | ref_sync_mode | `segmented` | 参考视频/音频是否按段切片：`global`（每段使用完整素材） / `segmented`（按段的时间比例切片） |
 | width × height | 960×544 | 一采分辨率（二采时被 latent_input 覆盖） |
-| total_frames | 362 | 生成总帧数（17n+5）；在 `Clip_Tag`/`timeline` 模式下仅作为兜底（无标签/无时间标记时），最终被各段之和覆盖 |
+| total_frames | 362 | 生成总帧数（17n+5）；在 `Clip_Tag`/`timeline`  模式下仅作为兜底（无标签/无时间标记时），最终被各段之和覆盖 |
 | fps | 24 | 帧率，用于音频同步和提示词秒数换算 |
 | chunk_frames | 90 | 每段生成帧数（17n+5），仅在 `sequential` / `global` 模式下生效 |
 | context_frames | 22 | 段间续接帧数（17n+5：5/22/39/56…），建议 22 以上 |
