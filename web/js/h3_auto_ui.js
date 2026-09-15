@@ -113,19 +113,23 @@ app.registerExtension({
             const totalR = resolveInputValue(this, "total_frames");
             const chunkR = resolveInputValue(this, "chunk_frames");
             const ctxR = resolveInputValue(this, "context_frames");
-
-            if ((totalR.connected && totalR.value === undefined) ||
-                (chunkR.connected && chunkR.value === undefined) ||
-                (ctxR.connected && ctxR.value === undefined)) {
+    
+            if ((totalR.connected && totalR.value === undefined) || (chunkR.connected && chunkR.value === undefined) || (ctxR.connected && ctxR.value === undefined)) {
                 if (this.infoWidget) this.infoWidget.value = "已连接上游(无法预测)，以运行日志为准";
                 return;
             }
-
-            const totalFrames = parseInt(totalR.value !== undefined ? totalR.value : 362);
-            const chunkFramesInput = parseInt(chunkR.value !== undefined ? chunkR.value : 90);
-            const ctxFrames = parseInt(ctxR.value !== undefined ? ctxR.value : 22);
-
+    
+            const totalFrames = parseInt(totalR.value !== undefined ? totalR.value : 362, 10);
+            const chunkFramesInput = parseInt(chunkR.value !== undefined ? chunkR.value : 90, 10);
+            const ctxFrames = parseInt(ctxR.value !== undefined ? ctxR.value : 22, 10);
+    
+            if (!Number.isFinite(totalFrames) || !Number.isFinite(chunkFramesInput) || !Number.isFinite(ctxFrames)) {
+                if (this.infoWidget) this.infoWidget.value = "已连接上游(无法预测)，以运行日志为准";
+                return;
+            }
+    
             let sizes, effContext = 0;
+
             if (chunkFramesInput <= 0) {
                 sizes = [snapToGridUp(Math.max(5, totalFrames))];
             } else {
@@ -173,6 +177,8 @@ app.registerExtension({
                 if (!origin || !origin.node || !origin.node.widgets) continue;
                 for (const w of origin.node.widgets) {
                     if (!w || seenWidgets.has(w)) continue;
+                    // 跳过文本编辑控件（如 Math Expression 的 expression）：
+                    if (w.type === "customtext" || w.type === "text" || w.type === "string") continue;
                     seenWidgets.add(w);
                     const origCb = w.callback;
                     w.callback = function (...args) {
@@ -190,22 +196,9 @@ app.registerExtension({
 // ---------------------------------------------------------------------------
 // Autogrow 动态端口对齐修复
 // ---------------------------------------------------------------------------
-// ComfyUI 自带 Autogrow 在“断开靠后组 + 同时连接靠前组”时（例如断开
-// ref_video_0 改连 ref_image_0），断开的收缩处理被 requestAnimationFrame 延迟，
-// 而靠前组会同步插入新端口使槽位下标整体后移，导致延迟回调按旧 slot 序号
-// 操作了错误的输入。结果：ref_video_0/ref_audio_0 残留指向已删除 link 的 .link，
-// 且多余尾端口（ref_video_1）不消失，排队时报
-// “No link found in parent graph for id [...] slot [...] ref_videos.ref_video_0”。
-// 这里在连接变化后按图里实际 link 状态重新对齐每个 autogrow 组：
-//   1) 清除指向已不存在 link 的脏 .link
-//   2) 把组内 link 向前补齐空洞（与官方收缩的 bubble 逻辑一致）
-//   3) 删除组尾多余的空端口
-// 该过程幂等，可安全重复执行。
 
 function scheduleAutogrowReconcile(node) {
     if (!node || app.configuringGraph) return;
-    // 官方收缩回调用一层 requestAnimationFrame 延迟，且可能再链式触发一层；
-    // 用三层 rAF 确保跑在官方回调之后，看到的是最终稳定状态。
     requestAnimationFrame(() => {
         requestAnimationFrame(() => {
             requestAnimationFrame(() => autogrowReconcile(node));
@@ -233,7 +226,6 @@ function autogrowReconcile(node) {
         const min = typeof cfg.min === "number" ? cfg.min : 1;
         const stride = (cfg.inputSpecs && cfg.inputSpecs.length) || 1;
 
-        // 按数组顺序收集本组输入槽下标
         const indices = [];
         for (let i = 0; i < node.inputs.length; i++) {
             const name = node.inputs[i] && node.inputs[i].name;
@@ -243,7 +235,6 @@ function autogrowReconcile(node) {
         }
         if (indices.length === 0) continue;
 
-        // 1) 清除脏 link（link id 已不在图中）
         for (const idx of indices) {
             const inp = node.inputs[idx];
             if (inp.link != null && !resolveLink(inp.link)) {
@@ -252,7 +243,6 @@ function autogrowReconcile(node) {
             }
         }
 
-        // 2) 向前补齐空洞：每个 column 内把非空 link 压缩到前面
         for (let c = 0; c < stride; c++) {
             const colIdx = [];
             for (let p = c; p < indices.length; p += stride) colIdx.push(indices[p]);
@@ -275,7 +265,6 @@ function autogrowReconcile(node) {
             }
         }
 
-        // 3) 删除组尾多余的空端口
         let highest = -1;
         for (let p = 0; p < indices.length; p++) {
             if (node.inputs[indices[p]].link != null) {
@@ -332,24 +321,25 @@ function traceOrigin(graph, linkId, visited) {
 function readOriginValue(node, slot) {
     if (!node || !node.widgets || !node.widgets.length) return undefined;
     const hasValue = (v) => typeof v !== "undefined" && v !== null && v !== "";
-    // 1) primitive 节点 (ComfyUI 自带 Int/Float/String/Boolean 等，type === "PrimitiveNode")：
-    //    首个 widget 即固定值（mode=fixed 时即输出值），后续 widget 是 control_after_generate 模式控件。
     if (node.type === "PrimitiveNode") {
         const w = node.widgets[0];
         return (w && hasValue(w.value)) ? w.value : undefined;
     }
-    // 2) 名为 "value" 的 widget（kjnode INTConstant、io.Int 等常量节点的统一值控件）
+
     const valueWidget = node.widgets.find(w => w && w.name === "value" && hasValue(w.value));
     if (valueWidget) return valueWidget.value;
-    // 3) 仅当存在唯一一个有值的 widget 时，才认为它是常量输出值，
-    //    避免把计算节点的输入 widget 误当成输出。
-    const valued = node.widgets.filter(w => w && hasValue(w.value));
-    if (valued.length === 1) return valued[0].value;
+    const isTextWidget = (w) => w && (w.type === "customtext" || w.type === "text" || w.type === "string");
+    const valued = node.widgets.filter(w => w && hasValue(w.value) && !isTextWidget(w));
+    if (valued.length === 1) {
+        const v = valued[0].value;
+        if (typeof v === "number" && Number.isFinite(v)) return v;
+        if (typeof v === "string" && v.trim() !== "" && Number.isFinite(Number(v))) return Number(v);
+        return undefined;
+    }
     return undefined;
 }
 
-// 读取一个参数的实际值：未连接 -> 本地 widget；已连接 -> 追溯上游。
-// 返回 { connected, value }，connected 且 value === undefined 表示连了上游但无法解析。
+
 function resolveInputValue(node, name) {
     if (!node || !node.inputs) return { connected: false, value: undefined };
     const slotIdx = node.inputs.findIndex(i => i.name === name);
@@ -387,6 +377,10 @@ function snapToGridNearest(n) {
 }
 
 function computeChunksJS(totalFrames, chunkFrames, contextFrames) {
+    if (!Number.isFinite(totalFrames)) totalFrames = 0;
+    if (!Number.isFinite(chunkFrames)) chunkFrames = 0;
+    if (!Number.isFinite(contextFrames)) contextFrames = 0;
+
     let chunk = snapToGridNearest(chunkFrames);
     if (chunk < 5) chunk = 5;
     let context = Math.max(0, Math.min(contextFrames, chunk - 5));
@@ -397,7 +391,6 @@ function computeChunksJS(totalFrames, chunkFrames, contextFrames) {
     }
 
     const maxLast = Math.floor(chunk * 1.3);
-
     let n = Math.ceil(totalFrames / chunk);
     while (n > 1) {
         const cov = (n - 2) * chunk + maxLast - (n - 2) * context;
@@ -407,13 +400,15 @@ function computeChunksJS(totalFrames, chunkFrames, contextFrames) {
             break;
         }
     }
-
     let last;
     while (true) {
         const covered = n >= 2 ? (n - 1) * chunk - (n - 2) * context : 0;
         const needLast = totalFrames - covered + (n >= 2 ? context : 0);
         last = snapToGridUp(Math.max(5, needLast));
         if (last <= maxLast) break;
+        // NaN/Infinity 保险：NaN 参与比较恒为 false 会导致此循环永不退出卡死页面；
+        // 有限数字下 needLast 每轮至少减 5 (chunk-context>=5)，必然收敛，无需帧数上限
+        if (!Number.isFinite(n) || !Number.isFinite(last)) break;
         n += 1;
     }
 
