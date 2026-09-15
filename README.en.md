@@ -21,6 +21,9 @@ Note: Changing models—or acceleration nodes like LoRA or SageAttention—will 
 
 ## Bug fixes and optimizations
 
+V0.7.2
+- Fixed a bug where connecting the input endpoints of an H3Parameter node (total_frames / chunk_frames / context_frames) to nodes like "Math Expression" caused the request for segmented processing to enter an infinite loop, freezing the ComfyUI web interface.
+
 V0.7.1
 
 - The `video_guide` parameter has been added to optimize video continuation, video extrapolation, and dual-video bridging (generating intermediate segments), with support for segmentation. Note: When this parameter is not set to `none`, the reference length at the corresponding reference port of the sampling node is forcibly truncated to the value specified by the `context_frames` parameter. The reference logic remains the same as for standard references (i.e., the reference is utilized only if declared in the prompt).
