@@ -4,28 +4,29 @@ on:
   push:
     branches: ['main']
     paths:
-      - 'README.md' # 只在 README.md 变化时触发，避免死循环
+      - 'README.md'
 
 jobs:
   translate:
     runs-on: ubuntu-latest
     permissions:
-      contents: write # 确保有写入权限
+      contents: write
     steps:
       - uses: actions/checkout@v4
         with:
-          token: ${{ secrets.GITHUB_TOKEN }} # 使用你的 token（按要求保留）
+          token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
 
       - name: Translate with Zhipu (Free Forever)
         env:
           ZHIPU_KEY: ${{ secrets.ZHIPU_API_KEY }}
-          PYTHONIOENCODING: utf-8 # 中文日志防乱码
+          PYTHONIOENCODING: utf-8
         run: |
           python << 'PYEOF'
           import requests, os, re
 
           FENCE = '`' * 3
+          CJK_RE = re.compile(r'[\u4e00-\u9fff]+')
 
           with open('README.md', 'r', encoding='utf-8') as f:
               src = f.read()
@@ -35,59 +36,70 @@ jobs:
               "【格式完整性（最高优先级）】\n"
               "1. 保持 Markdown 结构：标题层级、列表、表格竖线分隔、HTML 标签、代码块原样保留；链接的方括号和圆括号结构必须保留。\n"
               "2. 代码块内的注释可以翻译，但代码逻辑、变量名、路径保持不变。\n"
-              "3. 输出的开头和结尾都不得出现三连反引号代码围栏，不得有任何开场白或结束语，直接输出译文正文。\n\n"
+              "3. 输出的开头和结尾都不得出现三连反引号代码围栏，不得有任何开场白、结束语或译注，直接输出译文正文。\n\n"
               "【受保护标记】\n"
-              "4. 形如 %%L1%%、%%L2%% 的占位符是链接位置的受保护标记：必须原样留在原位置，禁止翻译、改写大小写、增删百分号、删除或移动。\n\n"
+              "4. 形如 %%L1%%、%%I1%% 的占位符是受保护标记：必须原样留在原位置，禁止翻译、改写大小写、增删百分号、删除或移动。\n\n"
               "【翻译完整性】\n"
-              "5. 逐句完整翻译，禁止跳过、缩译、省略。除代码块、行内代码、占位符外，译文中不得残留任何中文字符。\n\n"
+              "5. 逐句完整翻译，禁止跳过、缩译、省略。除代码块、行内代码、占位符外，译文中不得残留任何中文字符，也不要添加原文中没有的任何说明文字。\n\n"
               "【标点】\n"
               "6. 散文部分的中文全角标点（，。：；（）等）转为英文半角（, . : ; ( ) 等）。"
           )
 
-          # ---------- 链接抽取：允许 URL 含单层圆括号（如 Wikipedia 链接） ----------
+          LINE_SYSTEM = (
+              "你是翻译助手。将用户给出的每一行中文翻译为英文，输出行数必须与输入完全一致，一行对应一行。"
+              "保留行内的 Markdown 结构，%%L1%%、%%I1%% 形式的占位符必须原样不动。只输出译文，不要任何解释。"
+          )
+
           LINK_RE = re.compile(r'\]\(((?:[^()\n]|\([^()\n]*\))*)\)')
+          IMG_RE = re.compile(r'<img\b[^>]*>', re.I)
+          TAG_RE = re.compile(r'<!--.*?-->|<[^<>\n]+>', re.S)
 
           def mask_links(text):
               targets = []
               def _m(m):
                   targets.append(m.group(1))
-                  # 根因A修复: 用 f-string, 避免 %% 被 %-格式化折叠成单百分号
                   return f'](%%L{len(targets)}%%)'
               return LINK_RE.sub(_m, text), targets
 
-          def unmask_links(text, targets):
+          def mask_imgs(text):
+              imgs = []
               def _m(m):
+                  imgs.append(m.group(0))
+                  return f'%%I{len(imgs)}%%'
+              return IMG_RE.sub(_m, text), imgs
+
+          def unmask_all(text, targets, imgs):
+              def _l(m):
                   i = int(m.group(1))
                   return f'({targets[i - 1]})' if 1 <= i <= len(targets) else m.group(0)
-              return re.sub(r'\(%%[Ll](\d+)%%\)', _m, text)
+              text = re.sub(r'\(%%L(\d+)%%\)', _l, text)
+              def _i(m):
+                  i = int(m.group(1))
+                  return imgs[i - 1] if 1 <= i <= len(imgs) else m.group(0)
+              return re.sub(r'%%I(\d+)%%', _i, text)
 
           def normalize_tokens(text):
-              # 容忍模型把 %%L1%% 写成 %L1% / %%l1%% 等变体, 归一化为双百分号
-              # 根因A修复: f-string, 归一化结果才是真正的 %%L1%%
-              return re.sub(r'%{1,2}[Ll](\d+)%{1,2}', lambda m: f'%%L{m.group(1)}%%', text)
+              return re.sub(r'%{1,2}([LIli])(\d+)%{1,2}',
+                            lambda m: f'%%{m.group(1).upper()}{m.group(2)}%%', text)
 
-          # ---------- 根因B修复: 补上负向前瞻的收尾 ')'，并预编译 ----------
           BARE_RE = re.compile(r'\[([^\]\n]*)\](?!\s*\()')
 
           def repair_links(text, n_targets):
-              # 找出被丢掉的占位符编号；若正文中恰好存在同样数量的"裸[文本]"，
-              # 按顺序把占位符回填回去（机械修复）。对不上则放弃修复。
-              ids = set(re.findall(r'%%[Ll](\d+)%%', text))
+              ids = set(re.findall(r'%%L(\d+)%%', text))
               missing = [i for i in range(1, n_targets + 1) if str(i) not in ids]
               if not missing:
                   return text
               bare = list(BARE_RE.finditer(text))
               if len(bare) != len(missing):
-                  return None  # 无法机械修复，交给重试
+                  return None
               parts, last = [], 0
               for m, i in zip(bare, missing):
                   parts.append(text[last:m.end()])
-                  parts.append(f'(%%L{i}%%)')  # 根因A修复: f-string
+                  parts.append(f'(%%L{i}%%)')
                   last = m.end()
               parts.append(text[last:])
               return ''.join(parts)
 
-          # ---------- 代码围栏按行解析，正确处理嵌套/不同长度的围栏 ----------
           def fence_len(line):
               s = line.lstrip()
               return len(s) - len(s.lstrip('`')) if s.startswith(FENCE) else 0
@@ -101,54 +113,56 @@ jobs:
                           in_fence, open_len = True, n
                       elif n >= open_len and ln.strip().strip('`') == '':
                           in_fence, open_len = False, 0
-                      continue  # 围栏行本身不算正文
+                      continue
                   if not in_fence:
                       out.append(ln)
               t = '\n'.join(out)
               return re.sub(r'`[^`\n]*`', '', t)
 
-          # ---------- 校验 ----------
-          def validate_masked(text, n_targets):
-              ids = sorted(int(x) for x in re.findall(r'%%[Ll](\d+)%%', text))
+          def prose_text(text):
+              t = strip_code_and_inline(text)
+              return TAG_RE.sub(' ', t)
+
+          def validate_masked(text, n_targets, n_imgs):
+              ids = sorted(int(x) for x in re.findall(r'%%L(\d+)%%', text))
               if ids != list(range(1, n_targets + 1)):
                   return f"占位符不完整: 期望 {n_targets} 个, 实际 {len(ids)} 个"
-              # 新增加固: 占位符必须带圆括号包裹, 否则 unmask 还原不了
-              paren_ids = sorted(int(x) for x in re.findall(r'\(%%[Ll](\d+)%%\)', text))
+              paren_ids = sorted(int(x) for x in re.findall(r'\(%%L(\d+)%%\)', text))
               if paren_ids != list(range(1, n_targets + 1)):
                   return f"占位符缺少圆括号包裹: {paren_ids}"
-              t = strip_code_and_inline(text)
-              cjk = re.findall(r'[\u4e00-\u9fff]+', t)
+              iids = sorted(int(x) for x in re.findall(r'%%I(\d+)%%', text))
+              if iids != list(range(1, n_imgs + 1)):
+                  return f"图片占位符不完整: 期望 {n_imgs} 个, 实际 {len(iids)} 个"
+              cjk = CJK_RE.findall(prose_text(text))
               if cjk:
                   return "译文存在中文残留: " + ", ".join(cjk[:10])
               return None
 
           def validate_final(out):
-              a = LINK_RE.findall(src)
-              b = LINK_RE.findall(out)
+              a, b = LINK_RE.findall(src), LINK_RE.findall(out)
               if len(a) != len(b):
                   return f"整体链接数量不一致: 源 {len(a)} / 译 {len(b)}"
               bad = [(x, y) for x, y in zip(a, b) if x != y]
               if bad:
                   return "整体链接目标不一致: " + "; ".join(f"{x} -> {y}" for x, y in bad[:5])
-              t = LINK_RE.sub('](URL)', out)  # 先剥离链接目标, 避免 URL/锚点中的中文被误报
-              t = strip_code_and_inline(t)
-              cjk = re.findall(r'[\u4e00-\u9fff]+', t)
+              ia, ib = IMG_RE.findall(src), IMG_RE.findall(out)
+              if len(ia) != len(ib):
+                  return f"整体图片数量不一致: 源 {len(ia)} / 译 {len(ib)}"
+              t = LINK_RE.sub('](URL)', out)
+              cjk = CJK_RE.findall(prose_text(t))
               if cjk:
                   return "整体中文残留: " + ", ".join(cjk[:10])
               return None
 
-          # ---------- 分段（代码块内不切，围栏判定与上面一致） ----------
           def split_doc(text):
               MIN, HARD = 3000, 7000
               lines = text.split('\n')
               chunks, cur, in_fence, open_len, size = [], [], False, 0, 0
-
               def flush():
                   nonlocal cur, size
                   if cur:
                       chunks.append('\n'.join(cur))
                   cur, size = [], 0
-
               for ln in lines:
                   n = fence_len(ln)
                   if n > 0:
@@ -168,7 +182,7 @@ jobs:
               flush()
               return chunks
 
-          def call_translate(chunk, temperature):
+          def api_call(system, user, temperature):
               resp = requests.post(
                   "https://open.bigmodel.cn/api/paas/v4/chat/completions",
                   headers={"Authorization": f"Bearer {os.environ['ZHIPU_KEY']}"},
@@ -177,24 +191,80 @@ jobs:
                       "max_tokens": 16000,
                       "temperature": temperature,
                       "messages": [
-                          {"role": "system", "content": SYSTEM_PROMPT},
-                          {"role": "user", "content": "请将以下 Markdown 片段翻译为英文。片段中所有 %%L1%%、%%L2%% 形式的占位符必须原样保留在原位置。直接输出译文正文，不要任何解释。\n\n" + chunk}
+                          {"role": "system", "content": system},
+                          {"role": "user", "content": user}
                       ]
                   },
                   timeout=600
               )
               if resp.status_code != 200:
-                  print(f"HTTP错误: {resp.status_code}")
-                  print(f"响应内容: {resp.text}")
-                  exit(1)
-              resp = resp.json()
-              if "error" in resp:
-                  print(f"API错误: {resp['error']}")
-                  exit(1)
-              if "choices" not in resp or len(resp["choices"]) == 0:
-                  print(f"响应格式异常: {resp}")
-                  exit(1)
-              return resp['choices'][0]
+                  raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
+              data = resp.json()
+              if "error" in data:
+                  raise RuntimeError(f"API错误: {data['error']}")
+              if "choices" not in data or len(data["choices"]) == 0:
+                  raise RuntimeError(f"响应格式异常: {data}")
+              choice = data['choices'][0]
+              text = choice.get('message', {}).get('content', '')
+              if choice.get('finish_reason') != 'stop':
+                  raise RuntimeError(f"finish_reason={choice.get('finish_reason')}")
+              return text
+
+          def call_translate(chunk, temperature):
+              return api_call(
+                  SYSTEM_PROMPT,
+                  "请将以下 Markdown 片段翻译为英文。片段中所有 %%L1%%、%%I1%% 形式的占位符必须原样保留在原位置。"
+                  "直接输出译文正文，不要任何解释。\n\n" + chunk,
+                  temperature)
+
+          def cjk_surgery(text, chunk):
+              """中文残留的定向修复:
+              - 行内中文在源文档中不存在 => 模型自行添加的行 => 删除
+              - 行内中文能在源文档中找到 => 漏译的原文行 => 二次翻译"""
+              lines = text.split('\n')
+              in_fence, open_len = False, 0
+              bad = []
+              for idx, ln in enumerate(lines):
+                  n = fence_len(ln)
+                  if n > 0:
+                      if not in_fence:
+                          in_fence, open_len = True, n
+                      elif n >= open_len and ln.strip().strip('`') == '':
+                          in_fence, open_len = False, 0
+                      continue
+                  if in_fence:
+                      continue
+                  t = re.sub(r'`[^`\n]*`', '', ln)
+                  if CJK_RE.search(t):
+                      bad.append(idx)
+              if not bad:
+                  return text
+              to_fix, to_del = [], []
+              for i in bad:
+                  runs = CJK_RE.findall(lines[i])
+                  if any(r in chunk for r in runs):
+                      to_fix.append(i)
+                  else:
+                      to_del.append(i)
+              for i in to_del:
+                  print(f"  [CJK修复] 删除模型自行添加、源文档中不存在的行: {lines[i].strip()[:60]!r}")
+                  lines[i] = ''
+              if to_fix:
+                  payload = '\n'.join(lines[i] for i in to_fix)
+                  try:
+                      fixed_lines = api_call(
+                          LINE_SYSTEM,
+                          "请将以下各行逐行翻译为英文（输出行数必须与输入一致）:\n\n" + payload,
+                          0.1).strip().split('\n')
+                      if len(fixed_lines) == len(to_fix):
+                          for i, nl in zip(to_fix, fixed_lines):
+                              lines[i] = nl.strip()
+                          print(f"  [CJK修复] 已对 {len(to_fix)} 行漏译内容完成二次翻译")
+                      else:
+                          print(f"  [CJK修复] 二次翻译行数不匹配(出 {len(fixed_lines)}/入 {len(to_fix)})，保留原文")
+                  except Exception as e:
+                      print(f"  [CJK修复] 二次翻译失败: {e}，保留原文")
+              return '\n'.join(lines)
 
           def strip_fence(content):
               content = content.strip()
@@ -213,38 +283,40 @@ jobs:
 
           parts = []
           for i, chunk in enumerate(chunks, 1):
-              masked, targets = mask_links(chunk)
+              masked_l, targets = mask_links(chunk)
+              masked, imgs = mask_imgs(masked_l)
               done = None
-              # 温度递进：0.1 -> 0.3 -> 0.5，摆脱确定性复读
               for attempt, temp in ((1, 0.1), (2, 0.3), (3, 0.5)):
-                  choice = call_translate(masked, temp)
-                  text = choice.get('message', {}).get('content', '')
+                  try:
+                      text = call_translate(masked, temp)
+                  except Exception as e:
+                      print(f"[段{i}/第{attempt}次] 调用失败: {e}")
+                      continue
                   if not text or not text.strip():
                       print(f"[段{i}/第{attempt}次] 翻译结果为空")
-                      continue
-                  reason = choice.get('finish_reason')
-                  if reason != 'stop':
-                      print(f"[段{i}/第{attempt}次] 翻译被截断: finish_reason={reason}")
                       continue
                   text = normalize_tokens(strip_fence(text))
                   fixed = repair_links(text, len(targets))
                   if fixed is None:
-                      found = len(set(re.findall(r'%%[Ll](\d+)%%', text)))
+                      found = len(set(re.findall(r'%%L(\d+)%%', text)))
                       print(f"[段{i}/第{attempt}次] 占位符丢失且无法机械修复: 源 {len(targets)} 个 / 译出 {found} 个")
                       print(f"  译段开头: {text[:80].strip()!r}")
                       continue
-                  err = validate_masked(fixed, len(targets))
+                  err = validate_masked(fixed, len(targets), len(imgs))
+                  if err and '中文残留' in err:
+                      fixed = cjk_surgery(fixed, masked)
+                      err = validate_masked(fixed, len(targets), len(imgs))
                   if err:
                       print(f"[段{i}/第{attempt}次] 校验失败: {err}")
                       print(f"  译段开头: {fixed[:80].strip()!r}")
                       continue
-                  done = unmask_links(fixed, targets)
+                  done = unmask_all(fixed, targets, imgs)
                   break
               if done is None:
                   print(f"第 {i} 段三次尝试均未通过，已中止，不写入 README.en.md")
                   exit(1)
               parts.append(done)
-              print(f"[段{i}] 通过（含 {len(targets)} 条链接）")
+              print(f"[段{i}] 通过（含 {len(targets)} 条链接, {len(imgs)} 张图片）")
 
           content = '\n'.join(parts)
           err = validate_final(content)
