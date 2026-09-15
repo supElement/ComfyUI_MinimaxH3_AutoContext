@@ -22,6 +22,10 @@
 
 ## BUG修复及优化
 
+V0.7.2
+
+- 修复当 H3Parameter 参数节点的输入端点（total_frames / chunk_frames / context_frames）连接类似 Math Expression 节点后，预计分段请求陷入死循环，ComfyUI 网页卡死的bug。
+
 V0.7.1
 
 - 添加video_guide参数，用于优化视频续写、视频前推、双视频衔接（生成中间片段），支持分段。注意：非none时，采样节点的对应参考端口的参考会被强行剪切为context_frames参数中设置的数值。参考引用逻辑与普通参考相同（提示词中声明了，才会引用）。
