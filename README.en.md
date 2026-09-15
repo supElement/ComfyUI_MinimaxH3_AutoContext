@@ -1,44 +1,45 @@
 <div align="center">
 
-[![Chinese](https://img.shields.io/badge/Language-Chinese-red?style=for-the-badge)](./README.md)
+[![Chinese](https://img.shields.io/badge/语言-简体中文-red?style=for-the-badge)](./README.md)
 [![English](https://img.shields.io/badge/Language-English-blue?style=for-the-badge)](./README.en.md)
 
 </div>
 
 # ComfyUI_MinimaxH3_AutoContext
 
-A one-click automated generation node for long videos using MiniMax H3, featuring: segmented inference, seamless inter-segment anchoring, timeline-based prompt slicing, secondary sampling, and seam correction. To handle VRAM limitations, the process splits long videos into independent inference segments and achieves seamless transitions via overlap-based enhancement. Prompts are automatically sliced ​​along the timeline to align generated content with the prompt's rhythm; audio-visual references undergo corresponding slicing and alignment, ensuring only the relevant reference for the current segment is used during inference. Secondary sampling is supported, as are video extension (continuation), video prepending, and dual-video merging. The system supports latent cache management, allowing for quick resumption after interruptions by skipping already-processed segments; cache files are stored segment-by-segment, enabling the reuse of existing latent cache files provided the upstream sampling parameters remain unchanged.
+One-click MiniMax H3 long video automated generation node: **Segmented Reasoning + Inter-segment Anchor + Prompt Timeline Slicing + Secondary Sampling (2-Sample) + Seam Correction**.
+In limited GPU memory, split long videos into multiple independent reasoning segments, achieve seamless inter-segment connection through overlay enhancement methods, and automatically slice prompts along the timeline, aligning generated content with prompt rhythm; perform the same slicing and alignment on audio/video references; only the referenced references in the current segment participate in reasoning. Supports secondary sampling. Video continuation, video forward, dual video connection.
+Supports latent cache storage and retrieval, facilitating quick skipping of already reasoned segments if reasoning is interrupted for some reason, with cache files stored per segment. When upstream parameters of the sampling node remain unchanged, existing latent cache files can be read.
 
-Note: Changing models—or acceleration nodes like LoRA or SageAttention—will not be detected by the latent check mechanism; therefore, the latent cache must be deleted. Two methods exist to delete the latent cache:
-- Enable the `clear_cache` parameter on the `Minimax_H3_AutoContext_Sampler` node; this forces the node to regenerate its cache file when sampling begins.
-- Manually delete the corresponding folder in the cache directory (`\ComfyUI\output\cache`); the folder is named "node_" followed by the "Node ID".
-- `ignore_latent_hash`: Ignores hash verification for the `input_latent` port. Use case: Certain latent processing nodes (e.g., `Minimax H3 Latent Upscaler (3D)`) alter latent metadata, causing minor changes that render the latent cache unusable and waste inference time; setting this to `true` is recommended in such cases. I have only tested this with the `Minimax_H3-LatentUpscaler_Adv` node from my other repository (`github.com/supElement/ComfyUI_Element_easy`); other similar nodes have not been tested. When using latent processing nodes that do not alter latent noise characteristics, the `ignore_latent_hash` parameter can be set to `false`.
+Note: Changing the model, including lora, sageattention, and other acceleration nodes, will not detect latent changes, so latent cache must be deleted. Two methods to delete latent cache:
+- Enable the `clear_cache` parameter on the `Minimax_H3_AutoContext_Sampler` node, which forces the re-establishment of this node's cache file at the start of sampling.
+- Manually delete the corresponding folder in the cache directory (`\ComfyUI\output\cache`), with the folder name being "node_" + "node ID".
 
 <img width="2230" height="976" alt="image" src="https://github.com/user-attachments/assets/5634914a-6f98-4d4f-b573-2c8b41e0c57e" />
 
 
 <img width="2209" height="1030" alt="image" src="https://github.com/user-attachments/assets/9bbdda2a-d4ce-4836-b108-e359e72e31de" />
 
-## Bug fixes and optimizations
+## BUG Fixes and Optimizations
 
 V0.7.2
-- Fixed a bug where connecting the input endpoints of an H3Parameter node (total_frames / chunk_frames / context_frames) to nodes like "Math Expression" caused the request for segmented processing to enter an infinite loop, freezing the ComfyUI web interface.
+
+- Fixed a bug where the expected segmentation request would enter an infinite loop when the input endpoint of the H3Parameter parameter node (total_frames / chunk_frames / context_frames) is connected to a similar Math Expression node, causing ComfyUI web interface to freeze.
 
 V0.7.1
 
-- The `video_guide` parameter has been added to optimize video continuation, video extrapolation, and dual-video bridging (generating intermediate segments), with support for segmentation. Note: When this parameter is not set to `none`, the reference length at the corresponding reference port of the sampling node is forcibly truncated to the value specified by the `context_frames` parameter. The reference logic remains the same as for standard references (i.e., the reference is utilized only if declared in the prompt).
+- Added `video_guide` parameter, used to optimize video continuation, video forward, and dual video connection (generating intermediate segments), supporting segmentation. Note: When non-none, the reference at the corresponding reference port of the sampling node will be forcibly cropped to the value set in the `context_frames` parameter. Reference logic is the same as normal references (only referenced if declared in prompts).
 
 V0.6.5
 
-- Optimized latent cache handling logic: removed the manual cache directory specification and switched to automatically assigning a unique cache directory (format: "node + node ID") for each node. This prevents accidental overwriting of latent caches between sampling nodes.
-- Implemented segmented cache and validation logic: if an upstream node merely adds a prompt or a new segment—without altering prompts for existing segments submitted to the sampler or changing parameters linked to the sampling node—the existing cache remains valid and is reused, while a new latent cache is automatically created for the added segment. Downstream - sampling nodes (e.g., a second sampling pass) also retain and utilize existing latent caches, creating new caches only for the newly added segments.
-- The position of a prompt change determines which latent caches can be reused; segments following the modified one are forced to regenerate, and downstream nodes apply the same logic.
-- `ignore_latent_hash`: Ignores hash verification for the `input_latent` port. Use case: Some latent processing nodes (such as the Minimax H3 Latent Upscaler (3D) node) alter latent metadata, causing minor changes that render the latent cache unusable and waste inference time; setting this to `true` is recommended in such cases. I have only tested this with the `Minimax_H3-LatentUpscaler_Adv` node from my other repository (github.com/supElement/ComfyUI_Element_easy) and have not tested similar nodes; for latent processing nodes that do not alter latent noise characteristics, the `ignore_latent_hash` parameter can be set to `false`.
+- Optimized latent cache handling logic, removed manual cache directory specification, and automatically assigns a unique cache directory for each node ("node + node ID") to prevent accidental overlap of sampling node latent cache logic due to misoperation.
+- Established and verified cache logic in a segmented manner. If the upstream node only adds prompts or increases segmentation without changing other prompts submitted to sampling, and other parameters associated with the sampling node remain unchanged, the existing corresponding cache is still considered valid and called, while new segments will automatically establish latent cache. Downstream sampling nodes (2-sample) will also retain and call the existing latent cache, only creating new cache for added segments.
+- The position where prompts are changed determines which latent caches can be reused. Segments after prompts that are changed will be forcibly rebuilt, and downstream nodes adopt the same handling logic.
+- `ignore_latent_hash`, ignores the hash value check of the input port `input_latent`. Practical scenario: Some latent processing nodes may change latent judgment information (e.g., `Minimax H3 Latent Upscaler (3D)` node), causing minor latent changes to make latent cache unusable and waste reasoning time. It is recommended to set this to true. I only tested the `Minimax_H3-LatentUpscaler_Adv` node in my other repository `github.com/supElement/ComfyUI_Element_easy` extension, similar nodes were not tested. When using latent processing nodes that do not change latent noise characteristics, you can set `ignore_latent_hash` parameter to false.
 
 V0.5.8
-
-- Refined hash verification parameters to resolve tensor mismatch errors caused by changes in parameters of nodes upstream of the sampler.
-- `Minimax_H3_Seam_Correction` node: Removed the shot detection model—which previously caused a "white screen" in the sampling node's preview—and replaced it with the `PySceneDetect` method (CPU-only, avoiding potential contamination).
+- Improved hash value detection parameter to resolve tensor mismatch errors caused by changes in parameter parameters of upstream nodes of the sampler.
+- Removed the shot detection model from the `Minimax_H3_Seam_Correction` node, as the detection model would cause the sampler node preview to show a "white screen". Replaced with PySceneDetect method (pure CPU, no potential contamination).
 
 ## 📖 Table of Contents
 
@@ -47,189 +48,188 @@ V0.5.8
 - [Installation](#install)
 - [Node Parameters](#params)
 - [Output](#output)
-- [Second Pass & SplitSigmas High/Low Frequency](#second-pass)
+- [2-Sample and SplitSigmas High/Low Frequency](#second-pass)
 - [Seam Correction Node](#seam)
 - [Prompt Writing Examples](#prompt-examples)
-- [Prompt Notes (Node Limitations)](#limitations)
+- [Prompt Precautions (Node Limitations)](#limitations)
 
 ## <a id="nodes"></a> 🧩 Node List
 
 | Node | Description |
 |------|------|
-| **Minimax_H3_AutoContext_parameter** | Parameter-group node: centrally manages prompt / segmentation / resolution / audio parameters, outputs `parameter`, and previews "expected segmentation" in real time |
-| **Minimax_H3_AutoContext_Sampler** | Main node: segmented inference + continuation anchoring + sampling (shared by pass 1 / pass 2) |
-| **Minimax_H3_Seam_Correction** | Seam correction node: pixel-domain correction of inter-segment seams in the decoded video |
+| **Minimax_H3_AutoContext_parameter** | Parameter group node: Centralizes management of prompts/segmentation/resolution/audio, outputs `parameter`, and provides real-time preview of "Expected Segments" |
+| **Minimax_H3_AutoContext_Sampler** | Main node: Segmented reasoning + Anchor + Sampling (1-sample/2-sample shared) |
+| **Minimax_H3_Seam_Correction** | Seam correction node: Performs pixel-domain seam correction on decoded video segments |
 
-> Usage: `parameter node --parameter--> main node`. Fill in the prompt in the parameter node; the main node receives it via `parameter` (required).
+> Usage: `parameter node --parameter--> Main node`. Prompts are filled in the parameter node, and the main node receives `parameter` (required).
 
 ## <a id="features"></a> ✨ Core Features
 
-### 🧩 Segmented Inference
+### 🧩 Segmented Reasoning
 
-- Split into multiple segments by `total_frames` / `chunk_frames` (frame unit); frame counts are recommended as 5, 22, 39, 56, 73, 90…
-- The last segment is automatically extended to avoid a tiny tail segment
-- `fps` is only used for audio synchronization and seconds conversion in the prompt
+- Split into multiple segments based on `total_frames` / `chunk_frames` (frame unit). Recommended frame counts: 5, 22, 39, 56, 73, 90…
+- Automatically pads the last segment to avoid excessively short tail segments
+- `fps` is only used for audio synchronization and prompt time conversion within seconds
 
 ### 🔗 Inter-segment Continuation
 
-- **Overlapping Enhancement**: non-first segments automatically "relay" the previous segment's ending, so the new content continues naturally from where the previous segment left off, eliminating pauses or position drift at the seams
-- The previous segment's ending is passed as a motion reference to the current segment, helping continue the motion direction and speed
-- The previous segment's audio is also passed as "previous content", helping the sound continue naturally
-- Inter-segment audio is smoothly cross-faded, aligned with the video frame count
+- **Overlay Enhancement**: Non-first segments automatically "take over" the ending frame of the previous segment, with new content naturally continuing from where the previous segment ended, eliminating pauses or position jumps at the seams
+- The ending of the previous segment is used as motion reference for the current segment, helping to continue motion direction and speed
+- Previous audio is also passed as "previous content" to help the sound continue naturally
+- Inter-segment audio fades smoothly, aligned with the number of video frames
 
-> Frame-count rule: `total_frames` / `chunk_frames` / `context_frames` all take 5, 22, 39, 56, 73, 90… (a multiple of 17 plus 5); the node aligns them automatically, so manual calculation is usually unnecessary.
+> Frame count rule: `total_frames` / `chunk_frames` / `context_frames` all take 5, 22, 39, 56, 73, 90… (17 times plus 5), the node will automatically align, generally no need for manual calculation.
 
 ### ⏱️ Prompt Timeline
 
 | Mode | Description |
 |------|------|
-| **Clip_Tag** | Splits prompts based on user-defined tags (e.g., `段1`/`段2`), with each tag corresponding to a separate video segment; segment duration is determined by the prompt content (priority order: duration specified after the tag > in-segment timestamps > `total_frames/fps` fallback). |
-| **timeline** | Splits prompts based on explicit timestamps (e.g., `0-2s`/`2-6s`), with each time interval corresponding to a video segment; segment duration = interval length × `fps`, automatically snapped to a valid grid; **ignores `total_frames` and `chunk_frames`**, with total duration determined entirely by the prompts. Global segments (marked `【Global】`) remain in their original positions and are not extracted separately. |
-| **sequential** | Distributes prompts evenly across the video timeline based on sentence/phrase order without splitting the prompts themselves; video segmentation still follows `chunk_frames`. |
-| **global** | Applies the entire prompt block to all video segments (after stripping the `【Global】` tag); video segmentation follows `chunk_frames`. |
+| **Clip_Tag** | Slices prompts based on user-defined tags (e.g., `Segment 1`/`Segment 2`), each tag corresponds to an independent video segment; segment duration is determined by the prompt content (duration after tag > segment time markers > default `total_frames/fps`). |
+| **timeline** | Slices prompts based on explicit time markers (e.g., `0-2s`/`2-6s`), each time interval corresponds to a video segment; segment duration = interval length × `fps` and automatically snaps to legal grid; **ignores `total_frames` and `chunk_frames`**, entirely determined by prompts for total duration. Global segments (`【Global】`) remain in their original positions and are not extracted together. |
+| **sequential** | Distributes prompts in sentence order uniformly along the entire video timeline without splitting the prompts themselves; video segmentation still follows `chunk_frames`. | 
+| **global** | Entire prompt is used for all video segments (after stripping `【Global】` tag), video segmentation follows `chunk_frames`. |
 
-> In `Clip_Tag` and `timeline` modes, the `total_frames` and `chunk_frames` parameters are ignored (segment duration is determined by the prompts) and are only used as a fallback if the mode degrades (e.g., if no tags or timestamps are detected).
+> In `Clip_Tag` and `timeline` modes, `total_frames` and `chunk_frames` parameters are ignored (segment length determined by prompts), only used when degraded (e.g., no tags/time markers detected) to fall back to these values.
 
 ### 🏷️ Clip_Tag Tag Segmentation Mode
 
-- Split the prompt by user-defined tags (e.g. `段1` / `段2` / `段3`); each segment = one chunk = that segment's full prompt
-- Segment duration is determined by the prompt content (three-level priority):
-  1. Duration right after the tag line (e.g. `段1:0-5秒` → 5 s; `段1:3-8秒` → 5 s)
-  2. The maximum end value of in-segment time marks (e.g. `【0-2秒】` + `【2-5秒】` → 5 s)
-  3. `total_frames / fps` default fallback (single segment matches `total_frames`)
-- In-segment time marks are **relative time** (each segment starts at 0), not global absolute time
-- Non-first segments generate an extra overlap region for continuity, automatically trimmed after generation
-- The total duration is automatically aligned to the target total frames, getting as close as possible to the expected duration
-- Tags themselves are stripped during inference; the remaining prompt content is output according to `prompt_format`
+- Slices prompts based on user-defined tags (e.g., `Segment 1`/`Segment 2`/`Segment 3`), each segment = one chunk = all prompts for that segment
+- Segment duration determined by prompt content (three layers of priority):
+  1. Duration immediately following the tag line (e.g., `Segment 1:0-5s` → 5 seconds; `Segment 1:3-8s` → 5 seconds)
+  2. Maximum end value of time markers within the segment (e.g., `【0-2s】`+`【2-5s】` → 5 seconds)
+3. Default `total_frames / fps` fallback (matches `total_frames` for single segments)
+- Segment time markers are **relative time** (starting from 0 for each segment), not global absolute time
+- An overlap frame is automatically generated for non-first segments to ensure smooth connection, and is cropped after generation
+- Total duration is automatically aligned to the target total frame count, as close as possible to the expected duration
+- Labels themselves are removed during reasoning, and the rest of the prompt content is output based on `prompt_format`
 
 ### 🎯 Intelligent Reference Filtering (Image / Video / Audio)
 
-- Automatically detects which reference images/videos/audios are used in each segment's prompt and passes only those to that segment
-- A video is bound to its paired audio track, avoiding image/sound crosstalk
+- Automatically identifies reference images/videos/audios used in each segment's prompts and only passes referenced materials to that segment
+- Video and its paired audio track are bound together to avoid visual/audio cross-talk
 
-### 🖌️ Second Pass
+### 🖌️ Secondary Sampling (2-Sample)
 
-- Connecting pass-1 latent to the main node's `latent_input` (directly or via a latent upscaler) enters second-pass mode
-- Second-pass resolution **follows the input latent** (ignores width/height), enabling low-res pass 1 → high-res pass 2
-- `denoise` controls redraw strength; `sigmas` supports custom sigma schedules (same as `SamplerCustomAdvanced`)
-- `lock_audio`: pass 2 only redraws video and reuses pass-1 audio
+- Main node `latent_input` receives 1-sample latent (or via latent amplification node) to enter 2-sample mode
+- 2-sample resolution **takes input latent as reference** (ignores width/height), achieving low-quality 1-sample → high-quality 2-sample
+- `denoise` controls redraw intensity; `sigmas` supports custom sigma sequences (same as `SamplerCustomAdvanced`)
+- `lock_audio`: 2-sample only redraws video, reuses 1-sample audio
 
 ### 🎵 Audio Drive
 
 - `drive_audio` (AUDIO, optional) + `audio_drive` switch
-- When enabled, the video follows this audio track, and the output audio = the source audio itself (lip-sync / rhythm driven by it)
-
+- Enabled, video follows this audio for generation, output audio = source audio itself (lip sync/rhythm driven by it)
 ## <a id="install"></a> 📦 Installation
 
-### Method One: Manual Installation
+### Method 1: Manual Installation
 
 ```bash
 cd ./ComfyUI/custom_nodes
 git clone https://github.com/supElement/ComfyUI_MinimaxH3_AutoContext.git
 ```
 
-### Method Two: Install via Manager
+### Method 2: Install using Manager
 
-Search `ComfyUI_MinimaxH3_AutoContext` in ComfyUI Manager and click Install.
+Search for `ComfyUI_MinimaxH3_AutoContext` in ComfyUI Manager and click Install.
+
 
 ## <a id="params"></a> ⚙️ Node Parameters
 
-### Minimax_H3_AutoContext_parameter (Parameter Group Node)
+### Minimax_H3_AutoContext_parameter（Parameter Group Node）
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| long_prompt | — | Prompt (passed to the main node for inference and used for the "estimated segmentation" preview) |
-| **clip_mode** | `Clip_Tag` | Method for mapping prompts to video segments: `Clip_Tag` / `timeline` / `sequential` / `global`. `total_frames` and `chunk_frames` are ignored in `Clip_Tag` and `timeline` modes. |
-| clip_tag | `段1` | Clip_Tag segmentation label template (must end with a numeric index); effective only when `clip_mode=Clip_Tag` |
-| prompt_format | `official` | Prompt output format: `official` / `legacy` / `raw` | `official` uses the MiniMax H3 official [Shot] format; `legacy` uses the old-style timestamp format; `raw` outputs as-is (for Clip_Tag mode) |
-| crop_mode | `stretch` | Scaling/cropping for reference images, start/end frames, or reference videos: `center` / `stretch` / `none` |
-| ref_sync_mode | `segmented` | Whether to slice reference video/audio by segment: `global` (use full source for each segment) / `segmented` (slice based on segment time ratios) |
-| width × height | 960×544 | Resolution for the first pass (overridden by `latent_input` during the second pass) |
-| total_frames | 362 | Total frames to generate (17n+5); acts as a fallback in `Clip_Tag`/`timeline` modes (used only if tags/timestamps are missing), but is ultimately overridden by the sum of individual segments |
-| fps | 24 | Frame rate; used for audio synchronization and converting prompt timings to seconds |
-| chunk_frames | 90 | Frames generated per segment (17n+5); applies only in `sequential` / `global` modes |
-| context_frames | 22 | Continuity frames between segments (17n+5: 5/22/39/56…); recommended value is 22 or higher |
-| lock_audio | `true` | Locks the audio region during the second pass (noise_mask audio=0): resamples video only, keeping the first-pass audio unchanged |
-| audio_drive | `false` | Audio-driven mode toggle; when enabled, video generation follows `drive_audio` |
-| video_guide | `none` | Video extension parameter; supports segmentation. `none`: Disabled(Do not modify the video reference logic); `pre_guide`: Video continuation (uses `ref_video_0` or `ref_video_audio_0` ports); `post_guide`: Video extension/push-forward (uses `ref_video_0` or `ref_video_audio_0` ports); `pre_post_guide`: Bridging between two videos (uses `ref_video_0`/`ref_video_audio_0` and `ref_video_1`/`ref_video_audio_1` ports). The number of anchor frames is determined by `context_frames`. Note: When set to anything other than `none`, the reference at the corresponding port of the sampling node is forcibly truncated to the value specified by `context_frames`. The reference logic remains the same as for standard references (i.e., the reference is utilized only if declared in the prompt). |
+| Parameter | Default Value | Description |
+|----------|---------------|------------|
+| long_prompt | — | Prompt (passed to the main node for reasoning, also used for "Estimated Segmentation" preview) |
+| **clip_mode** | `Clip_Tag` | How prompts map to video segments: `Clip_Tag` / `timeline` / `sequential` / `global`. In `Clip_Tag` and `timeline` modes, `total_frames` and `chunk_frames` are ignored. |
+| clip_tag | `段1` | Clip_Tag segmentation tag template (must end with a numeric sequence number), only effective when `clip_mode=Clip_Tag` |
+| prompt_format | `official` | Prompt output format: `official` / `legacy` / `raw`. `official` uses the official [Shot] format of MiniMax H3, `legacy` is the old-style time tag, `raw` outputs as-is (used for Clip_Tag mode) |
+| crop_mode | `stretch` | Reference image/first/last frame/reference video scaling and cropping: `center` / `stretch` / `none` |
+| ref_sync_mode | `segmented` | Whether reference video/audio is sliced per segment: `global` (uses the full material per segment) / `segmented` (slices by the time ratio of each segment) |
+| width × height | 960×544 | Resolution of one sample (latent_input covers it when two-sampling) |
+| total_frames | 362 | Total number of frames to generate (17n+5); only serves as a fallback in `Clip_Tag`/`timeline` modes, ultimately overridden by the sum of each segment |
+| fps | 24 | Frame rate, used for audio synchronization and prompt second conversion |
+| chunk_frames | 90 | Number of frames generated per segment (17n+5), only effective in `sequential` / `global` modes |
+| context_frames | 22 | Frames for segment continuation (17n+5: 5/22/39/56…), recommended to be 22 or higher |
+| lock_audio | `true` | Lock audio area during two-sampling (noise_mask audio=0): resamples video only, keeps one-sampling audio unchanged |
+| audio_drive | `false` | Audio drive switch, after enabling, video follows drive_audio generation |
+| video_guide | `none` | Video extension parameter, supports segmentation. none: disabled (does not modify video reference logic); pre_guide: video continuation (sample node ref_video_0 or + ref_video_audio_0 port); post_guide: video push forward (sample node ref_video_0 or + ref_video_audio_0 port); pre_post_guide: dual video middle connection (sample node ref_video_0 or + ref_video_audio_0 port, ref_video_1 or + ref_video_audio_1 port). The anchored frame count is determined by context_frames. Note: When not none, the reference of the sampling node's corresponding reference port will be forcibly cut to the value set in the context_frames parameter. The reference logic is the same as normal references (only reference if declared in the prompt). |
 
-> Real-time preview of "estimated segments" displayed on the node (calculated via frontend JS; does not affect the inference process).
+> The node displays "Estimated Segmentation" preview in real-time (calculated by frontend JS, does not participate in reasoning).
 
-### Minimax_H3_AutoContext_Sampler (main node)
+### Minimax_H3_AutoContext_Sampler（Main Node）
 
-| Parameter | Default | Description |
-|------|--------|------|
+| Parameter | Default Value | Description |
+|----------|---------------|------------|
 | model / vae / audio_vae / clip | — | MiniMax H3 model components |
-| parameter | required | Parameter-group input (from the parameter node) |
-| sampler | optional | External sampler object (SAMPLER); overrides the built-in sampler_name/scheduler |
-| sigmas | optional | Custom sigma schedule (SIGMAS); highest priority |
-| latent_input | optional | Pass-2 input latent (connecting it enables pass 2) |
-| info | optional | Parameter inheritance input (chained multi-pass; keeps segmentation consistent) |
-| first_frame / last_frame | optional | First / last frame anchoring (FL2VA) |
-| video_context_denoise | 0.0 | Inter-segment continuity strength (non-first segments only): 0 = continue exactly from the previous segment's ending, 1 = regenerate, intermediate = soft blend. With SplitSigmas in pass 2, set 1 to avoid artifacts |
+| parameter | Required | Parameter group input (from parameter node) |
+| sampler | Optional | External sampler object (SAMPLER), overrides built-in sampler_name/scheduler |
+| sigmas | Optional | Custom sigma sequence (SIGMAS), highest priority |
+| latent_input | Optional | Two-sampling input latent (enables two-sampling upon connection) |
+| info | Optional | Parameter inheritance input (multi-sampling chaining, ensures segment consistency) |
+| first_frame / last_frame | Optional | First/last frame anchoring (FL2VA) |
+| video_context_denoise | 0.0 | Segment continuation strength (only non-first segment): 0=exact continuation of the previous segment's end, 1=regenerate, intermediate values=soft blend. When connected to SplitSigmas for two-sampling, it is recommended to set to 1 to avoid screen artifacts |
 | seed | 0 | Random seed (control_after_generate) |
 | steps / cfg | 30 / 1.0 | Sampling steps / CFG |
 | sampler_name / scheduler | euler / simple | Built-in sampler / scheduler |
-| denoise | 1.0 | Redraw strength (1 = full resample, lower preserves more of the original structure) |
-| enable_cache | true | Stores/reads latent cache; automatically creates a folder named "node+[node ID]" in the "\ComfyUI\output\cache" directory. Existing latent cache files are overwritten if upstream nodes or parameters change. |
-| clear_cache | false | Forces the latent cache file to be rebuilt. |
-| ignore_latent_hash | false | Ignores hash verification for the `input_latent` port. Useful when certain latent processing nodes alter latent metadata, causing minor changes that render the cache unusable and waste inference time; setting this to `true` is recommended in such cases. |
-| ref_image_N / ref_video_N / ref_video_audio_N / ref_audio_N | optional | Reference materials (Autogrow dynamic ports) |
-| drive_audio | optional | Audio drive source |
-
+| denoise | 1.0 | Redraw strength (1=full resampling, smaller value retains more original structure) |
+| enable_cache | true | Store/read latent cache, automatically creates a folder named "node+nodeID" in the "\ComfyUI\output\cache" directory, and overrides existing latent cache files when upstream nodes or parameters change |
+| clear_cache | false | Force rebuild latent cache file |
+| ignore_latent_hash | false | Ignore hash validation of input port input_latent. Practical scenario: Some latent processing nodes change latent judgment information, causing minor latent changes to result in cache incompatibility and wasting reasoning time. It is recommended to set it to true in this case |
+| ref_image_N / ref_video_N / ref_video_audio_N / ref_audio_N | Optional | Reference materials (Autogrow dynamic ports) |
+| drive_audio | Optional | Audio drive source |
 ## <a id="output"></a> 📤 Output
 
 | Output | Description |
 |------|------|
-| **latent** | Spliced audio/video latent; connect to VAE Decode, or upscale then connect to pass 2 |
-| **denoised_latent** | Clean latent output, used for pass-2 relay / preview |
-| **info** | Segmentation parameters (Dict), passed to the next main node's info input to keep chained passes' segmentation consistent |
+| **latent** | Concatenated audio-video latent, followed by VAE Decode, or upscaled then followed by binary sampling |
+| **denoised_latent** | Clean latent output, used for binary sampling continuation / preview |
+| **info** | Segment parameters (Dict), passed to the next main node's info input, ensuring consistent multi-sampling segmentation |
 
 
 
-## <a id="second-pass"></a> 🔄 Second Pass & SplitSigmas High/Low Frequency
+## <a id="second-pass"></a> 🔄 Binary Sampling and SplitSigmas High/Low Frequencies
 
-### Basic second pass (low-res pass 1 → high-res pass 2)
-
-```
-parameter node ──parameter──> main node (pass 1, 864×480)
-    └─ latent / denoised_latent ──> [split AV] ──> video_latent ──> latent upscale ──> [merge AV] ──> main node (pass 2).latent_input
-pass-2 node: shared parameter (or info inheritance); optional denoise 0.4~0.6
-```
-
-- Pass-2 resolution follows `latent_input`, ignoring the parameter node's width/height
-
-### SplitSigmas high/low frequency (save time, improve clarity)
-
-> ⚠️ **Audio constraint**: high/low frequency **only applies to video** (audio inter-segment continuity needs full sampling), so keep audio fully sampled.
+### Basic Binary Sampling (Low-Resolution First Sample → High-Resolution Second Sample)
 
 ```
-Pass-1 node: full sampling (do not connect high_sigmas; audio fully denoised)
-          → denoised_latent → split & upscale video (audio untouched) → merge → pass-2.latent_input
-Pass-2 node: sigmas ← low_sigmas (only run the low-sigma range to add detail)
-          lock_audio = True (reuse the complete pass-1 audio)
-          video_context_denoise = 1.0 (redraw the continuation region together with the new content to avoid artifacts)
+parameter node ──parameter──> Main node (First Sample, 864×480)
+    └─ latent / denoised_latent ──> [Separate AV] ──> video_latent ──> latent upscaled ──> [Combine AV] ──> Main node (Second Sample).latent_input
+Binary Sampling node: parameter shared (or info inherited), optional denoise 0.4~0.6
 ```
 
-> 💡 **Pass-2 `video_context_denoise`**: with SplitSigmas, setting 0 (exact continuation) may cause artifacts at the boundary between the continued region and the redrawn new content; setting 1.0 redraws the continuation region in sync and avoids them. If the seam is slightly discontinuous, lower it to 0.3~0.5 as a compromise. Pass 1 keeps the default 0.
+- Binary sampling resolution is based on `latent_input`, ignoring parameter's width/height
+
+### SplitSigmas High/Low Frequencies (Save Time, Enhance Clarity)
+
+> ⚠️ **Audio Constraint**: High/Low frequencies only take effect on video (audio segments need complete sampling), keep audio as complete sampling.
+
+```
+First Sample node: Complete sampling (no connection to high_sigmas, audio complete denoising)
+          → denoised_latent → Separate amplify video (audio unchanged) → Combine → Second Sample.latent_input
+Second Sample node: sigmas ← low_sigmas (only run low sigma segments to enhance details)
+          lock_audio = True (reuse first sample complete audio)
+          video_context_denoise = 1.0 (continuation area redraws together with new area, avoid screen tearing)
+```
+
+> 💡 **Second Sample `video_context_denoise`**: When connected to SplitSigmas, setting to 0 (precise continuation) may cause screen tearing at the boundary between continuation area and newly redrawn area; setting to 1.0 allows continuation area to redraw synchronously to avoid it. If the seam appears slightly discontinuous, it can be reduced to 0.3~0.5 for a compromise. First sample keeps default 0.
 
 ## <a id="seam"></a> 🧵 Seam Correction Node (Minimax_H3_Seam_Correction)
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `fix_color_preset` | `"medium"` | **Color/Exposure correction level**<br>`off`: disabled;<br>`low`: per‑channel luminance gain with half‑strength correction, most conservative, no color cast;<br>`medium`: per‑channel luminance gain, only corrects seam level jumps (recommended);<br>`high`: MKL linear color transfer with a longer statistical window, more stable with large motion;<br>`max`: frame‑by‑frame luminance normalisation across the whole clip, eliminates gradual drift within segments, but flattens intentional brightness changes (e.g. sunset/tunnel entry); near‑black frames are ineffective (logged). |
-| `fix_motion_preset` | `"off"` | **Seam continuity (optical flow alignment + blending) level**<br>`off`: disabled (recommended to test with colour correction first);<br>`low/medium/high/max`: higher levels blend more frames with stronger effect, but may introduce slight blur or pumping. |
-| `fix_flash` | `false` | **Flash frame handling** (transient brightness jumps at boundaries). Independent switch, uses temporal fusion logic. May suppress legitimate rapid changes like lightning or explosions. Works even when `fix_motion_preset=off`. |
-| `flash_threshold` | `0.30` | Threshold for transient correction (abnormal pixel ratio). Lower values are more aggressive (correct more frames). Recommended range `0.20` – `0.40`. |
-| `cut_threshold` | `15.0` | Sensitivity threshold for PySceneDetect (range `5.0` – `50.0`). Lower values are more sensitive. Recommended `10` – `20`. Only effective when `cut_detection=true`. |
-| `blend_frames` | `2` | Level transition window around seams (frames, 0–8): after exposure alignment, smooths the brightness transition over `blend_frames` on each side of the boundary. Higher values give smoother transitions but may cause slight blur/breathing with fast motion; `0` disables. |
-| `use_gpu` | `true` | Use CUDA GPU for statistics, colour transforms, and optical flow (falls back to CPU if unavailable). |
+| Parameter | Default Value | Description |
+|------|--------|------|
+| `fix_color_preset` | `"medium"` | **Color/Exposure Processing Level**<br>`off`：No processing; <br>`low`：Per-channel brightness gain, correction amount halved, most conservative, no color bias; <br>`medium`：Per-channel brightness gain, only corrects seam level jumps (recommended); <br>`high`：MKL linear color migration, longer statistical window, more stable during large motion; <br>`max`：Full frame brightness normalization across the entire video, eliminates intra-segment gradient drift, but flattens the actual brightness changes in the frame (e.g., night scene/entering a tunnel), near black frames are ineffective (reported in logs). |
+| `fix_motion_preset` | `"off"` | **Seam Continuity (Optical Flow Alignment+Blending) Level**<br>`off`：No processing (recommended to first observe the effect with color level); <br>`low/medium/high/max`：Higher levels involve more frames and stronger blending, but may introduce slight blurring or breathing effects. |
+| `fix_flash` | `false` | **Flash Processing** (instant brightness jumps at boundaries). Independent switch, uses temporal fusion logic. If the scene has reasonable rapid brightness changes like lightning, explosions, suppression may flatten these effects. Still effective even when `fix_motion_preset=off`. |
+| `flash_threshold` | `0.30` | Transient correction selection threshold (percentage of abnormal pixels), smaller value is more aggressive (corrects more frames), recommended `0.20` ~ `0.40`. |
+| `cut_threshold` | `15.0` | PySceneDetect's sensitivity threshold (range `5.0` ~ `50.0`), smaller value is more sensitive, recommended `10` ~ `20`. |
+| `blend_frames` | `2` | Seam level gradient window (frames, 0~8): After exposure alignment, smooth the brightness transition of the `blend_frames` before and after the boundary as a smooth ramp; larger value results in smoother transition, more natural, but large motion scenes may cause slight blurring/breathing; `0` means disabled. |
+| `use_gpu` | `true` | Use CUDA GPU for statistics, color transformation, and optical flow calculation (automatically fallback to CPU if unavailable). |
 
-⚠️ Removed the shot‑detection model dependency; now uses PySceneDetect (pure CPU, no potential pollution).
+⚠️ Removed the scene detection model, using PySceneDetect (pure CPU, no potential contamination).
 
 > Usage: `VAE Decode → H3_Seam_Correction → Save/Video`.
 
-> ⚠️ Note: This node only performs frame-level seam correction and cannot fix artifacts produced upstream in the second pass. 
+> ⚠️ Note: This node only performs visual seam correction, cannot fix artifacts generated by the upstream of binary sampling.
 
 ## <a id="prompt-examples"></a> ✍️ Prompt Writing Examples
 
@@ -245,109 +245,107 @@ integrated_multimodal_description
 overall_soundscape
 ```
 
-> Paragraphs containing `0-5s` marks are split by time; unmarked paragraphs (style / sfx / banned items) are automatically merged into every window.
+> Segments marked with `0-5s` are split by time, unmarked segments (styles/effects/prohibitions) are automatically combined into each window.
 
 ### Global Mode (global)
 
-> The entire prompt is used for all segments; suited to a one-shot scene with uniform action throughout.
+> The entire prompt applies to all segments, suitable for homogeneous actions in a single take throughout.
 
-### Clip_Tag Mode (Segment by Tag)
+### Clip_Tag Mode (Segment by Tags)
 
-> Set `clip_mode` to `Clip_Tag` and fill in the tag template (`clip_tag`) (must end with a number).
+> Set `clip_mode` to `Clip_Tag`, fill `clip_tag` with the tag template (must end with a numeric sequence number).
 
 **Tag Template Examples**
 
 | Template | Match |
 |------|------|
-| `段1` | `段1` / `段2` / `段3` (prefix "段"+number) |
+| `Section 1` | `Section 1` / `Section 2` / `Section 3` (prefix "Section"+number) |
 | `A01` | `A01` / `A02` / `A03` (prefix "A"+number) |
-| `[片段001]` | `[片段001]` / `[片段002]` (prefix "[片段"+number+suffix"]") |
+| `[Clip001]` | `[Clip001]` / `[Clip002]` (prefix "[Clip"+number+suffix "]") |
 
-**Tag Writing**: a tag occupies a line alone as the split point; a line break after the tag is recommended. It also works without a line break (the separator is skipped and the segment content is taken):
+**Tag Writing**: Tags occupy a line as a separator, recommended to add a newline after the tag. Without newline, it can still process (skips the separator to take segment content):
 
 ```text
 段1:3s
-视频：
+Video:
 ...
-音频设计：
+Audio Design:
 ...
 
 
 段2:3-8s
-视频：
-0-2秒：
+Video:
+0-2 seconds:
 ...
-2-5秒：
+2-5 seconds:
 ...
-音频设计：
-0-5秒：...
+Audio Design:
+0-5 seconds:...
 ```
 
-**Segment Duration Rules** (three-level priority):
+**Segment Duration Rules** (three levels of priority):
 
-1. Duration right after the tag line: `段1:0-5秒` → 5 s; `段1:3-8秒` → 5 s (the duration mark is removed from the prompt)
-2. In-segment time marks, 0-based: `【0-2秒】` + `【2-5秒】` → 5 s
-3. Neither present → `chunk_frames / fps` fallback
+1. Duration immediately following the tag line: `段1:0-5s` → 5 seconds; `段1:3-8s` → 5 seconds (duration markers will be removed from the prompt)
+2. In-segment time markers 0-based: `【0-2秒】`+`【2-5秒】` → 5 seconds
+3. None → `chunk_frames / fps` as fallback
 
 **prompt_format Selection**
 
-- `official` / `legacy`: in-segment time marks are automatically rendered as in-segment relative coordinates
-- `raw`: tags are removed and output as-is; time marks stay unchanged (suited to structured prompts generated by large models)
+- `official` / `legacy`：Convert in-segment time markers to relative coordinates for rendering within the segment
+- `raw`：Output the original untagged content, time markers remain unchanged (suitable for structured prompts generated by large models)
+## <a id="limitations"></a> 📝 Prompt Precautions (Limitations of Nodes)
 
-## <a id="limitations"></a> 📝 Prompt Notes (Node Limitations)
-
-> The following notes **do not apply** to simple, always-valid prompt scenarios (i.e., all segments share the same prompt, global mode),
-> e.g. talking-head digital humans (of course, dialogue needs segmentation), videos with little change in shot/composition, or character-replacement scenarios where the prompt stays generic.
+> The following precautions **do not apply** to simple, always-effective prompt scenarios (i.e., all segments share the same prompt, global mode),
+> such as: voice-over digital humans (of course, lines need to be segmented), minimal changes in shots/construction in videos, or video character replacements, etc., common prompt scenarios.
 
 ### 1️⃣ Core Principle: Temporal Exclusivity
 
-> When using segmented inference (chunking), you must follow the **temporal exclusivity** principle — each segment's prompt can only describe the **new changes** "happening" in that segment relative to the end of the previous segment.
+> When using segmented reasoning (Chunks), please strictly adhere to the **temporal exclusivity** principle—each segment's prompt can only describe the **new changes** that are "occurring" in that segment relative to the end of the previous segment.
 
-- **Segmentation is a "relay"**: when the Nth segment is generated, its starting visual state (position, pose, camera position) is fully provided implicitly by the "anchoring frames (Context Frames)" at the end of the previous segment. You don't need to re-describe that starting state in the prompt.
-- **No "retrospection" or "overlap"**: the Nth segment's prompt must never re-describe actions or camera moves already completed in the N-1th segment. Repeating them makes the model receive instructions that logically conflict with the anchoring frames (instruction conflict), causing stuttering, confused motion logic, or repeated actions.
-- **Zero the boundary**: when switching segments, clear the previous segment's "action in progress". The new segment's prompt should be like "new instructions after pressing the shutter" — only describe the displacement, action, or new elements occurring in the new time window.
+- **Segments are "Relays"**: When generating the Nth segment, its starting visual state (position, action posture, camera position) is fully implicitly provided by the "anchoring frames (Context Frames)" at the end of the previous segment. You don't need to repeat this starting state in the prompt.
+- **Prohibited "Retrospection" and "Overlap"**: The prompt for the Nth segment must absolutely not repeat the actions or camera movements already completed in the N-1th segment. If repeated, the model will receive conflicting instructions with the anchoring frame's visual (instruction conflict), leading to jerky generation, incorrect motion logic, or repeated actions.
+- **Zeroing at Boundaries**: When switching segments, zero out the "ongoing actions" of the previous segment. The new segment's prompt should act like a "new instruction after taking a snapshot," targeting only the displacement, actions, or new elements that appear within the current new time period.
 
-**❌ Incorrect Writing (Conflict/Overlap)**
-
-```text
-Segment 1: 3 seconds
-"Object A moves toward position B" 
-Segment 2: 3-6 seconds
-"After object A moves to position B, it turns around at position B" 
-```
-
-> Problem analysis: at the end of segment 1, the anchoring frame shows object A has already arrived at position B and just stopped. But segment 2's prompt forcibly requires "object A to move to position B", which conflicts with the "already arrived" static result of the anchoring frame; the model tries to "move again", causing glitching or skipped frames.
-
-**✅ Correct Writing (Seamless Progression)**
+**❌ Incorrect Style (Conflicting Overlap)**
 
 ```text
 Segment 1: 3 seconds
-"Object A moves toward position B and finally stops at position B" (emphasizing action closure)
+"Object A moves to position B"
 Segment 2: 3-6 seconds
-"After standing still, object A slowly turns its direction" (directly describing the new action after the previous segment ends)
+"Object A moves to position B and then turns around at position B"
 ```
 
-> Correct logic: segment 2 completely abandons describing the "moving process", treats "stopped at B" as a given fact, and only describes the following "turning" new action — the model can then continue seamlessly using the anchoring frames.
+> Problem Analysis: When the 1st segment ends, the anchoring frame shows Object A has already reached position B and just stopped. However, the 2nd segment's prompt forcibly requires "Object A moving to position B," which conflicts with the anchoring frame's static result "already arrived." The model will attempt to "re-move" it, causing creepy or frame-skipping effects.
 
-> 🚀 **One-sentence summary**: the end of the previous segment is the "result", and the start of the next segment is the "new action after the result" — don't write the "process that led to the result" into the next segment.
+**✅ Correct Style (Seamless Progression)**
+
+```text
+Segment 1: 3 seconds
+"Object A moves to position B and finally stops at position B" (emphasizing action closure)
+Segment 2: 3-6 seconds
+"After standing firm, Object A slowly turns direction" (directly describing the new action after the previous segment ends)
+```
+
+> Correct Logic: The 2nd segment completely discards the description of the "movement process," assuming "stopped at B point" is a given fact, and only describes the subsequent "turning" new action. The model can then perfectly continue using the anchoring frame.
+
+> 🚀 **In one sentence**: The end of the previous segment is the "result," and the beginning of the next segment is the "new action after the result." Don't put the "process that led to the result" into the next segment.
 
 ### 2️⃣ Core Principle: Per-Segment Reference Declaration
 
-> When using segmented inference together with reference images/videos (image1, video1, etc.), you must follow the **per-segment reference declaration** principle — every segment's prompt must independently and completely declare all the reference materials it needs; references are not "remembered" or "inherited" into the next segment.
+> When using segmented reasoning with reference images/videos (image1, video1, etc.), please strictly adhere to the **per-segment reference declaration** principle—each segment's prompt must independently and completely declare all the reference materials required for that segment. References are not "memorized" or "inherited" to the next segment (only the referenced references participate in reasoning for the current segment).
 
-- **No global memory**: the node parses the reference tags written in the current segment's prompt to precisely decide which materials that segment needs. Writing image1 in the previous segment only means the previous segment used it; the next segment is scanned anew.
-- **Not written, not passed**: if the Nth segment doesn't mention image1 again, that segment won't receive that reference image, causing character/object inconsistency.
+- **No Global Memory**: The node parses the reference labels explicitly mentioned in the current segment's prompt to accurately determine which materials are needed for that segment. Writing image1 in the previous segment only means it was used in the previous segment; the next segment will re-scan.
+- **If Not Written, Not Passed**: If the Nth segment doesn't write image1 again, that reference image won't be passed to this segment, causing inconsistencies in characters/objects.
 
-**❌ Incorrect Writing (Implicit Inheritance)**
-
-```text
-Segment 1 [3s]: image1 is object A; object A is moving forward.
-Segment 2 [3-6s]: Object A stops and turns to face the camera. (image1 not written)
-```
-
-**✅ Correct Writing (Explicit Per Segment)**
+**❌ Incorrect Style (Implicit Inheritance)**
 
 ```text
-Segment 1 [3s]: image1 is object A; object A is moving forward.
-Segment 2 [3-6s]: image1 is object A; object A stops and turns to face the camera.
+Segment 1[3s]: image1 is Object A, Object A is moving forward.
+Segment 2[3-6s]: Object A stops, turns to look at the camera. (No image1 written)
 ```
+
+**✅ Correct Style (Explicit Per-Segment)**
+
+```text
+Segment 1[3s]: image1 is Object A, Object A is moving forward.
+Segment 2[3-6s]: image1 is Object A, Object A stops, turns to look at the camera.
