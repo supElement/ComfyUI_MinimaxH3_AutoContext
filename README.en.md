@@ -84,7 +84,7 @@ V0.5.8
 
 | Mode | Description |
 |------|------|
-| **Clip_Tag** | Slices prompts based on user-defined tags (e.g., `Segment 1`/`Segment 2`), each tag corresponds to an independent video segment; segment duration is determined by the prompt content (duration after tag > segment time markers > default `total_frames/fps`). |
+| **Clip_Tag** | Slices prompts based on user-defined tags (e.g., `段1`/`段2`), each tag corresponds to an independent video segment; segment duration is determined by the prompt content (duration after tag > segment time markers > default `total_frames/fps`). |
 | **timeline** | Slices prompts based on explicit time markers (e.g., `0-2s`/`2-6s`), each time interval corresponds to a video segment; segment duration = interval length × `fps` and automatically snaps to legal grid; **ignores `total_frames` and `chunk_frames`**, entirely determined by prompts for total duration. Global segments (`【Global】`) remain in their original positions and are not extracted together. |
 | **sequential** | Distributes prompts in sentence order uniformly along the entire video timeline without splitting the prompts themselves; video segmentation still follows `chunk_frames`. | 
 | **global** | Entire prompt is used for all video segments (after stripping `【Global】` tag), video segmentation follows `chunk_frames`. |
@@ -93,10 +93,10 @@ V0.5.8
 
 ### 🏷️ Clip_Tag Tag Segmentation Mode
 
-- Slices prompts based on user-defined tags (e.g., `Segment 1`/`Segment 2`/`Segment 3`), each segment = one chunk = all prompts for that segment
+- Slices prompts based on user-defined tags (e.g., `段1`/`段2`/`Segment 3`), each segment = one chunk = all prompts for that segment
 - Segment duration determined by prompt content (three layers of priority):
-  1. Duration immediately following the tag line (e.g., `Segment 1:0-5s` → 5 seconds; `Segment 1:3-8s` → 5 seconds)
-  2. Maximum end value of time markers within the segment (e.g., `【0-2s】`+`【2-5s】` → 5 seconds)
+  1. Duration immediately following the tag line (e.g., `段1:0-5s` → 5s; `段1:3-8s` → 5s)
+  2. Maximum end value of time markers within the segment (e.g., `【0-2s】`+`【2-5s】` → 5s)
 3. Default `total_frames / fps` fallback (matches `total_frames` for single segments)
 - Segment time markers are **relative time** (starting from 0 for each segment), not global absolute time
 - An overlap frame is automatically generated for non-first segments to ensure smooth connection, and is cropped after generation
@@ -275,18 +275,18 @@ Audio Design:
 
 段2:3-8s
 Video:
-0-2 seconds:
+0-2s:
 ...
-2-5 seconds:
+2-5s:
 ...
 Audio Design:
-0-5 seconds:...
+0-5s:...
 ```
 
 **Segment Duration Rules** (three levels of priority):
 
-1. Duration immediately following the tag line: `段1:0-5s` → 5 seconds; `段1:3-8s` → 5 seconds (duration markers will be removed from the prompt)
-2. In-segment time markers 0-based: `【0-2秒】`+`【2-5秒】` → 5 seconds
+1. Duration immediately following the tag line: `段1:0-5s` → 5s; `段1:3-8s` → 5s (duration markers will be removed from the prompt)
+2. In-segment time markers 0-based: `【0-2秒】`+`【2-5秒】` → 5s
 3. None → `chunk_frames / fps` as fallback
 
 **prompt_format Selection**
@@ -309,9 +309,9 @@ Audio Design:
 **❌ Incorrect Style (Conflicting Overlap)**
 
 ```text
-Segment 1: 3 seconds
+段1: 3s
 "Object A moves to position B"
-Segment 2: 3-6 seconds
+段2: 3-6s
 "Object A moves to position B and then turns around at position B"
 ```
 
@@ -320,9 +320,9 @@ Segment 2: 3-6 seconds
 **✅ Correct Style (Seamless Progression)**
 
 ```text
-Segment 1: 3 seconds
+段1: 3s
 "Object A moves to position B and finally stops at position B" (emphasizing action closure)
-Segment 2: 3-6 seconds
+段2: 3-6s
 "After standing firm, Object A slowly turns direction" (directly describing the new action after the previous segment ends)
 ```
 
@@ -340,12 +340,12 @@ Segment 2: 3-6 seconds
 **❌ Incorrect Style (Implicit Inheritance)**
 
 ```text
-Segment 1[3s]: image1 is Object A, Object A is moving forward.
-Segment 2[3-6s]: Object A stops, turns to look at the camera. (No image1 written)
+段1[3s]: image1 is Object A, Object A is moving forward.
+段2[3-6s]: Object A stops, turns to look at the camera. (No image1 written)
 ```
 
 **✅ Correct Style (Explicit Per-Segment)**
 
 ```text
-Segment 1[3s]: image1 is Object A, Object A is moving forward.
-Segment 2[3-6s]: image1 is Object A, Object A stops, turns to look at the camera.
+段1[3s]: image1 is Object A, Object A is moving forward.
+段2[3-6s]: image1 is Object A, Object A stops, turns to look at the camera.
