@@ -60,7 +60,7 @@ def normalize_x0(model, x0, samples=None):
             pass
         return x0
     except Exception as e:
-        print(f"[H3-FaceFix] x0 规范化失败: {e}")
+        print(f"[H3-FaceFix] x0 normalization failed: {e}\n[H3-FaceFix] x0 规范化失败: {e}")
         return None
 
 
@@ -181,12 +181,12 @@ def encode_frames_adaptive(vae, frames, want_t=None, tag=""):
             if lat.dim() == 4:
                 lat = lat.unsqueeze(2)
             if lat.dim() == 5 and (want_t is None or int(lat.shape[2]) == want_t):
-                print(f"[H3-Enc]{tag} 布局={t_} → {tuple(lat.shape)} ok")
+                print(f"[H3-Enc]{tag} layout={t_} → {tuple(lat.shape)} ok\n[H3-Enc]{tag} 布局={t_} → {tuple(lat.shape)} ok")
                 return lat
             errs.append(f"{t_}→{tuple(lat.shape)}")
         except Exception as e:
             errs.append(f"{t_}→{type(e).__name__}: {e}")
-    print(f"[H3-Enc]{tag} 全部布局失败 (want_t={want_t}, 输入{tuple(frames.shape)}): {errs}")
+    print(f"[H3-Enc]{tag} all layouts failed (want_t={want_t}, input {tuple(frames.shape)}): {errs}\n[H3-Enc]{tag} 全部布局失败 (want_t={want_t}, 输入{tuple(frames.shape)}): {errs}")
     return None
 
 

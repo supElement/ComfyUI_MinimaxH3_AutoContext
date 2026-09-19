@@ -104,7 +104,7 @@ def save_segment_latent_sync(cache_dir, seg_idx, samples, x0, metadata=None):
         torch.save(data, temp_path)
         os.replace(temp_path, path)  
     except Exception as e:
-        print(f"[H3-Cache] 保存段 {seg_idx} 失败: {e}")
+        print(f"[H3-Cache] Failed to save segment {seg_idx}: {e}\n[H3-Cache] 保存段 {seg_idx} 失败: {e}")
         if os.path.exists(temp_path):
             os.remove(temp_path)
 
@@ -122,7 +122,7 @@ def load_segment_latent(cache_dir, seg_idx, current_metadata=None):
     try:
         data = torch.load(path, map_location="cpu")
     except Exception as e:
-        print(f"[H3-Cache] 加载段 {seg_idx} 失败: {e}")
+        print(f"[H3-Cache] Failed to load segment {seg_idx}: {e}\n[H3-Cache] 加载段 {seg_idx} 失败: {e}")
         return None, None
 
     saved_meta = data.get("metadata", {})
@@ -145,12 +145,13 @@ def load_segment_latent(cache_dir, seg_idx, current_metadata=None):
         for k in current_metadata.keys():
             if k in sensitive_keys:
                 if saved_meta.get(k) != current_metadata[k]:
-                    print(f"   Mismatch on key: {k}, saved={saved_meta.get(k)}, current={current_metadata[k]}")
+                    print(f"   Mismatch on key: {k}, saved={saved_meta.get(k)}, current={current_metadata[k]}"
+                          f"\n   键 {k} 不一致: 已保存={saved_meta.get(k)}, 当前={current_metadata[k]}")
                     mismatch = True
                     break
 
         if mismatch:
-            print("\033[33m" + f"[H3-Cache] 段 {seg_idx+1} 参数或输入指纹变更，删除旧缓存" + "\033[0m")
+            print("\033[33m" + f"[H3-Cache] Segment {seg_idx+1} parameters or input fingerprint changed, deleting stale cache\n[H3-Cache] 段 {seg_idx+1} 参数或输入指纹变更，删除旧缓存" + "\033[0m")
             try:
                 os.remove(path)
             except:
@@ -181,7 +182,7 @@ def _save_worker():
         except queue.Empty:
             continue
         except Exception as e:
-            print(f"[H3-Cache] 异步保存线程异常: {e}")
+            print(f"[H3-Cache] Async save thread error: {e}\n[H3-Cache] 异步保存线程异常: {e}")
 
 def start_save_thread():
     """启动后台保存线程（只启动一次）"""

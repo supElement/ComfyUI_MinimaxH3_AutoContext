@@ -5,13 +5,16 @@ try:
     from .seam_correction import H3SeamCorrection
 except ImportError:
     H3SeamCorrection = None
-    print("[H3-AutoContext] 警告：H3SeamCorrection 加载失败，请检查依赖（如 transnetv2-pytorch）。")
+    print("[H3-AutoContext] Warning: H3SeamCorrection failed to load, check its dependencies (e.g. transnetv2-pytorch).\n"
+          "[H3-AutoContext] 警告：H3SeamCorrection 加载失败，请检查依赖（如 transnetv2-pytorch）。")
 
 try:
     from .h3_tst_patch import H3TSTPatch
 except ImportError:
     H3TSTPatch = None
-    print("[H3-AutoContext] 警告：H3TSTPatch 加载失败，TST 注意力校正不可用"
+    print("[H3-AutoContext] Warning: H3TSTPatch failed to load, TST attention correction is unavailable"
+          " (a newer ComfyUI is required: it depends on comfy_api.latest and comfy.patcher_extension).\n"
+          "[H3-AutoContext] 警告：H3TSTPatch 加载失败，TST 注意力校正不可用"
           "（需要较新版本 ComfyUI：依赖 comfy_api.latest 与 comfy.patcher_extension）。")
 
 NODE_CLASS_MAPPINGS = {
@@ -32,7 +35,7 @@ try:
     NODE_CLASS_MAPPINGS["H3FaceResample"] = H3FaceResample
     NODE_CLASS_MAPPINGS["H3FaceBlend"] = H3FaceBlend
 except Exception as _e:
-    print(f"[H3-AutoContext] 警告：修脸三节点加载失败: {_e}")
+    print(f"[H3-AutoContext] Warning: the three face-fix nodes failed to load: {_e}\n[H3-AutoContext] 警告：修脸三节点加载失败: {_e}")
 
 
 WEB_DIRECTORY = "./web/js"

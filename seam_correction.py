@@ -306,7 +306,7 @@ def _correct_exposure(images, seams, edit_points, mode, method, strength,
     if mode == "anchor":
         ref = _sample_window_pixels(images, micro[0][0], micro[0][1], device)
         if ref is None:
-            print("[H3-Seam] 锚点段有效像素不足，跳过曝光修正")
+            print("[H3-Seam] Anchor segment has too few valid pixels, skipping exposure correction\n[H3-Seam] 锚点段有效像素不足，跳过曝光修正")
             return logs
         for i in range(1, len(micro)):
             s, e = micro[i]
@@ -649,13 +649,13 @@ def _detect_shot_cuts(images, threshold, device, min_gap=_CUT_MIN_GAP):
                 except PermissionError:
                     time.sleep(0.1)  
             else:
-                print(f"[H3-Seam] 警告：临时文件 {tmp_path} 未能删除（可手动清理）")
+                print(f"[H3-Seam] WARNING: temporary file {tmp_path} could not be deleted (clean up manually)\n[H3-Seam] 警告：临时文件 {tmp_path} 未能删除（可手动清理）")
 
-        print(f"[H3-Seam] PySceneDetect 检测到切镜: {cuts}")
+        print(f"[H3-Seam] PySceneDetect detected cuts: {cuts}\n[H3-Seam] PySceneDetect 检测到切镜: {cuts}")
         return cuts
 
     except Exception as e:
-        print(f"[H3-Seam] PySceneDetect 依赖异常: {e}")
+        print(f"[H3-Seam] PySceneDetect dependency error: {e}\n[H3-Seam] PySceneDetect 依赖异常: {e}")
         # 清理资源
         if video is not None:
             try:
@@ -1069,15 +1069,20 @@ def _spatial_similarity(images, left_start, left_end, right_start, right_end, de
 
 # ---------- 预设与工具提示 ----------
 _PHOTO_TOOLTIP = (
-    "色彩/曝光处理档位。"
+    "Color/exposure correction preset."
+    "\n色彩/曝光处理档位。"
 )
 
 _SEAM_TOOLTIP = (
-    "接缝连续性处理。基于光流对齐+局部融合，修补运动/结构不连续。"
+    "Seam continuity handling. Optical-flow alignment + local blending "
+    "to repair motion/structure discontinuities."
+    "\n接缝连续性处理。基于光流对齐+局部融合，修补运动/结构不连续。"
 )
 
 _FLASH_TOOLTIP = (
-    "闪帧处理，若画面有闪电、爆炸等合理快速明暗变化，抑制会削平这些效果。"
+    "Flash-frame handling. If the footage has intentional fast brightness "
+    "changes such as lightning or explosions, suppression will flatten them."
+    "\n闪帧处理，若画面有闪电、爆炸等合理快速明暗变化，抑制会削平这些效果。"
 )
 
 _CUT_DETECT_TOOLTIP = (
@@ -1116,14 +1121,18 @@ class H3SeamCorrection(io.ComfyNode):
             display_name="Minimax_H3_Seam_Correction",
             category="MinimaxH3_AutoContext",
             description=(
-                "Minimax H3 段间接缝修正："
+                "Minimax H3 inter-segment seam correction: "
+                "segment-level global exposure/color alignment (MKL) + "
+                "seam-local optical-flow warp/blend"
+                "\nMinimax H3 段间接缝修正："
                 "分段全局曝光/色彩对齐 (MKL) + "
                 "接缝局部光流 warp/blend"
             ),
             inputs=[
                 io.Image.Input(
                     "images",
-                    tooltip="解码后的完整视频帧 (接 VAE Decode 输出)",
+                    tooltip="Decoded full video frames (connect VAE Decode output)"
+                            "\n解码后的完整视频帧 (接 VAE Decode 输出)",
                 ),
                 io.Combo.Input(
                     "fix_color_preset",
@@ -1148,7 +1157,8 @@ class H3SeamCorrection(io.ComfyNode):
                     min=0.0,
                     max=1.0,
                     step=0.01,
-                    tooltip="瞬态修正筛选阈值,值越小越激进,推荐 0.20~0.40。",
+                    tooltip="Transient-fix filter threshold, smaller is more aggressive, recommended 0.20~0.40."
+                            "\n瞬态修正筛选阈值,值越小越激进,推荐 0.20~0.40。",
                 ),
                 
                 io.Float.Input(
@@ -1157,7 +1167,8 @@ class H3SeamCorrection(io.ComfyNode):
                     min=5.0,
                     max=50.0,
                     step=0.5,
-                    tooltip="镜头检测敏感度，值越小越敏感，推荐 10~20",
+                    tooltip="Shot-detection sensitivity, smaller is more sensitive, recommended 10~20"
+                            "\n镜头检测敏感度，值越小越敏感，推荐 10~20",
                 ),
                 io.Int.Input(
                     "blend_frames",
@@ -1166,14 +1177,18 @@ class H3SeamCorrection(io.ComfyNode):
                     max=8,
                     step=1,
                     tooltip=(
-                        "接缝处电平渐变窗口 (帧)。值越大过渡越缓、"
+                        "Seam level-ramp window (frames). Larger values transition "
+                        "more smoothly, but too large on high-motion shots causes "
+                        "slight blurring."
+                        "\n接缝处电平渐变窗口 (帧)。值越大过渡越缓、"
                         "但运动大的镜头过大会带来轻微糊感。"
                     ),
                 ),
                 io.Boolean.Input(
                     "use_gpu",
                     default=True,
-                    tooltip="使用 CUDA GPU 进行统计、色彩变换与光流",
+                    tooltip="Run statistics, color transforms and optical flow on CUDA GPU"
+                            "\n使用 CUDA GPU 进行统计、色彩变换与光流",
                 ),
             ],
             outputs=[
@@ -1212,6 +1227,9 @@ class H3SeamCorrection(io.ComfyNode):
         if device.type != "cuda":
             print(
                 "[H3-Seam] WARNING: GPU disabled or "
+                "CUDA unavailable; statistics and optical flow will run on "
+                "the input device"
+                "\n[H3-Seam] WARNING: GPU disabled or "
                 "CUDA unavailable; 统计与光流将在输入设备上运行"
             )
 
@@ -1226,16 +1244,20 @@ class H3SeamCorrection(io.ComfyNode):
             f"flash={'on' if fix_flash else 'off'}, "
             f"flash_threshold={flash_threshold:.2f}, "
             f"blend={blend_frames}"
+            f"\n[H3-Seam] 设备={device}, 帧数={n_frames}, "
+            f"色彩={fix_color_preset}, 运动={fix_motion_preset}, "
+            f"闪帧={'on' if fix_flash else 'off'}, "
+            f"闪帧阈值={flash_threshold:.2f}, 混合={blend_frames}"
         )
 
         min_gap = max(4, _DETECT_WINDOW)
         
         if cut_detection:
-            print("[H3-Seam] 使用 PySceneDetect 进行镜头检测")
+            print("[H3-Seam] Running shot detection with PySceneDetect\n[H3-Seam] 使用 PySceneDetect 进行镜头检测")
             cuts = _detect_shot_cuts(images, cut_threshold, device)
         
             if cuts is None:
-                print("[H3-Seam] PySceneDetect 异常，回退到台阶检测")
+                print("[H3-Seam] PySceneDetect error, falling back to step detection\n[H3-Seam] PySceneDetect 异常，回退到台阶检测")
                 stats = _frame_stats(images, device)
                 steps, z = _detect_step_boundaries(stats, _DETECT_WINDOW, _DETECT_Z, min_gap)
                 steps = [s + 1 for s in steps if s + 1 < n_frames]
@@ -1243,12 +1265,12 @@ class H3SeamCorrection(io.ComfyNode):
                 seams = list(boundaries)
                 edit_points = sorted(boundaries)
                 if not seams:
-                    print("[H3-Seam] 台阶检测也未找到接缝，原样输出")
+                    print("[H3-Seam] Step detection found no seam either, outputting unchanged\n[H3-Seam] 台阶检测也未找到接缝，原样输出")
                     return io.NodeOutput(images)
 
             else:
                 if not cuts:
-                    print("[H3-Seam] PySceneDetect 未检测到任何切点")
+                    print("[H3-Seam] PySceneDetect detected no cut\n[H3-Seam] PySceneDetect 未检测到任何切点")
                     seams = []
                     edit_points = []
                 else:
@@ -1267,11 +1289,11 @@ class H3SeamCorrection(io.ComfyNode):
                         )
                         if corr > 0.60:
                             seams.append(c)
-                            print(f"[H3-Seam] 边界 {c} 确认为同镜头色差 (相关系数={corr:.3f}) → 启用色彩修正")
+                            print(f"[H3-Seam] Boundary {c} confirmed as same-shot color difference (correlation={corr:.3f}) -> color correction enabled\n[H3-Seam] 边界 {c} 确认为同镜头色差 (相关系数={corr:.3f}) → 启用色彩修正")
                         else:
-                            print(f"[H3-Seam] 边界 {c} 为真实切镜 (相关系数={corr:.3f}) → 跳过修正")
+                            print(f"[H3-Seam] Boundary {c} is a real shot cut (correlation={corr:.3f}) -> correction skipped\n[H3-Seam] 边界 {c} 为真实切镜 (相关系数={corr:.3f}) → 跳过修正")
                     if not seams:
-                        print("[H3-Seam] 所有边界均为真实切镜")
+                        print("[H3-Seam] All boundaries are real shot cuts\n[H3-Seam] 所有边界均为真实切镜")
         else:
             stats = _frame_stats(images, device)
             steps, z = _detect_step_boundaries(stats, _DETECT_WINDOW, _DETECT_Z, min_gap)
@@ -1280,11 +1302,12 @@ class H3SeamCorrection(io.ComfyNode):
             seams = list(boundaries)
             edit_points = sorted(boundaries)
             if not seams:
-                print("[H3-Seam] 未检测到接缝")
+                print("[H3-Seam] No seam detected\n[H3-Seam] 未检测到接缝")
 
         if photo is None and seam is None and not fix_flash:
             print(
-                "[H3-Seam] 三项处理均为 off -> 画面原样输出"
+                "[H3-Seam] All three stages are off -> output frames unchanged"
+                "\n[H3-Seam] 三项处理均为 off -> 画面原样输出"
             )
             return io.NodeOutput(images)
 
@@ -1296,18 +1319,30 @@ class H3SeamCorrection(io.ComfyNode):
                 out, seams, float(photo["strength"]), device)
             after = _luma_series(out, 0, n_frames, device)
             print(
-                f"[H3-Seam] color[max] 全片逐帧电平归一化 -> 锚点电平="
+                f"[H3-Seam] color[max] whole-clip per-frame level normalization -> anchor level="
+                f"({float(ref[0]):.4f},{float(ref[1]):.4f},{float(ref[2]):.4f})"
+                f"\n[H3-Seam] color[max] 全片逐帧电平归一化 -> 锚点电平="
                 f"({float(ref[0]):.4f},{float(ref[1]):.4f},{float(ref[2]):.4f})"
             )
             print(
-                f"[H3-Seam] color[max] 全片亮度极差 "
+                f"[H3-Seam] color[max] whole-clip luma range "
+                f"{float(before.max() - before.min()):.4f} -> "
+                f"{float(after.max() - after.min()):.4f}  "
+                f"(gain range {float(gain.min()):.2f}~{float(gain.max()):.2f})"
+                f"\n[H3-Seam] color[max] 全片亮度极差 "
                 f"{float(before.max() - before.min()):.4f} -> "
                 f"{float(after.max() - after.min()):.4f}  "
                 f"(增益范围 {float(gain.min()):.2f}~{float(gain.max()):.2f})"
             )
             if clipped:
                 print(
-                    f"[H3-Seam] color[max] 警告: {clipped}/{n_frames} 帧所需增益"
+                    f"[H3-Seam] color[max] WARNING: {clipped}/{n_frames} frames need gain"
+                    f" above the safe limit {_GAIN_MAX}x; only partial brightening was applied."
+                    f" These frames are crushed to near black, their pixel information is"
+                    f" already lost and post-processing cannot recover it -- fix it in the"
+                    f" generation stage (rerun the segment / increase context_frames /"
+                    f" anchor exposure with a reference image)"
+                    f"\n[H3-Seam] color[max] 警告: {clipped}/{n_frames} 帧所需增益"
                     f"超出安全上限 {_GAIN_MAX}x，只做了部分提亮。"
                     f"这些帧已被压到近黑、像素信息已丢失，后处理无法恢复 —— "
                     f"需要在生成阶段解决 (重跑该段 / 加大 context_frames / "
@@ -1331,17 +1366,20 @@ class H3SeamCorrection(io.ComfyNode):
                 int(blend_frames),
             )
             if not logs:
-                print("[H3-Seam] 色彩曝光对齐: 未产生有效修正")
+                print("[H3-Seam] Color/exposure alignment: no valid correction produced\n[H3-Seam] 色彩曝光对齐: 未产生有效修正")
             for bnd, s, e, a, b, warn in logs:
                 diag, luma_out = _describe_transform(a, b)
                 after = _boundary_step(out, bnd, stat_window, device)
                 print(
-                    f"[H3-Seam] color 帧{bnd} -> 段[{s},{e}): "
+                    f"[H3-Seam] color frame{bnd} -> segment[{s},{e}): "
+                    f"gain=({diag[0]:.3f},{diag[1]:.3f},{diag[2]:.3f}) "
+                    f"luma step {before.get(int(bnd), 0.0):+.4f} -> {after:+.4f}"
+                    f"\n[H3-Seam] color 帧{bnd} -> 段[{s},{e}): "
                     f"gain=({diag[0]:.3f},{diag[1]:.3f},{diag[2]:.3f}) "
                     f"亮度台阶 {before.get(int(bnd), 0.0):+.4f} -> {after:+.4f}"
                 )
                 if warn:
-                    print(f"[H3-Seam] 帧{bnd} 安全闸门: {warn}")
+                    print(f"[H3-Seam] frame{bnd} safety gate: {warn}\n[H3-Seam] 帧{bnd} 安全闸门: {warn}")
 
         if fix_flash:
             stats_after = _frame_stats(out, device)
@@ -1372,9 +1410,9 @@ class H3SeamCorrection(io.ComfyNode):
                         avg_adj = (prev + nxt) / 2.0
                         result = curr * (1 - mask) + avg_adj * mask
                         out[f, ..., :3] = result.clamp(0.0, 1.0).to(out.dtype)
-                        print(f"[H3-Seam] 局部修正: 帧{f}，异常像素占比 {abnormal_ratio:.2%}")
+                        print(f"[H3-Seam] local fix: frame{f}, abnormal pixel ratio {abnormal_ratio:.2%}\n[H3-Seam] 局部修正: 帧{f}，异常像素占比 {abnormal_ratio:.2%}")
             else:
-                print("[H3-Seam] color后未检测到瞬态")
+                print("[H3-Seam] no transient frame detected after color correction\n[H3-Seam] color后未检测到瞬态")
 
         if seam is not None or fix_flash:
             actions = []
@@ -1405,7 +1443,7 @@ class H3SeamCorrection(io.ComfyNode):
                 )
                 actions.append((b, kind, f"{label} delta={delta:.3f}"))
             for b, kind, action in actions:
-                print(f"[H3-Seam] 帧{b}: {kind} -> {action}")
+                print(f"[H3-Seam] frame{b}: {kind} -> {action}\n[H3-Seam] 帧{b}: {kind} -> {action}")
 
         if device.type == "cuda":
             torch.cuda.synchronize()

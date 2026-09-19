@@ -207,7 +207,9 @@ def _filter_refs_official(window_prompt, ref_img_data, ref_vid_data, ref_aud_lat
         if s in subj_map:
             referenced_pics.update(subj_map[s])
         else:
-            print(f"[H3-Auto] 警告: <Subject {s}> 未在 subject_definitions 中定义, "
+            print(f"[H3-Auto] Warning: <Subject {s}> is not defined in subject_definitions, "
+                  f"cannot resolve its reference image\n"
+                  f"[H3-Auto] 警告: <Subject {s}> 未在 subject_definitions 中定义, "
                   f"无法确定对应参考图")
 
     # if not referenced_pics:
@@ -218,7 +220,10 @@ def _filter_refs_official(window_prompt, ref_img_data, ref_vid_data, ref_aud_lat
 
     missing = sorted(i for i in referenced_pics if i >= len(all_imgs))
     if missing:
-        print(f"[H3-Auto] 警告: 引用了不存在的参考图 "
+        print(f"[H3-Auto] Warning: referenced non-existent reference image "
+              f"{['<Picture ' + str(i + 1) + '>' for i in missing]} "
+              f"(only {len(all_imgs)} available)\n"
+              f"[H3-Auto] 警告: 引用了不存在的参考图 "
               f"{['<Picture ' + str(i + 1) + '>' for i in missing]} "
               f"(实际只有 {len(all_imgs)} 张)")
 
@@ -246,7 +251,11 @@ def _filter_refs_official(window_prompt, ref_img_data, ref_vid_data, ref_aud_lat
     new_prompt = '\n'.join(result_lines)
 
     skipped = [i for i in range(len(all_imgs)) if i not in referenced_pics]
-    print(f"[H3-Auto] 参考图过滤(官方标签): "
+    print(f"[H3-Auto] Reference image filter (official tags): "
+          f"Subject refs={['<Subject ' + str(s) + '>' for s in referenced_subjs]} "
+          f"passed={['<Picture ' + str(i + 1) + '>' for i in valid]} "
+          f"skipped={[i + 1 for i in skipped]}\n"
+          f"[H3-Auto] 参考图过滤(官方标签): "
           f"Subject引用={['<Subject ' + str(s) + '>' for s in referenced_subjs]} "
           f"传递={['<Picture ' + str(i + 1) + '>' for i in valid]} "
           f"跳过={[i + 1 for i in skipped]}")
@@ -272,7 +281,7 @@ def _filter_pictures_simple(prompt, ref_img_data, fmt):
         if 1 <= num <= len(all_imgs):
             referenced.add(num)
         else:
-            print(f"[H3-Auto] 警告: 引用了不存在的参考图 {num} (共 {len(all_imgs)} 张)")
+            print(f"[H3-Auto] Warning: referenced non-existent reference image {num} ({len(all_imgs)} available)\n[H3-Auto] 警告: 引用了不存在的参考图 {num} (共 {len(all_imgs)} 张)")
 
     if not referenced:
         return all_imgs, prompt
@@ -282,7 +291,7 @@ def _filter_pictures_simple(prompt, ref_img_data, fmt):
     filtered = [all_imgs[i - 1] for i in ordered]
 
     skipped = [i for i in range(1, len(all_imgs) + 1) if i not in referenced]
-    print(f"[H3-Auto] 参考图过滤: 引用={ordered} 传递={ordered} 跳过={skipped}")
+    print(f"[H3-Auto] Reference image filter: referenced={ordered} passed={ordered} skipped={skipped}\n[H3-Auto] 参考图过滤: 引用={ordered} 传递={ordered} 跳过={skipped}")
 
     new_prompt = _render_all_mentions(prompt, mentions, {"picture": index_map}, fmt)
     return filtered, new_prompt
@@ -319,14 +328,14 @@ def _filter_video_audio(prompt, ref_vid_data, ref_aud_data, fmt):
         if 1 <= num <= len(videos):
             referenced_videos.add(num)
         else:
-            print(f"[H3-Auto] 警告: 引用了不存在的参考视频 {num} (共 {len(videos)} 个)")
+            print(f"[H3-Auto] Warning: referenced non-existent reference video {num} ({len(videos)} available)\n[H3-Auto] 警告: 引用了不存在的参考视频 {num} (共 {len(videos)} 个)")
 
     referenced_audio_slots = set()
     for _, num, *_ in audio_mentions:
         if 1 <= num <= len(audio_slots):
             referenced_audio_slots.add(num - 1)
         else:
-            print(f"[H3-Auto] 警告: 引用了不存在的参考音频 {num} (共 {len(audio_slots)} 个)")
+            print(f"[H3-Auto] Warning: referenced non-existent reference audio {num} ({len(audio_slots)} available)\n[H3-Auto] 警告: 引用了不存在的参考音频 {num} (共 {len(audio_slots)} 个)")
 
     kept_videos = set(v - 1 for v in referenced_videos)
     for slot_idx in referenced_audio_slots:
@@ -357,7 +366,7 @@ def _filter_video_audio(prompt, ref_vid_data, ref_aud_data, fmt):
     passed_v = [i + 1 for i in kept_videos]
     passed_a = [audio_slots[s][1] + 1 for s in kept_audio_slots
                 if audio_slots[s][0] == "standalone"]
-    print(f"[H3-Auto] 参考视频/音频过滤: 视频传递={passed_v} 独立音频传递={passed_a}")
+    print(f"[H3-Auto] Reference video/audio filter: videos passed={passed_v} standalone audios passed={passed_a}\n[H3-Auto] 参考视频/音频过滤: 视频传递={passed_v} 独立音频传递={passed_a}")
 
     new_prompt = _render_all_mentions(
         prompt, video_mentions + audio_mentions,
@@ -400,7 +409,7 @@ def _load_video_clip(video_tensor, num_frames, from_end=False, target_w=None, ta
         return None
     total = video_tensor.shape[0]
     if total < num_frames:
-        print(f"[H3-Auto] 警告: 视频帧数 {total} < 需求 {num_frames}，将循环复制补齐（建议提供足够帧数）")
+        print(f"[H3-Auto] Warning: video has {total} frames < required {num_frames}, will loop-repeat to pad (please provide enough frames)\n[H3-Auto] 警告: 视频帧数 {total} < 需求 {num_frames}，将循环复制补齐（建议提供足够帧数）")
         indices = list(range(total)) * (num_frames // total + 1)
         video_tensor = video_tensor[indices[:num_frames]]
     if from_end:
@@ -520,9 +529,9 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
             if len(ref_videos) >= 1:
                 if process_guide(ref_videos[0], from_end=True, base_frame_index=0, vid_idx=0, is_pre=True):
                     guide_indices.add(0)
-                    print(f"[H3-Auto] 前段锚定: 取video 1尾部 {ctx_frames} 帧")
+                    print(f"[H3-Auto] Pre-guide anchor: taking last {ctx_frames} frames of video 1\n[H3-Auto] 前段锚定: 取video 1尾部 {ctx_frames} 帧")
             else:
-                print(f"[H3-Auto] 警告: pre_guide/pre_post_guide 需要至少1个参考视频，当前为0，已忽略前段引导")
+                print(f"[H3-Auto] Warning: pre_guide/pre_post_guide needs at least 1 reference video, got 0, pre-guide ignored\n[H3-Auto] 警告: pre_guide/pre_post_guide 需要至少1个参考视频，当前为0，已忽略前段引导")
 
         # 2. 后段引导（锚定结尾）
         if video_guide in ["post_guide", "pre_post_guide"]:
@@ -531,9 +540,9 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
                 # 注意：这里不计算 start_idx，只处理视频，稍后在第二阶段生成 Keyframes
                 if process_guide(ref_videos[vid_idx], from_end=False, base_frame_index=0, vid_idx=vid_idx, is_pre=False):
                     guide_indices.add(vid_idx)
-                    print(f"[H3-Auto] 后段锚定: 取video {vid_idx+1}头部 {ctx_frames} 帧")
+                    print(f"[H3-Auto] Post-guide anchor: taking first {ctx_frames} frames of video {vid_idx+1}\n[H3-Auto] 后段锚定: 取video {vid_idx+1}头部 {ctx_frames} 帧")
             else:
-                print(f"[H3-Auto] 警告: post_guide/pre_post_guide 需要索引{vid_idx+1}的视频，当前只有 {len(ref_videos)} 个，已忽略后段引导")
+                print(f"[H3-Auto] Warning: post_guide/pre_post_guide needs video {vid_idx+1}, only {len(ref_videos)} available, post-guide ignored\n[H3-Auto] 警告: post_guide/pre_post_guide 需要索引{vid_idx+1}的视频，当前只有 {len(ref_videos)} 个，已忽略后段引导")
 
     else:
         pass
@@ -544,7 +553,7 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
     if is_second_pass:
         v_in, _ = h3_conditioning.unpack_nested_latent(latent_input)
         if v_in is None:
-            print("[H3-Auto] 警告: latent_input 无视频 latent，回退一采")
+            print("[H3-Auto] Warning: latent_input has no video latent, falling back to first pass\n[H3-Auto] 警告: latent_input 无视频 latent，回退一采")
             is_second_pass = False
             latent_w = width // SPATIAL_COMPRESSION
             latent_h = height // SPATIAL_COMPRESSION
@@ -552,7 +561,11 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
             latent_w = int(v_in.shape[4])
             latent_h = int(v_in.shape[3])
             if latent_w % 2 != 0 or latent_h % 2 != 0:
-                print(f"[H3-Auto] 警告: 输入 latent 尺寸 {latent_w}x{latent_h} 为奇数，"
+                print(f"[H3-Auto] Warning: input latent size {latent_w}x{latent_h} is odd, "
+                      f"H3 requires even (patch_size=2). Padded by edge replication to "
+                      f"{latent_w + (latent_w % 2)}x{latent_h + (latent_h % 2)}; "
+                      f"a 32-aligned resolution (e.g. 1920x1088) is recommended\n"
+                      f"[H3-Auto] 警告: 输入 latent 尺寸 {latent_w}x{latent_h} 为奇数，"
                       f"H3 需偶数 (patch_size=2)。已按边缘复制对齐到 "
                       f"{latent_w + (latent_w % 2)}x{latent_h + (latent_h % 2)}；"
                       f"建议改用 32 对齐分辨率 (如 1920x1088)")
@@ -562,40 +575,40 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
                 latent_h = int(v_in.shape[3])
             width = latent_w * SPATIAL_COMPRESSION
             height = latent_h * SPATIAL_COMPRESSION
-            print(f"[H3-Auto] 二采模式: 空间分辨率以输入 latent 为准 {width}x{height}")
+            print(f"[H3-Auto] Second pass: spatial resolution taken from input latent {width}x{height}\n[H3-Auto] 二采模式: 空间分辨率以输入 latent 为准 {width}x{height}")
     else:
         latent_w = width // SPATIAL_COMPRESSION
         latent_h = height // SPATIAL_COMPRESSION
 
     if first_frame is not None or last_frame is not None:
-        print("[H3-Auto] 正在 VAE 编码首/尾帧...")
+        print("[H3-Auto] VAE encoding first/last frame...\n[H3-Auto] 正在 VAE 编码首/尾帧...")
     first_latent = _encode_image(vae, first_frame, device, target_w=width, target_h=height,
                                  crop_mode=crop_mode)
     last_latent = _encode_image(vae, last_frame, device, target_w=width, target_h=height,
                                 crop_mode=crop_mode)
 
     if ref_images:
-        print(f"[H3-Auto] 正在 VAE 编码参考图 ({len(ref_images)} 张)...")
+        print(f"[H3-Auto] VAE encoding reference images ({len(ref_images)})...\n[H3-Auto] 正在 VAE 编码参考图 ({len(ref_images)} 张)...")
     ref_img_data = _prepare_ref_images(ref_images, vae, device, width, height, crop_mode)
 
     if ref_videos:
         if ref_sync_mode == "segmented":
-            print(f"[H3-Auto] 正在预处理参考视频 ({len(ref_videos)} 个, segmented 模式跳过全量编码)...")
+            print(f"[H3-Auto] Preprocessing reference videos ({len(ref_videos)}, segmented mode skips full encoding)...\n[H3-Auto] 正在预处理参考视频 ({len(ref_videos)} 个, segmented 模式跳过全量编码)...")
         else:
-            print(f"[H3-Auto] 正在 VAE 编码参考视频 ({len(ref_videos)} 个)...")
+            print(f"[H3-Auto] VAE encoding reference videos ({len(ref_videos)})...\n[H3-Auto] 正在 VAE 编码参考视频 ({len(ref_videos)} 个)...")
     ref_vid_data = _prepare_ref_videos(ref_videos, vae, audio_vae, device, width, height, fps,
                                        crop_mode, pre_encode=(ref_sync_mode != "segmented"))
 
     if ref_audios:
         if ref_sync_mode == "segmented":
-            print(f"[H3-Auto] 正在预处理独立参考音频 ({len(ref_audios)} 个, segmented 模式跳过全量编码)...")
+            print(f"[H3-Auto] Preprocessing standalone reference audios ({len(ref_audios)}, segmented mode skips full encoding)...\n[H3-Auto] 正在预处理独立参考音频 ({len(ref_audios)} 个, segmented 模式跳过全量编码)...")
         else:
-            print(f"[H3-Auto] 正在 VAE 编码独立参考音频 ({len(ref_audios)} 个)...")
+            print(f"[H3-Auto] VAE encoding standalone reference audios ({len(ref_audios)})...\n[H3-Auto] 正在 VAE 编码独立参考音频 ({len(ref_audios)} 个)...")
     ref_aud_data = _prepare_ref_audios(ref_audios, audio_vae, device,
                                        pre_encode=(ref_sync_mode != "segmented"))
     if extra_ref_audios:
         ref_aud_data.extend(extra_ref_audios)
-        print(f"[H3-Auto] 已将 {len(extra_ref_audios)} 段引导视频的音频合并到参考音频中")
+        print(f"[H3-Auto] Merged audio of {len(extra_ref_audios)} guide video(s) into reference audios\n[H3-Auto] 已将 {len(extra_ref_audios)} 段引导视频的音频合并到参考音频中")
 
     drive_waveform = None
     drive_sr = AUDIO_SAMPLE_RATE
@@ -603,7 +616,7 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
         getter = getattr(drive_audio, "get", None)
         wf = getter("waveform") if callable(getter) else None
         if wf is None:
-            print("[H3-Auto] 警告: audio_drive 已开启但 drive_audio 缺少波形数据，忽略音频锁定")
+            print("[H3-Auto] Warning: audio_drive is on but drive_audio has no waveform data, audio locking ignored\n[H3-Auto] 警告: audio_drive 已开启但 drive_audio 缺少波形数据，忽略音频锁定")
         else:
             sr = int(getter("sample_rate", AUDIO_SAMPLE_RATE))
             vae_sr = int(getattr(audio_vae, "audio_sample_rate", AUDIO_SAMPLE_RATE))
@@ -611,17 +624,21 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
                 try:
                     wf = torchaudio.functional.resample(wf, sr, vae_sr)
                 except Exception as e:
-                    print(f"[H3-Auto] 音频驱动重采样失败: {e}")
+                    print(f"[H3-Auto] Audio drive resample failed: {e}\n[H3-Auto] 音频驱动重采样失败: {e}")
             if wf.numel() == 0:
-                print("[H3-Auto] 警告: drive_audio 波形为空 (0 采样)，输出音频将为空")
+                print("[H3-Auto] Warning: drive_audio waveform is empty (0 samples), output audio will be empty\n[H3-Auto] 警告: drive_audio 波形为空 (0 采样)，输出音频将为空")
             elif torch.count_nonzero(wf) == 0:
-                print("[H3-Auto] 警告: drive_audio 波形全为零 (静音)，请检查源音频是否正确加载")
+                print("[H3-Auto] Warning: drive_audio waveform is all zeros (silent), check that the source audio loaded correctly\n[H3-Auto] 警告: drive_audio 波形全为零 (静音)，请检查源音频是否正确加载")
             drive_waveform = wf
             drive_sr = vae_sr
-            print(f"[H3-Auto] 音频驱动已开启: 源音频 {wf.shape[-1] / drive_sr:.2f}s @ {drive_sr}Hz "
+            print(f"[H3-Auto] Audio drive enabled: source audio {wf.shape[-1] / drive_sr:.2f}s @ {drive_sr}Hz "
+                  f"(shape={tuple(wf.shape)})\n"
+                  f"[H3-Auto] 音频驱动已开启: 源音频 {wf.shape[-1] / drive_sr:.2f}s @ {drive_sr}Hz "
                   f"(shape={tuple(wf.shape)})")
     elif drive_audio is not None:
-        print("[H3-Auto] 提示: drive_audio 已连接但 audio_drive=disable，未启用音频锁定。"
+        print("[H3-Auto] Note: drive_audio is connected but audio_drive=disable, audio locking is off. "
+              "Set audio_drive to enable to output the source audio on the audio port\n"
+              "[H3-Auto] 提示: drive_audio 已连接但 audio_drive=disable，未启用音频锁定。"
               "如需让 audio 端口输出源音频，请把 audio_drive 设为 enable")
 
     first_pass_segments = None
@@ -649,7 +666,7 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
         parsed = h3_utils.parse_prompt_with_globals(long_prompt)
         timeline_items = [item for item in parsed if item["type"] == "timeline"]
         if not timeline_items:
-            print("[H3-Auto] timeline 模式下未检测到时间标记，降级为 global 模式")
+            print("[H3-Auto] No time markers found in timeline mode, falling back to global mode\n[H3-Auto] timeline 模式下未检测到时间标记，降级为 global 模式")
             total_seconds = total_frames / fps
             schedule = h3_utils.build_prompt_schedule(long_prompt, total_seconds, mode="global")
             chunks, _ = h3_utils.compute_chunks(total_frames, chunk_frames, context_frames)
@@ -718,14 +735,14 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
             return h3_utils.compose_window_prompt(schedule, start_sec, end_sec, fmt=prompt_format)
 
     effective_new = [seg_sizes[0]] + [s - context_frames for s in seg_sizes[1:]]
-    print(f"[H3-Auto] clip_mode={clip_mode}, 段数={len(chunks)}, 实际采样={seg_sizes}, 实际输出={effective_new}, 总帧数={total_frames}")
+    print(f"[H3-Auto] clip_mode={clip_mode}, segments={len(chunks)}, sampled={seg_sizes}, produced={effective_new}, total_frames={total_frames}\n[H3-Auto] clip_mode={clip_mode}, 段数={len(chunks)}, 实际采样={seg_sizes}, 实际输出={effective_new}, 总帧数={total_frames}")
 
     # ==================== 二采切分（现在 seg_sizes 已知） ====================
     if is_second_pass:
         first_pass_segments = _split_first_pass_latent(
             latent_input, seg_sizes, context_frames, fps)
         if first_pass_segments is None or len(first_pass_segments) != len(chunks):
-            print("[H3-Auto] 错误: 二采切分失败 (输入 latent 与分段账目不匹配)，回退一采")
+            print("[H3-Auto] Error: second-pass split failed (input latent does not match segment accounting), falling back to first pass\n[H3-Auto] 错误: 二采切分失败 (输入 latent 与分段账目不匹配)，回退一采")
             is_second_pass = False
             first_pass_segments = None
 
@@ -734,7 +751,7 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
     # ============================================================
     external_keyframes = []  # 始终为空
     if video_guide != "none" and (pre_guide_full_latent is not None or post_guide_full_latent is not None):
-        print("[H3-Auto] 使用填充 Latent 进行头尾锚定，不额外生成 Keyframes")
+        print("[H3-Auto] Using padding latents for head/tail anchoring, no extra Keyframes generated\n[H3-Auto] 使用填充 Latent 进行头尾锚定，不额外生成 Keyframes")
 
     # ==================== 采样循环 ====================
     all_segments = []
@@ -750,7 +767,7 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
     if info is not None:
         upstream_fingerprint = info.get("upstream_fingerprint")
         if upstream_fingerprint:
-            print(f"[H3-Auto] 从上游 info 获取到 fingerprint: {upstream_fingerprint[:8]}...")
+            print(f"[H3-Auto] Got fingerprint from upstream info: {upstream_fingerprint[:8]}...\n[H3-Auto] 从上游 info 获取到 fingerprint: {upstream_fingerprint[:8]}...")
     
     force_regenerate = False
     for idx, (start_f, end_f) in enumerate(chunks):
@@ -766,7 +783,7 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
         account = f"帧数={seg_frames}"
         if not is_first_chunk:
             account += f" (锚定={context_frames}，有效帧数={seg_frames - context_frames})"
-        print(f"[H3-Auto] 生成段 {idx+1}/{len(chunks)} (帧{start_f}-{end_f}) {account}")
+        print(f"[H3-Auto] Generating segment {idx+1}/{len(chunks)} (frames {start_f}-{end_f}) {account}\n[H3-Auto] 生成段 {idx+1}/{len(chunks)} (帧{start_f}-{end_f}) {account}")
     
         # ==================== 提示词构建 ====================
         window_prompt = prompt_getter(idx)
@@ -774,7 +791,7 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
         seg_ref_vid, seg_ref_aud = ref_vid_data, ref_aud_data
         if ref_sync_mode == "segmented":
             if seg_ref_vid or seg_ref_aud:
-                print(f"[H3-Auto] 段 {idx+1}/{len(chunks)}: 正在切片并 VAE 编码参考视频/音频...")
+                print(f"[H3-Auto] Segment {idx+1}/{len(chunks)}: slicing and VAE encoding reference video/audio...\n[H3-Auto] 段 {idx+1}/{len(chunks)}: 正在切片并 VAE 编码参考视频/音频...")
             seg_start_ratio = start_f / total_frames if total_frames > 0 else 0.0
             seg_end_ratio = end_f / total_frames if total_frames > 0 else 0.0
             seg_ref_vid = _slice_ref_videos_for_segment(
@@ -787,7 +804,7 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
         seg_ref_img, seg_ref_vid, seg_ref_aud, window_prompt = _filter_refs_for_prompt(
             window_prompt, ref_img_data, seg_ref_vid, seg_ref_aud, fmt=prompt_format)
     
-        print("\033[32m" + f"[H3-Auto] ----- 段 {idx+1}/{len(chunks)} 完整提示词 ({len(window_prompt)}字) -----" + "\033[0m")
+        print("\033[32m" + f"[H3-Auto] ----- Segment {idx+1}/{len(chunks)} full prompt ({len(window_prompt)} chars) -----\n[H3-Auto] ----- 段 {idx+1}/{len(chunks)} 完整提示词 ({len(window_prompt)}字) -----" + "\033[0m")
         print(window_prompt)
         print(f"[H3-Auto] {'=' * 50}")
     
@@ -811,7 +828,7 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
                     seg_kfs.append(kf_copy)
             if seg_kfs:
                 seg_external_kfs = seg_kfs
-                print(f"[H3-Auto] 段 {idx+1}/{len(chunks)} 注入 {len(seg_kfs)} 个外部 Keyframes (相对索引: {[k['resolved_frame_index'] for k in seg_kfs]})")
+                print(f"[H3-Auto] Segment {idx+1}/{len(chunks)}: injecting {len(seg_kfs)} external Keyframes (relative indices: {[k['resolved_frame_index'] for k in seg_kfs]})\n[H3-Auto] 段 {idx+1}/{len(chunks)} 注入 {len(seg_kfs)} 个外部 Keyframes (相对索引: {[k['resolved_frame_index'] for k in seg_kfs]})")
 
         # ==================== 构建 conditioning payload ====================
         payload = h3_conditioning.build_conditioning_payload(
@@ -841,7 +858,7 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
             drive_aud_latent = _encode_drive_audio(
                 audio_vae, drive_waveform, drive_sr, gen_start / fps, gen_end / fps, device)
             if drive_aud_latent is None:
-                print(f"[H3-Auto] 段 {idx+1}/{len(chunks)}: drive_audio 切片为空，本段不锁定音频")
+                print(f"[H3-Auto] Segment {idx+1}/{len(chunks)}: drive_audio slice is empty, audio not locked for this segment\n[H3-Auto] 段 {idx+1}/{len(chunks)}: drive_audio 切片为空，本段不锁定音频")
     
         # ==================== 准备初始 latent ====================
         if is_second_pass:
@@ -1011,7 +1028,7 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
         if cached_samples is not None:
             segment_latent = cached_samples
             x0 = cached_x0
-            print("\033[33m" + f"[H3-Cache] 段 {idx+1}/{len(chunks)} 加载缓存，跳过采样" + "\033[0m")
+            print("\033[33m" + f"[H3-Cache] Segment {idx+1}/{len(chunks)} loaded from cache, skipping sampling\n[H3-Cache] 段 {idx+1}/{len(chunks)} 加载缓存，跳过采样" + "\033[0m")
         else:
             force_regenerate = True
             segment_latent = _sample_segment(
@@ -1026,7 +1043,7 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
                 metadata = current_meta.copy()
                 latent_cache.save_segment_latent_async(
                     cache_dir, idx, segment_latent, x0, metadata)
-                print("\033[33m" + f"[H3-Cache] 段 {idx+1}/{len(chunks)} 已提交异步保存" + "\033[0m")
+                print("\033[33m" + f"[H3-Cache] Segment {idx+1}/{len(chunks)} async save submitted\n[H3-Cache] 段 {idx+1}/{len(chunks)} 已提交异步保存" + "\033[0m")
     
         segment_fingerprints.append(f"{window_prompt_hash}_{conditions_hash}_{seg_frames}")
         
@@ -1065,7 +1082,7 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
     try:
         seam_info["segment_prompts"] = [prompt_getter(i) for i in range(len(chunks))]
     except Exception as _e:
-        print(f"[H3-Auto] segment_prompts 打包失败: {_e}")
+        print(f"[H3-Auto] segment_prompts packaging failed: {_e}\n[H3-Auto] segment_prompts 打包失败: {_e}")
         seam_info["segment_prompts"] = []
 
     
@@ -1079,12 +1096,12 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
         target_samples = int(round(total_frames / fps * drive_sr))
         drive_final_audio = {"waveform": _align_length(drive_waveform, target_samples, dim=-1),
                              "sample_rate": drive_sr}
-        print(f"[H3-Auto] 音频驱动: 源音频已锁进 latent，视频照它生成")
+        print(f"[H3-Auto] Audio drive: source audio locked into latent, video generated from it\n[H3-Auto] 音频驱动: 源音频已锁进 latent，视频照它生成")
 
     if not decode_output:
         return None, drive_final_audio, final_latent, final_denoised, seam_info
 
-    print("[H3-Auto] 开始逐段 VAE 解码与拼接...")
+    print("[H3-Auto] Starting per-segment VAE decode and merge...\n[H3-Auto] 开始逐段 VAE 解码与拼接...")
     all_pixels, all_waveforms = [], []
     for idx, seg in enumerate(all_segments):
         comfy.model_management.throw_exception_if_processing_interrupted()
@@ -1106,12 +1123,12 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
         extra = max(0, min(excess, last_avail))
         head_trims[-1] += extra
         if extra > 0:
-            print(f"[H3-Auto] 末段头部追加裁剪 {extra} 帧以保护尾帧锚点")
+            print(f"[H3-Auto] Extra head trim of {extra} frames on the last segment to protect the tail-frame anchor\n[H3-Auto] 末段头部追加裁剪 {extra} 帧以保护尾帧锚点")
 
     final_pixels = torch.cat([all_pixels[i][head_trims[i]:] for i in range(n_segs)], dim=0)
     if final_pixels.shape[0] > total_frames:
         final_pixels = final_pixels[:total_frames]
-    print(f"[H3-Auto] 视频拼接: 各段裁剪={head_trims} 最终={final_pixels.shape[0]}帧")
+    print(f"[H3-Auto] Video merge: head trims={head_trims} final={final_pixels.shape[0]} frames\n[H3-Auto] 视频拼接: 各段裁剪={head_trims} 最终={final_pixels.shape[0]}帧")
 
     if drive_final_audio is not None:
         final_audio = drive_final_audio
@@ -1219,7 +1236,7 @@ def _prepare_ref_videos(ref_videos, vae, audio_vae, device, gen_w, gen_h, fps,
 
         n = frames.shape[0]
         if n < 5:
-            print(f"[H3-Auto] 参考视频帧数 {n} < 5，跳过")
+            print(f"[H3-Auto] Reference video has {n} frames < 5, skipping\n[H3-Auto] 参考视频帧数 {n} < 5，跳过")
             continue
         while n % 17 != 5:
             n -= 1
@@ -1304,7 +1321,7 @@ def _encode_image(vae, image, device, target_w=None, target_h=None, crop_mode="d
             latent = latent.unsqueeze(2)
         return latent
     except Exception as e:
-        print(f"[H3-Auto] 图像 VAE 编码失败: {e}")
+        print(f"[H3-Auto] Image VAE encode failed: {e}\n[H3-Auto] 图像 VAE 编码失败: {e}")
         return None
 
 
@@ -1323,7 +1340,7 @@ def _encode_video_latent(vae, video, device):
             latent = latent.unsqueeze(2)
         return latent
     except Exception as e:
-        print(f"[H3-Auto] 视频 VAE 编码失败: {e}")
+        print(f"[H3-Auto] Video VAE encode failed: {e}\n[H3-Auto] 视频 VAE 编码失败: {e}")
         return None
 
 
@@ -1346,7 +1363,7 @@ def _encode_audio(audio_vae, audio_dict, device):
         try:
             waveform = torchaudio.functional.resample(waveform, sr, vae_sr)
         except Exception as e:
-            print(f"[H3-Auto] 音频重采样失败: {e}")
+            print(f"[H3-Auto] Audio resample failed: {e}\n[H3-Auto] 音频重采样失败: {e}")
 
     if waveform.shape[1] == 1:
         waveform = waveform.repeat(1, 2, 1)
@@ -1355,7 +1372,7 @@ def _encode_audio(audio_vae, audio_dict, device):
         z = audio_vae.encode(waveform[:1].movedim(1, -1))
         return z
     except Exception as e:
-        print(f"[H3-Auto] 音频 VAE 编码失败: {e}")
+        print(f"[H3-Auto] Audio VAE encode failed: {e}\n[H3-Auto] 音频 VAE 编码失败: {e}")
         return None
 
 
@@ -1368,7 +1385,10 @@ def _fit_audio_latent(encoded_audio, template_audio):
     if encoded_audio is None or encoded_audio.ndim != 4 or template_audio.ndim != 4:
         return None
     if encoded_audio.shape[1:-1] != template_audio.shape[1:-1]:
-        print(f"[H3-Auto] 警告: 音频 latent 布局不匹配，跳过锁定: "
+        print(f"[H3-Auto] Warning: audio latent layout mismatch, skipping lock: "
+              f"got {tuple(encoded_audio.shape)}, "
+              f"expected channels {tuple(template_audio.shape[1:-1])}\n"
+              f"[H3-Auto] 警告: 音频 latent 布局不匹配，跳过锁定: "
               f"got {tuple(encoded_audio.shape)}, "
               f"expected 通道 {tuple(template_audio.shape[1:-1])}")
         return None
@@ -1426,7 +1446,7 @@ def _decode_segment(vae, audio_vae, seg_latent, device):
             if pixels.shape[0] == 1:
                 pixels = pixels[0]
         except Exception as e:
-            print(f"[H3-Auto] 视频解码失败: {e}")
+            print(f"[H3-Auto] Video decode failed: {e}\n[H3-Auto] 视频解码失败: {e}")
             pixels = None
 
     waveform = None
@@ -1441,7 +1461,7 @@ def _decode_segment(vae, audio_vae, seg_latent, device):
             if waveform.dim() == 2:
                 waveform = waveform.unsqueeze(0)
         except Exception as e:
-            print(f"[H3-Auto] 音频解码失败: {e}")
+            print(f"[H3-Auto] Audio decode failed: {e}\n[H3-Auto] 音频解码失败: {e}")
             waveform = None
 
     return pixels, waveform
@@ -1480,7 +1500,7 @@ def _make_h3_empty_latent(latent_w, latent_h, pixel_frames, fps,
         head_tokens = min(ctx_v_tokens, v_t - 2)
         head_tokens = max(0, head_tokens)
         if head_tokens > 0:
-            print(f"[H3-Auto] 头部填充: 写入 {head_tokens} 个 Token (对应 {head_overlap_frames} 帧)")
+            print(f"[H3-Auto] Head padding: writing {head_tokens} tokens ({head_overlap_frames} frames)\n[H3-Auto] 头部填充: 写入 {head_tokens} 个 Token (对应 {head_overlap_frames} 帧)")
             video_latent[:, :, :head_tokens] = head_overlap_video[:, :, -head_tokens:].to(
                 device=video_latent.device, dtype=video_latent.dtype)
 
@@ -1492,7 +1512,7 @@ def _make_h3_empty_latent(latent_w, latent_h, pixel_frames, fps,
         tail_tokens = min(ctx_v_tokens, v_t - 2)
         tail_tokens = max(0, tail_tokens)
         if tail_tokens > 0:
-            print(f"[H3-Auto] 尾部填充: 写入 {tail_tokens} 个 Token (对应 {tail_overlap_frames} 帧)")
+            print(f"[H3-Auto] Tail padding: writing {tail_tokens} tokens ({tail_overlap_frames} frames)\n[H3-Auto] 尾部填充: 写入 {tail_tokens} 个 Token (对应 {tail_overlap_frames} 帧)")
             video_latent[:, :, -tail_tokens:] = tail_overlap_video[:, :, :tail_tokens].to(
                 device=video_latent.device, dtype=video_latent.dtype)
 
@@ -1698,13 +1718,13 @@ def _split_first_pass_latent(merged_latent, seg_sizes, effective_context, fps):
     expected_v = seg_v_tokens[0] + sum(
         seg_v_tokens[i] - min(ctx_v, seg_v_tokens[i] - 2) for i in range(1, n_seg))
     if int(v_all.shape[2]) != expected_v:
-        print(f"[H3-Auto] 二采切分失败: 视频 token 数 {int(v_all.shape[2])} ≠ 账目 {expected_v}")
+        print(f"[H3-Auto] Second-pass split failed: video token count {int(v_all.shape[2])} ≠ accounting {expected_v}\n[H3-Auto] 二采切分失败: 视频 token 数 {int(v_all.shape[2])} ≠ 账目 {expected_v}")
         return None
     if a_all is not None:
         expected_a = seg_a_tokens[0] + sum(
             seg_a_tokens[i] - min(ctx_a, seg_a_tokens[i] - 1) for i in range(1, n_seg))
         if int(a_all.shape[-1]) != expected_a:
-            print(f"[H3-Auto] 二采切分失败: 音频 token 数 {int(a_all.shape[-1])} ≠ 账目 {expected_a}")
+            print(f"[H3-Auto] Second-pass split failed: audio token count {int(a_all.shape[-1])} ≠ accounting {expected_a}\n[H3-Auto] 二采切分失败: 音频 token 数 {int(a_all.shape[-1])} ≠ 账目 {expected_a}")
             return None
 
     seg_v_lats = []
@@ -1784,7 +1804,9 @@ def _crossfade_audio(all_waveforms, head_trims, context_frames, total_frames, fp
 
     target_samples = int(total_frames / fps * sr)
     final_wave = _align_length(final_wave, target_samples, dim=-1)
-    print(f"[H3-Auto] 音频拼接: 重叠淡化={overlap}采样({overlap/sr:.2f}s) "
+    print(f"[H3-Auto] Audio merge: crossfade overlap={overlap} samples ({overlap/sr:.2f}s) "
+          f"final={final_wave.shape[-1]} samples ({final_wave.shape[-1]/sr:.2f}s)\n"
+          f"[H3-Auto] 音频拼接: 重叠淡化={overlap}采样({overlap/sr:.2f}s) "
           f"最终={final_wave.shape[-1]}采样({final_wave.shape[-1]/sr:.2f}s)")
     return {"waveform": final_wave, "sample_rate": sr}
 
@@ -1817,7 +1839,7 @@ def _slice_ref_videos_for_segment(ref_vid_data, start_ratio, end_ratio, vae, aud
 
         n = sliced.shape[0]
         if n < 5:
-            print(f"[H3-Auto] 分段参考视频帧数 {n} < 5，跳过")
+            print(f"[H3-Auto] Segmented reference video has {n} frames < 5, skipping\n[H3-Auto] 分段参考视频帧数 {n} < 5，跳过")
             continue
         while n % 17 != 5:
             n -= 1
@@ -1912,7 +1934,9 @@ def _merge_segment_latents(all_segments, effective_context, fps):
     except Exception:
         combined = (merged_v, merged_a)
 
-    print(f"[H3-Auto] Latent 拼接: video={merged_v.shape[2]} tokens, "
+    print(f"[H3-Auto] Latent merge: video={merged_v.shape[2]} tokens, "
+          f"audio={merged_a.shape[-1] if merged_a is not None else 0} tokens\n"
+          f"[H3-Auto] Latent 拼接: video={merged_v.shape[2]} tokens, "
           f"audio={merged_a.shape[-1] if merged_a is not None else 0} tokens")
 
     return {"samples": combined}

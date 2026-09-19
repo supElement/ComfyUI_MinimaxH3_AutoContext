@@ -109,7 +109,7 @@ def build_conditioning_payload(seed, frame_count,
             keyframes.append({"resolved_frame_index": 0, "latent": first_latent})
             if first_frame_pixel is not None:
                 images_for_clip.append(first_frame_pixel[:1])
-            print(f"[H3-Auto] 首帧 keyframe: pixel_index=0")
+            print(f"[H3-Auto] First-frame keyframe: pixel_index=0\n[H3-Auto] 首帧 keyframe: pixel_index=0")
 
         if prev_segment is not None:
             v_lat, a_lat = unpack_nested_latent(prev_segment)
@@ -147,10 +147,10 @@ def build_conditioning_payload(seed, frame_count,
             })
             if last_frame_pixel is not None:
                 images_for_clip.append(last_frame_pixel[:1])
-            print(f"[H3-Auto] 尾帧 keyframe: pixel_index={frame_count - 1} (段帧数={frame_count})")
+            print(f"[H3-Auto] Last-frame keyframe: pixel_index={frame_count - 1} (segment frames={frame_count})\n[H3-Auto] 尾帧 keyframe: pixel_index={frame_count - 1} (段帧数={frame_count})")
     else:
         keyframes = external_keyframes
-        print(f"[H3-Auto] 使用外部多帧强锚定: {len(keyframes)} 个 Keyframes")
+        print(f"[H3-Auto] Using external multi-frame hard anchoring: {len(keyframes)} keyframes\n[H3-Auto] 使用外部多帧强锚定: {len(keyframes)} 个 Keyframes")
 
     used_slots = len(refs)
     max_user_slots = max(0, MAX_REF_SLOTS - used_slots)
@@ -241,7 +241,7 @@ def encode_text_with_references(clip, text, ref_items_for_clip, device, images_f
     try:
         tokens = clip.tokenize(text, **tokenize_kwargs)
     except Exception as e:
-        print(f"[H3-Auto] Tokenize 警告 ({e})，降级为纯文本编码。")
+        print(f"[H3-Auto] Tokenize warning ({e}), falling back to plain-text encoding.\n[H3-Auto] Tokenize 警告 ({e})，降级为纯文本编码。")
         tokens = clip.tokenize(text)
 
     cond = clip.encode_from_tokens_scheduled(tokens)

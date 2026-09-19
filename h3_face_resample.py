@@ -50,7 +50,9 @@ def _normalize_sigmas(sigmas, device):
         raise ValueError("[H3-FaceResample] 首 σ 必须 > 0")
     if float(s[-1]) != 0.0:
         s = torch.cat([s, torch.zeros(1, device=device)])
-        print(f"[H3-FaceResample] sigmas 末值非 0, 自动补 0 (完整去噪): "
+        print(f"[H3-FaceResample] last sigma is not 0, appended 0 (full denoise): "
+              f"{[round(float(x), 4) for x in s]}\n"
+              f"[H3-FaceResample] sigmas 末值非 0, 自动补 0 (完整去噪): "
               f"{[round(float(x), 4) for x in s]}")
     return s
 
@@ -63,12 +65,17 @@ class H3FaceResample(io.ComfyNode):
             node_id="H3FaceResample",
             display_name="Minimax_H3_Face_Resample",
             category="MinimaxH3_AutoContext/FaceFix",
-            description="修脸第 2 步: 裁剪序列放大编码→H3重采样→原生画布输出。σ阶梯由 sigmas 端口决定。",
+            description="Face fix step 2: upscale and encode the crop sequence -> H3 resample -> native canvas output. "
+                        "The σ schedule comes from the sigmas input.\n"
+                        "修脸第 2 步: 裁剪序列放大编码→H3重采样→原生画布输出。σ阶梯由 sigmas 端口决定。",
             inputs=[
-                io.Image.Input("crop_images", tooltip="来自 H3FaceCut 的 crop_images"),
-                io.Dict.Input("face_pack", tooltip="来自 H3FaceCut 的 face_pack"),
-                io.Dict.Input("info", tooltip="采样节点的 info 输出 (需含 h3_runtime)"),
-                io.Sigmas.Input("sigmas", tooltip="精修 σ 阶梯 (单调递减, 末值0)。"
+                io.Image.Input("crop_images", tooltip="crop_images from H3FaceCut\n来自 H3FaceCut 的 crop_images"),
+                io.Dict.Input("face_pack", tooltip="face_pack from H3FaceCut\n来自 H3FaceCut 的 face_pack"),
+                io.Dict.Input("info", tooltip="info output of the sampler node (must contain h3_runtime)\n"
+                                              "采样节点的 info 输出 (需含 h3_runtime)"),
+                io.Sigmas.Input("sigmas", tooltip="Refinement σ schedule (monotonically decreasing, last value 0). "
+                                "SplitSigmasDenoise low_sigmas = refine from that σ down to 0\n"
+                                "精修 σ 阶梯 (单调递减, 末值0)。"
                                 "SplitSigmasDenoise 的 low_sigmas = 从该σ精修到 0"),
                 io.Int.Input("seed", default=0, min=0, max=0xffffffffffffffff,
                              control_after_generate=True),
@@ -87,7 +94,8 @@ class H3FaceResample(io.ComfyNode):
         S = int(pack.get("crop_size") or 0)
         a_lat = pack.get("a_lat")
         if S <= 0 or a_lat is None or crop_images is None or crop_images.dim() != 4:
-            print("[H3-FaceResample] 无脸空包, crop_images 原样透传")
+            print("[H3-FaceResample] no face empty pack, crop_images passed through unchanged\n"
+                  "[H3-FaceResample] 无脸空包, crop_images 原样透传")
             return io.NodeOutput(crop_images, pack)
 
         rt = info.get("h3_runtime") if isinstance(info, dict) else None
@@ -113,7 +121,9 @@ class H3FaceResample(io.ComfyNode):
         # ---- σ 阶梯: 完全来自 sigmas 端口 ----
         fix_sig = _normalize_sigmas(sigmas, device)
         k = int(fix_sig.numel()) - 1
-        print(f"[H3-FaceResample] fix_sig={[round(float(s), 3) for s in fix_sig]} ({k} 步), "
+        print(f"[H3-FaceResample] fix_sig={[round(float(s), 3) for s in fix_sig]} ({k} steps), "
+              f"canvas {res}x{res} (S={S}, {float(res) / S:.2f}x), T={T_exp}\n"
+              f"[H3-FaceResample] fix_sig={[round(float(s), 3) for s in fix_sig]} ({k} 步), "
               f"画布 {res}x{res} (S={S}, {float(res) / S:.2f}x), T={T_exp}")
 
         # ---- 裁剪序列 → 画布 latent (1E) ----
@@ -131,7 +141,9 @@ class H3FaceResample(io.ComfyNode):
               if rt.get("ref_videos") else [])
         ra = (h3_sampler._prepare_ref_audios(rt.get("ref_audios"), audio_vae, device)
               if rt.get("ref_audios") else [])
-        print(f"[H3-FaceResample] 参考素材按画布 {res}x{res} 重编码 "
+        print(f"[H3-FaceResample] reference assets re-encoded to canvas {res}x{res} "
+              f"(images {len(ri)}/videos {len(rv)}/audios {len(ra)})\n"
+              f"[H3-FaceResample] 参考素材按画布 {res}x{res} 重编码 "
               f"(图{len(ri)}/视频{len(rv)}/音频{len(ra)})")
 
         prompt, src_name = _pick_prompt(F_, boundaries, seg_prompts, long_prompt)
@@ -143,7 +155,8 @@ class H3FaceResample(io.ComfyNode):
             clip, prompt, payload["ref_items_for_clip"], device,
             images_for_clip=payload.get("images_for_clip"))
         positive = h3_conditioning.inject_conditioning_data(positive, payload)
-        print(f"[H3-FaceResample] prompt 来源: {src_name}")
+        print(f"[H3-FaceResample] prompt source: {src_name}\n"
+              f"[H3-FaceResample] prompt 来源: {src_name}")
 
         # ---- 重采样: mask 全放开 ----
         audio = a_lat.to(device=device, dtype=torch.float32)
@@ -180,6 +193,8 @@ class H3FaceResample(io.ComfyNode):
         if px.dim() == 4:
             px = px.unsqueeze(1)
         px = px[0].clamp(0.0, 1.0).float()
-        print(f"[H3-FaceResample] 完成: images {tuple(px.shape)} "
+        print(f"[H3-FaceResample] done: images {tuple(px.shape)} "
+              f"(native canvas, scaling/blend-back done by ③)\n"
+              f"[H3-FaceResample] 完成: images {tuple(px.shape)} "
               f"(原生画布, 缩放/贴回由 ③ 完成)")
         return io.NodeOutput(px.contiguous(), dict(pack))

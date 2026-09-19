@@ -40,11 +40,15 @@ class H3FaceCut:
     """原生节点写法: face_model 是 combo 下拉, 所有 comfy 版本必出下拉框。"""
 
     CATEGORY = "MinimaxH3_AutoContext/FaceFix"
-    DESCRIPTION = "修脸第 1 步: 逐帧检测→平滑填补→固定尺寸居中裁剪 (稳定器)。只切不算。"
+    DESCRIPTION = ("Face fix step 1: per-frame detection -> smooth fill -> fixed-size centered crop (stabilizer). "
+                   "Crops only, no sampling.\n"
+                   "修脸第 1 步: 逐帧检测→平滑填补→固定尺寸居中裁剪 (稳定器)。只切不算。")
     FUNCTION = "execute"
     RETURN_TYPES = ("IMAGE", "*")
     RETURN_NAMES = ("crop_images", "face_pack")
-    OUTPUT_TOOLTIPS = ("脸恒居中的固定尺寸裁剪序列",
+    OUTPUT_TOOLTIPS = ("Fixed-size crop sequence with the face held at the center\n"
+                       "脸恒居中的固定尺寸裁剪序列",
+                       "Geometry pack (centers/crop_size/meta + a_lat) for steps 2 and 3\n"
                        "几何信息包 (centers/crop_size/meta + a_lat), 供 ② ③ 使用")
 
     @classmethod
@@ -53,17 +57,23 @@ class H3FaceCut:
         return {
             "required": {
                 "face_model": (choices, {
-                    "tooltip": ("人脸检测模型 (下拉 = ComfyUI/models/elementEasy 内的文件, "
+                    "tooltip": ("Face detection model (dropdown = files inside ComfyUI/models/elementEasy, "
+                                "subfolders included); refresh the browser after dropping in new files\n"
+                                "人脸检测模型 (下拉 = ComfyUI/models/elementEasy 内的文件, "
                                 "含子目录)。新放入文件后刷新浏览器即可出现"),
                 }),
-                "latent": ("LATENT", {"tooltip": "采样节点输出的完整 latent (第一个 latent 口)"}),
-                "vae": ("VAE", {"tooltip": "视频 VAE (抽帧解码用)"}),
+                "latent": ("LATENT", {"tooltip": "Full latent output of the sampler node (first latent socket)\n"
+                                                 "采样节点输出的完整 latent (第一个 latent 口)"}),
+                "vae": ("VAE", {"tooltip": "Video VAE (used to decode frames)\n视频 VAE (抽帧解码用)"}),
                 "conf": ("FLOAT", {"default": 0.3, "min": 0.05, "max": 0.9, "step": 0.05,
-                                   "tooltip": "检测置信度阈值 (暗场误检多就调高)"}),
+                                   "tooltip": "Detection confidence threshold (raise it when dark scenes give false hits)\n"
+                                              "检测置信度阈值 (暗场误检多就调高)"}),
                 "res": ("INT", {"default": 512, "min": 256, "max": 2048, "step": 32,
-                                "tooltip": "画布边长: 裁剪序列放大到该尺寸交给 H3 重绘"}),
+                                "tooltip": "Canvas side length: the crop sequence is upscaled to this size for H3 redraw\n"
+                                           "画布边长: 裁剪序列放大到该尺寸交给 H3 重绘"}),
                 "expand": ("INT", {"default": 20, "min": 0, "max": 100,
-                                   "tooltip": "裁剪余量% (脸框四周保留的背景, 贴回羽化需要它)"}),
+                                   "tooltip": "Crop margin % (background kept around the face box, needed for the feather blend-back)\n"
+                                              "裁剪余量% (脸框四周保留的背景, 贴回羽化需要它)"}),
             },
         }
 
@@ -102,11 +112,15 @@ class H3FaceCut:
                          "W": int(W), "H": int(H), "res": int(res),
                          "n_hit": int(n_hit), "n_frames": len(per_frame)}}
         if track is None:
-            print("[H3-FaceCut] 未检测到人脸 → 空包 (下游原样透传)")
+            print("[H3-FaceCut] no face detected -> empty pack (passed through unchanged downstream)\n"
+                  "[H3-FaceCut] 未检测到人脸 → 空包 (下游原样透传)")
             return (torch.zeros(1, 64, 64, 3), pack)
         sm, S = track
         miss = 1.0 - n_hit / float(len(per_frame))
-        print(f"\033[35m[H3-FaceCut] 检出 {n_hit}/{len(per_frame)} 帧 (缺失{miss * 100:.0f}%, "
+        print(f"\033[35m[H3-FaceCut] detected {n_hit}/{len(per_frame)} frames (missing {miss * 100:.0f}%, "
+              f"{'high, raise conf in dark scenes' if miss > 0.4 else 'ok'}) | "
+              f"fixed crop S={S}px -> canvas {int(res)}px (upscale {float(res) / S:.2f}x)\n"
+              f"[H3-FaceCut] 检出 {n_hit}/{len(per_frame)} 帧 (缺失{miss * 100:.0f}%, "
               f"{'偏高, 暗场可升conf' if miss > 0.4 else 'ok'}) | "
               f"固定裁剪 S={S}px → 画布 {int(res)}px (放大 {float(res) / S:.2f}x)\033[0m")
 
@@ -125,6 +139,8 @@ class H3FaceCut:
 
         pack["crop_size"] = int(S)
         pack["centers"] = centers
-        print(f"[H3-FaceCut] 裁剪序列 {tuple(crop_t.shape)} "
+        print(f"[H3-FaceCut] crop sequence {tuple(crop_t.shape)} "
+              f"(fc={crop_t.shape[0]}, expected {h3ff._pixels_for_tokens(int(T))})\n"
+              f"[H3-FaceCut] 裁剪序列 {tuple(crop_t.shape)} "
               f"(fc={crop_t.shape[0]}, 期望 {h3ff._pixels_for_tokens(int(T))})")
         return (crop_t.contiguous(), pack)

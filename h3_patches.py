@@ -90,6 +90,9 @@ def _patch_packed_layout():
         if real_indices:
             ref_shift = video_t0 - float(text_len)
             print(f"[H3-Auto] Layout: video_t0={video_t0:.1f} (text_len={text_len}, "
+                  f"ref offset={ref_shift:.1f}) keyframe_t="
+                  f"{[round(video_t0 + float(FRAME_RESCALE) * p, 1) for p in real_indices]}\n"
+                  f"[H3-Auto] Layout: video_t0={video_t0:.1f} (text_len={text_len}, "
                   f"ref偏移={ref_shift:.1f}) keyframe_t="
                   f"{[round(video_t0 + float(FRAME_RESCALE) * p, 1) for p in real_indices]}")
 
@@ -140,9 +143,9 @@ def apply_patches():
     try:
         _patch_packed_layout()
     except Exception as e:
-        print(f"[H3-Auto] PackedLayout patch failed: {e}")
+        print(f"[H3-Auto] PackedLayout patch failed: {e}\n[H3-Auto] PackedLayout patch 失败: {e}")
     try:
         _patch_extra_conds()
     except Exception as e:
-        print(f"[H3-Auto] extra_conds patch failed: {e}")
+        print(f"[H3-Auto] extra_conds patch failed: {e}\n[H3-Auto] extra_conds patch 失败: {e}")
     _patches_applied = True

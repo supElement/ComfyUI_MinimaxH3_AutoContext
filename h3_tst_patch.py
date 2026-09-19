@@ -159,15 +159,24 @@ class H3TSTPatch(io.ComfyNode):
             node_id="H3TSTPatch",
             display_name="Minimax_H3_TST_AttentionPatch",
             category="MinimaxH3_AutoContext",
-            description="H3 时间状态传输 (TST) 注意力校正：谱张力诊断帧级传输算子状态，"
+            description="H3 temporal state transfer (TST) attention correction: spectral tension diagnoses the "
+                        "frame-level transfer operator state and adaptively scales the video-row query. "
+                        "Chain it with the segment inference node; it affects every attention call of all segments "
+                        "after this node. Natively compatible with the official ModelAttentionBackend; "
+                        "chains with other attention patch nodes (this node must sit downstream of them)\n"
+                        "H3 时间状态传输 (TST) 注意力校正：谱张力诊断帧级传输算子状态，"
                         "自适应缩放视频行 query。与分段推理节点串联使用，"
                         "对本节点之后所有段的所有 attention 调用生效。"
                         "与官方 ModelAttentionBackend 天然兼容；"
                         "与其它 attention patch 节点链式共存 (本节点需放在其下游)",
             inputs=[
-                io.Model.Input("model", tooltip="输入模型 (MiniMax H3)，输出补丁后的模型接到采样节点"),
+                io.Model.Input("model", tooltip="Input model (MiniMax H3); connect the patched model output to the sampler node\n"
+                                                "输入模型 (MiniMax H3)，输出补丁后的模型接到采样节点"),
                 io.Float.Input("tau", default=0.2, min=0.0, max=1.0, step=0.01,
-                               tooltip="校正强度。0=透传不挂载 (可作 A/B 基线)。"
+                               tooltip="Correction strength. 0=pass through without patching (usable as an A/B baseline). "
+                                       "Typical range 0.1~0.3, try 0.3 when small faces break down badly. "
+                                       "Actual correction = tau * layer weight(stronger in deep layers) * step weight(stronger early)\n"
+                                       "校正强度。0=透传不挂载 (可作 A/B 基线)。"
                                        "常用范围 0.1~0.3，小脸崩坏明显时可试 0.3。"
                                        "实际校正量 = tau * 层权重(深层更强) * 步权重(早期更强)"),
             ],
@@ -179,9 +188,13 @@ class H3TSTPatch(io.ComfyNode):
     @classmethod
     def execute(cls, model, tau=0.2) -> io.NodeOutput:
         if tau == 0.0:
-            print("[H3-Auto] TST: tau=0，直接透传模型 (未挂载任何补丁)")
+            print("[H3-Auto] TST: tau=0, model passed through directly (no patch mounted)\n"
+                  "[H3-Auto] TST: tau=0，直接透传模型 (未挂载任何补丁)")
             return io.NodeOutput(model)
         patched = patch_model(model, tau)
-        print(f"[H3-Auto] TST 注意力校正已挂载: tau={tau}")
-        print("[H3-Auto] 提示: TST 会改变输出，采样节点缓存需重新生成 (与换 LoRA/加速节点后相同)")
+        print(f"[H3-Auto] TST attention correction mounted: tau={tau}\n"
+              f"[H3-Auto] TST 注意力校正已挂载: tau={tau}")
+        print("[H3-Auto] Note: TST changes the output, so the sampler node cache must be regenerated "
+              "(same as after swapping LoRA/speedup nodes)\n"
+              "[H3-Auto] 提示: TST 会改变输出，采样节点缓存需重新生成 (与换 LoRA/加速节点后相同)")
         return io.NodeOutput(patched)

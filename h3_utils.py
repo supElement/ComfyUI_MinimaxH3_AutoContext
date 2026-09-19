@@ -429,7 +429,7 @@ def build_prompt_schedule(long_prompt: str, total_seconds: float, mode: str = "a
         if has_timeline:
             return _result(timeline_segs, g_before, g_after, "timeline")
         if not quiet:
-            print("[H3-Auto] 提示: 未检测到时间标记 (如 '0-5s')，降级为 global 模式")
+            print("[H3-Auto] Notice: no time marks detected (e.g. '0-5s'), falling back to global mode\n[H3-Auto] 提示: 未检测到时间标记 (如 '0-5s')，降级为 global 模式")
         return _result([_fulltext_segment(long_prompt)], "", "", "global")
 
     if mode == "sequential":
@@ -860,7 +860,7 @@ def build_tag_schedule(long_prompt, clip_tag_input, default_seconds):
     prefix_text, raw_segments = _split_by_tag(long_prompt, prefix, suffix)
 
     if not raw_segments:
-        print(f"[H3-Auto] Clip_Tag: 未在提示词中找到标签 '{clip_tag_input}'，降级为整段")
+        print(f"[H3-Auto] Clip_Tag: tag '{clip_tag_input}' not found in the prompt, falling back to a single segment\n[H3-Auto] Clip_Tag: 未在提示词中找到标签 '{clip_tag_input}'，降级为整段")
         return {"segments": [(long_prompt.strip(), default_seconds)], "prefix": ""}
 
     segments = []
@@ -871,16 +871,18 @@ def build_tag_schedule(long_prompt, clip_tag_input, default_seconds):
             duration = _compute_segment_duration(seg_text, default_seconds)
 
         if duration > 15:
-            print(f"[H3-Auto] 警告: 段 {seg_no} 时长 {duration}s 超过 15s "
+            print(f"[H3-Auto] Warning: segment {seg_no} duration {duration}s exceeds 15s "
+                  f"(MiniMax H3 recommended duration; longer output is possible in special cases)\n"
+                  f"[H3-Auto] 警告: 段 {seg_no} 时长 {duration}s 超过 15s "
                   f"(MiniMax H3 官方推荐时长，特殊情况下可生成更长)")
 
         segments.append((seg_text, duration))
 
     total = sum(d for _, d in segments)
     durations_str = ", ".join(f"{d}s" for _, d in segments)
-    print(f"[H3-Auto] Clip_Tag 分段: {len(segments)} 段 [{durations_str}]，合计 {total}s")
+    print(f"[H3-Auto] Clip_Tag segments: {len(segments)} segments [{durations_str}], total {total}s\n[H3-Auto] Clip_Tag 分段: {len(segments)} 段 [{durations_str}]，合计 {total}s")
     if prefix_text.strip():
-        print(f"[H3-Auto] Clip_Tag 全局前缀: {prefix_text.strip()[:80]}...")
+        print(f"[H3-Auto] Clip_Tag global prefix: {prefix_text.strip()[:80]}...\n[H3-Auto] Clip_Tag 全局前缀: {prefix_text.strip()[:80]}...")
 
     return {"segments": segments, "prefix": prefix_text.strip()}
 
@@ -941,7 +943,9 @@ def compute_tag_chunks(seg_target_frames_list, context_frames):
         chunks.append((start, start + s))
         start += s
 
-    print(f"[H3-Auto] 分段计算: 目标总帧数={target_total} "
+    print(f"[H3-Auto] Chunk plan: target total frames={target_total} "
+          f"actual output={total_new} (delta {total_new - target_total:+d} frames)\n"
+          f"[H3-Auto] 分段计算: 目标总帧数={target_total} "
           f"实际输出={total_new} (偏差 {total_new - target_total:+d}帧)")
 
     return chunks, seg_sizes
