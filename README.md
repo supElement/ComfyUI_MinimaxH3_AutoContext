@@ -34,7 +34,7 @@ V0.7.3
 - 接法：模型加载 → 本节点 → 采样节点；支持与其他 attention patch 节点链式共存（需放在其下游）
 - 参数：tau 校正强度（0 = 透传，可作 A/B 基线；常用 0.1~0.3）
 
-二、高分辨率局部修脸三步管线（3 个）
+二、高分辨率局部修脸三步管线（3 个节点）
 
 <img width="1641" height="921" alt="image" src="https://github.com/user-attachments/assets/3d7fb8a4-0c5b-474c-b03b-2a40e40c67bf" />
 
