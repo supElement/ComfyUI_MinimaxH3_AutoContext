@@ -222,10 +222,14 @@ def _guard_transform(a, b, src, dst):
     ms = src.double().median(dim=0).values.clamp_min(1e-4)
     md = dst.double().median(dim=0).values
     gain = (md / ms).clamp(_GAIN_MIN, _GAIN_MAX)
+    diag_s = [round(float(v), 3) for v in diag]
+    off_s = [round(float(v), 3) for v in off]
+    gain_s = [round(float(v), 3) for v in gain]
     warn = (
-        f"变换过激 (gain={[round(float(v), 3) for v in diag]}, "
-        f"offset={[round(float(v), 3) for v in off]}) "
-        f"-> 退回纯增益 {[round(float(v), 3) for v in gain]}"
+        f"transform too aggressive (gain={diag_s}, offset={off_s}) "
+        f"-> falling back to pure gain {gain_s}"
+        f" / 变换过激 (gain={diag_s}, offset={off_s}) "
+        f"-> 退回纯增益 {gain_s}"
     )
     return (
         torch.diag(gain),
@@ -617,7 +621,7 @@ def _detect_shot_cuts(images, threshold, device, min_gap=_CUT_MIN_GAP):
         h, w = images[0].shape[:2]
         writer = cv2.VideoWriter(tmp_path, fourcc, 24.0, (w, h))
         if not writer.isOpened():
-            raise IOError("无法创建临时视频文件")
+            raise IOError("failed to create the temporary video file\n无法创建临时视频文件")
 
         for img in images.cpu().numpy():
             bgr = (img[..., :3] * 255).astype(np.uint8)[..., ::-1]

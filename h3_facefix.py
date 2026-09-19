@@ -96,7 +96,8 @@ def detect_faces_yolo(frames_u8, conf=0.3, model_path=""):
     global _yolo_model, _yolo_path
     from ultralytics import YOLO
     if not model_path:
-        raise ValueError("face_model 为空: 需要 YOLO 人脸权重路径 (如 face_yolov9c.pt)")
+        raise ValueError("face_model is empty: a YOLO face-weights path is required (e.g. face_yolov9c.pt)"
+                         "\nface_model 为空: 需要 YOLO 人脸权重路径 (如 face_yolov9c.pt)")
     if _yolo_model is None or _yolo_path != model_path:
         _yolo_model = YOLO(model_path)
         _yolo_path = model_path

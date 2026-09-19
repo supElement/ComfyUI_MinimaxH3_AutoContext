@@ -776,7 +776,8 @@ def _parse_tag_pattern(clip_tag_input):
     while i >= 0 and not s[i].isdigit():
         i -= 1
     if i < 0:
-        raise ValueError(f"标签模板 '{clip_tag_input}' 未包含数字序号")
+        raise ValueError(f"tag template '{clip_tag_input}' has no numeric index"
+                         f"\n标签模板 '{clip_tag_input}' 未包含数字序号")
     num_end = i + 1
     while i >= 0 and s[i].isdigit():
         i -= 1

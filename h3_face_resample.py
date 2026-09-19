@@ -29,25 +29,31 @@ CFG = 1.0
 
 def _pick_prompt(fc, boundaries, seg_prompts, long_prompt):
     if not seg_prompts:
-        return long_prompt, "全局提示词"
+        return long_prompt, "global prompt / 全局提示词"
     idx = min(sum(1 for b in (boundaries or []) if b <= int(fc) // 2),
               len(seg_prompts) - 1)
-    return seg_prompts[idx], f"段{idx + 1}提示词"
+    return seg_prompts[idx], f"segment {idx + 1} prompt / 段{idx + 1}提示词"
 
 
 def _normalize_sigmas(sigmas, device):
     """SIGMAS 端口 → 精修阶梯: 校验递减/首值>0, 末值非0自动补0 (完整去噪)。"""
     if sigmas is None:
-        raise ValueError("[H3-FaceResample] sigmas 端口未连接 — 请接 "
+        raise ValueError("[H3-FaceResample] sigmas port not connected — connect a scheduler output such as "
+                         "BasicScheduler / SplitSigmasDenoise(low_sigmas)"
+                         "\n[H3-FaceResample] sigmas 端口未连接 — 请接 "
                          "BasicScheduler / SplitSigmasDenoise(low_sigmas) 等调度器输出")
     s = sigmas.detach().clone().flatten().to(device=device, dtype=torch.float32)
     if s.numel() < 2:
-        raise ValueError(f"[H3-FaceResample] sigmas 至少 2 个值 (首σ>0, 末σ=0), 收到 {s.numel()} 个")
+        raise ValueError(f"[H3-FaceResample] sigmas needs at least 2 values (first σ>0, last σ=0), got {s.numel()}"
+                         f"\n[H3-FaceResample] sigmas 至少 2 个值 (首σ>0, 末σ=0), 收到 {s.numel()} 个")
     if not bool(torch.all(s[1:] <= s[:-1])):
-        raise ValueError("[H3-FaceResample] sigmas 必须单调不增: "
+        raise ValueError("[H3-FaceResample] sigmas must be monotonically non-increasing: "
+                         f"{[round(float(x), 4) for x in s]}"
+                         "\n[H3-FaceResample] sigmas 必须单调不增: "
                          f"{[round(float(x), 4) for x in s]}")
     if float(s[0]) <= 0.0:
-        raise ValueError("[H3-FaceResample] 首 σ 必须 > 0")
+        raise ValueError("[H3-FaceResample] first σ must be > 0"
+                         "\n[H3-FaceResample] 首 σ 必须 > 0")
     if float(s[-1]) != 0.0:
         s = torch.cat([s, torch.zeros(1, device=device)])
         print(f"[H3-FaceResample] last sigma is not 0, appended 0 (full denoise): "
@@ -90,7 +96,8 @@ class H3FaceResample(io.ComfyNode):
     def execute(cls, crop_images, face_pack, info, sigmas, seed=0) -> io.NodeOutput:
         pack = face_pack or {}
         if int(pack.get("version") or 0) != 3:
-            raise ValueError("[H3-FaceResample] pack 版本不符 — 请重跑 H3FaceCut (v4)")
+            raise ValueError("[H3-FaceResample] pack version mismatch — rerun H3FaceCut (v4)"
+                             "\n[H3-FaceResample] pack 版本不符 — 请重跑 H3FaceCut (v4)")
         S = int(pack.get("crop_size") or 0)
         a_lat = pack.get("a_lat")
         if S <= 0 or a_lat is None or crop_images is None or crop_images.dim() != 4:
@@ -100,7 +107,8 @@ class H3FaceResample(io.ComfyNode):
 
         rt = info.get("h3_runtime") if isinstance(info, dict) else None
         if not rt:
-            raise ValueError("[H3-FaceResample] info 中没有 h3_runtime")
+            raise ValueError("[H3-FaceResample] info does not contain h3_runtime"
+                             "\n[H3-FaceResample] info 中没有 h3_runtime")
         model = rt["model"]; clip = rt["clip"]; vae = rt["vae"]
         audio_vae = rt.get("audio_vae")
         device = comfy.model_management.get_torch_device()
@@ -108,7 +116,8 @@ class H3FaceResample(io.ComfyNode):
         base_px = crop_images.detach().float()          # [F,S,S,C]
         F_ = int(base_px.shape[0])
         if (F_ - 5) % 17 != 0:
-            raise ValueError(f"[H3-FaceResample] 帧数 {F_} 不在 17k+5 网格上 — pack 与 latent 不匹配")
+            raise ValueError(f"[H3-FaceResample] frame count {F_} is not on the 17k+5 grid — pack and latent do not match"
+                             f"\n[H3-FaceResample] 帧数 {F_} 不在 17k+5 网格上 — pack 与 latent 不匹配")
         T_exp = 5 * ((F_ - 5) // 17) + 2
 
         res = int((pack.get("meta") or {}).get("res", 512))
@@ -128,9 +137,10 @@ class H3FaceResample(io.ComfyNode):
 
         # ---- 裁剪序列 → 画布 latent (1E) ----
         base_lat = h3ff.upscale_and_encode(vae, base_px, res, res,
-                                           want_t=T_exp, tag="[裁剪画布]")
+                                           want_t=T_exp, tag="[crop canvas / 裁剪画布]")
         if base_lat is None:
-            raise RuntimeError("[H3-FaceResample] 裁剪画布编码失败 (见 [H3-Enc] 日志)")
+            raise RuntimeError("[H3-FaceResample] crop canvas encoding failed (see the [H3-Enc] log)"
+                               "\n[H3-FaceResample] 裁剪画布编码失败 (见 [H3-Enc] 日志)")
         base_lat = base_lat.to(device=device, dtype=torch.float32)
 
         # ---- 参考素材按画布分辨率重编码 ----
@@ -183,9 +193,12 @@ class H3FaceResample(io.ComfyNode):
             v_fix, _ = h3_conditioning.unpack_nested_latent({"samples": out_s})
         except Exception as e:
             import traceback; traceback.print_exc()
-            raise RuntimeError(f"[H3-FaceResample] 重采样失败: {e}")
+            raise RuntimeError(f"[H3-FaceResample] resample failed: {e}"
+                               f"\n[H3-FaceResample] 重采样失败: {e}")
         if v_fix is None or v_fix.dim() != 5 or int(v_fix.shape[2]) != T_exp:
-            raise RuntimeError(f"[H3-FaceResample] 输出形状异常: "
+            raise RuntimeError(f"[H3-FaceResample] unexpected output shape: "
+                               f"{None if v_fix is None else tuple(v_fix.shape)}"
+                               f"\n[H3-FaceResample] 输出形状异常: "
                                f"{None if v_fix is None else tuple(v_fix.shape)}")
 
         # ---- 生成画布解码 (1D) → 原生分辨率输出, 一切缩放由 ③ 完成 ----

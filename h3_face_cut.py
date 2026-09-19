@@ -80,19 +80,24 @@ class H3FaceCut:
     def execute(self, latent, vae, face_model="", conf=0.3, res=512, expand=20):
         v_lat, a_lat = h3_conditioning.unpack_nested_latent(latent)
         if v_lat is None or v_lat.dim() != 5 or a_lat is None:
-            raise ValueError("[H3-FaceCut] latent 必须同时含 video+audio")
+            raise ValueError("[H3-FaceCut] latent must contain both video+audio"
+                             "\n[H3-FaceCut] latent 必须同时含 video+audio")
         B, C, T, LH, LW = v_lat.shape
         if T < 4:
-            raise ValueError(f"[H3-FaceCut] 视频 token 数 {T} 过短")
+            raise ValueError(f"[H3-FaceCut] video token count {T} is too small"
+                             f"\n[H3-FaceCut] 视频 token 数 {T} 过短")
         H, W = LH * 16, LW * 16
 
         # ---- 模型路径解析 (固定目录) ----
         model_rel = (face_model or "").strip()
         if not model_rel:
-            raise ValueError(f"[H3-FaceCut] 未选择检测模型 — 请将 YOLO 权重放入: {MODEL_DIR}")
+            raise ValueError(f"[H3-FaceCut] no detection model selected — put the YOLO weights into: {MODEL_DIR}"
+                             f"\n[H3-FaceCut] 未选择检测模型 — 请将 YOLO 权重放入: {MODEL_DIR}")
         model_path = os.path.normpath(os.path.join(MODEL_DIR, model_rel))
         if not os.path.isfile(model_path):
-            raise ValueError(f"[H3-FaceCut] 模型不存在: {model_path} — "
+            raise ValueError(f"[H3-FaceCut] model not found: {model_path} — "
+                             f"newly added files only show up in the dropdown after refreshing the browser"
+                             f"\n[H3-FaceCut] 模型不存在: {model_path} — "
                              f"新放入的文件需刷新浏览器后才会出现在下拉列表")
 
         # ---- 1) 全量解码 + 逐帧检测 ----

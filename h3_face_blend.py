@@ -46,7 +46,8 @@ class H3FaceBlend(io.ComfyNode):
     def execute(cls, images, canvas, bbox, feather_px=16) -> io.NodeOutput:
         pack = bbox or {}
         if int(pack.get("version") or 0) != 3:
-            raise ValueError("[H3-FaceBlend] bbox 版本不符 — 请重跑 H3FaceCut (v4)")
+            raise ValueError("[H3-FaceBlend] bbox version mismatch — rerun H3FaceCut (v4)"
+                             "\n[H3-FaceBlend] bbox 版本不符 — 请重跑 H3FaceCut (v4)")
         S = int(pack.get("crop_size") or 0)
         centers = pack.get("centers") or []
         if S <= 0 or not centers:
@@ -64,7 +65,9 @@ class H3FaceBlend(io.ComfyNode):
         F_img, H, W = int(img.shape[0]), int(img.shape[1]), int(img.shape[2])
         F_can, h_can, w_can = int(can.shape[0]), int(can.shape[1]), int(can.shape[2])
         if F_img != F_can:
-            raise ValueError(f"[H3-FaceBlend] 原画面 {F_img} 帧 ≠ canvas {F_can} 帧 — "
+            raise ValueError(f"[H3-FaceBlend] source frames {F_img} ≠ canvas frames {F_can} — "
+                             f"both images must come from the same sampling run"
+                             f"\n[H3-FaceBlend] 原画面 {F_img} 帧 ≠ canvas {F_can} 帧 — "
                              f"两个 images 必须来自同一次采样")
 
         # ---- 本节点唯一职责的缩放: canvas → S×S (已是 S×S 则跳过, 干跑恒等) ----

@@ -780,9 +780,9 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
         if not is_first_chunk:
             anchor_prev = prev_x0
     
-        account = f"帧数={seg_frames}"
+        account = f"frames={seg_frames} / 帧数={seg_frames}"
         if not is_first_chunk:
-            account += f" (锚定={context_frames}，有效帧数={seg_frames - context_frames})"
+            account += f" (anchor={context_frames}, effective={seg_frames - context_frames} / 锚定={context_frames}，有效帧数={seg_frames - context_frames})"
         print(f"[H3-Auto] Generating segment {idx+1}/{len(chunks)} (frames {start_f}-{end_f}) {account}\n[H3-Auto] 生成段 {idx+1}/{len(chunks)} (帧{start_f}-{end_f}) {account}")
     
         # ==================== 提示词构建 ====================
