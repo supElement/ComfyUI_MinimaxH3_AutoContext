@@ -470,7 +470,7 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
                                 ignore_latent_hash=False,
                                 unique_id=None,
                                 info=None,
-                                video_guide="none" ):
+                                video_guide="none"):
     h3_patches.apply_patches()
 
     device = comfy.model_management.get_torch_device()
@@ -907,9 +907,12 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
             effective_sampler_name = sampler_name
             effective_scheduler = scheduler
         
+        # TST 指纹：h3_tst_patch.py 挂载时把 tau 写进
+        _tst_to = (getattr(model, "model_options", None) or {}).get("transformer_options", None) or {}
+        _tst_tau = _tst_to.get("h3_tst_tau", None)
         current_meta = {
             "seed": seed + idx,
-            "steps": actual_steps,                   
+            "steps": actual_steps,
             "cfg": cfg,
             "denoise": denoise,
             "video_context_denoise": video_context_denoise,
@@ -923,7 +926,9 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
             "window_prompt_hash": window_prompt_hash,
             "conditions_hash": conditions_hash,
             "video_guide": video_guide,
+            "tst_tau": _tst_tau,
         }
+
     
         if info is not None and "segment_fingerprints" in info and idx < len(info["segment_fingerprints"]):
             current_meta["segment_fingerprint"] = info["segment_fingerprints"][idx]
@@ -1054,9 +1059,15 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
         "seg_sizes": [int(s) for s in seg_sizes],
         "effective_context": int(context_frames),
         "decoded_frames": int(seam_decoded),
-        "segment_fingerprints": segment_fingerprints,   
-        "upstream_global_hash": upstream_global_hash,   
+        "segment_fingerprints": segment_fingerprints,
+        "upstream_global_hash": upstream_global_hash,
     }
+    try:
+        seam_info["segment_prompts"] = [prompt_getter(i) for i in range(len(chunks))]
+    except Exception as _e:
+        print(f"[H3-Auto] segment_prompts 打包失败: {_e}")
+        seam_info["segment_prompts"] = []
+
     
     if not is_second_pass and len(segment_fingerprints) > 0:
         combined = "".join(segment_fingerprints)
@@ -1510,57 +1521,50 @@ def _make_h3_empty_latent(latent_w, latent_h, pixel_frames, fps,
 def _sample_segment(model, positive, latent_dict, steps, cfg, sampler_name, scheduler, seed,
                     denoise=1.0, sigmas=None, sampler_obj=None):
     """采样一段 latent。denoise<1 或 sigmas 非空时作为二采 (img2img 从 latent_dict 起步)。
-
     - sampler_obj: 外部 SAMPLER 对象 (可选)，覆盖内置 sampler_name/scheduler
+    - face_fix: 人脸局部修复配置 dict (可选)，启用后在采样中段插入局部重采样
     """
     import latent_preview
-
     latent_tensor = latent_dict["samples"]
     noise = comfy.sample.prepare_noise(latent_tensor, seed)
-
     use_custom_sigmas = sigmas is not None
     kdenoise = denoise
     if use_custom_sigmas:
         kdenoise = 1.0
         if denoise is not None and denoise < 0.9999:
             sigmas = sigmas * denoise
-
     n_steps = max(1, int(len(sigmas)) - 1) if use_custom_sigmas else steps
     x0_output = {}
     callback = latent_preview.prepare_callback(model, n_steps, x0_output)
     disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
-
     negative = []
     denoise_mask = latent_dict.get("noise_mask")
 
+
+    # ---- 以下原路径不变 ----
     if sampler_obj is not None:
         if sigmas is None:
             _ks = comfy.samplers.KSampler(
-                model, steps=steps, device=model.load_device,
-                sampler=sampler_name, scheduler=scheduler,
-                denoise=denoise, model_options=model.model_options)
+                model, steps=steps, device=model.load_device, sampler=sampler_name,
+                scheduler=scheduler, denoise=denoise, model_options=model.model_options)
             sigmas = _ks.sigmas
         samples = comfy.sample.sample_custom(
             model, noise, cfg, sampler_obj, sigmas, positive, negative, latent_tensor,
             noise_mask=denoise_mask, callback=callback, disable_pbar=disable_pbar, seed=seed)
     else:
         sampler = comfy.samplers.KSampler(
-            model, steps=steps, device=model.load_device,
-            sampler=sampler_name, scheduler=scheduler,
-            denoise=kdenoise, model_options=model.model_options)
+            model, steps=steps, device=model.load_device, sampler=sampler_name,
+            scheduler=scheduler, denoise=kdenoise, model_options=model.model_options)
         if use_custom_sigmas:
             samples = sampler.sample(
                 noise, positive, negative, cfg=cfg, latent_image=latent_tensor,
-                force_full_denoise=True,
-                denoise_mask=denoise_mask,
-                sigmas=sigmas, callback=callback, disable_pbar=disable_pbar)
+                force_full_denoise=True, denoise_mask=denoise_mask, sigmas=sigmas,
+                callback=callback, disable_pbar=disable_pbar)
         else:
             samples = sampler.sample(
                 noise, positive, negative, cfg=cfg, latent_image=latent_tensor,
                 force_full_denoise=True, start_step=0, last_step=steps,
-                denoise_mask=denoise_mask,
-                callback=callback, disable_pbar=disable_pbar)
-
+                denoise_mask=denoise_mask, callback=callback, disable_pbar=disable_pbar)
     x0 = x0_output.get("x0")
     if x0 is not None:
         if hasattr(samples, "is_nested") and samples.is_nested \
@@ -1575,6 +1579,7 @@ def _sample_segment(model, positive, latent_dict, steps, cfg, sampler_name, sche
             x0 = model.model.process_latent_out(x0.cpu())
         except Exception:
             pass
+            
     return {"samples": samples, "x0": x0}
 
 

@@ -121,6 +121,7 @@ class H3ParameterNode(io.ComfyNode):
                             "post_guide: 用 ref_video_0 的头部锚定结尾（视频前推）；\n"
                             "pre_post_guide: 用 ref_video_0 尾部锚定开头 + ref_video_1 头部锚定结尾（中间衔接）。\n"
                             "锚定帧数由 context_frames 决定。"),
+                            
             ],
             outputs=[
                 io.Dict.Output(display_name="parameter"),
@@ -132,7 +133,7 @@ class H3ParameterNode(io.ComfyNode):
                 prompt_format="official", crop_mode="stretch", ref_sync_mode="segmented",
                 width=960, height=544, total_frames=362, fps=24, chunk_frames=90,
                 context_frames=22, lock_audio=True, audio_drive=False,
-                video_guide="none",
+                video_guide="none", 
                 ) -> io.NodeOutput:
         parameter = {
             "long_prompt": long_prompt,
@@ -272,6 +273,7 @@ class H3AutoContextSampler(io.ComfyNode):
             
         p = parameter or {}
         video_guide = p.get("video_guide", "none")
+
         long_prompt = p.get("long_prompt", "")
         clip_mode = p.get("clip_mode", "Clip_Tag")
         clip_tag = p.get("clip_tag", "段1")
@@ -406,5 +408,17 @@ class H3AutoContextSampler(io.ComfyNode):
         )
         if seam_info:
             out_info.update(seam_info)
-
+        # ---- 修脸三节点运行时: 全量参数打包进 info, 供 H3FaceResample 的 info 端口使用 ----
+        out_info["h3_runtime"] = {
+            "model": model, "vae": vae, "audio_vae": audio_vae, "clip": clip,
+            "first_frame": first_frame, "last_frame": last_frame,
+            "ref_images": ref_image_list, "ref_videos": ref_video_list,
+            "ref_audios": ref_audio_list, "drive_audio": drive_audio,
+            "long_prompt": long_prompt, "prompt_format": prompt_format,
+            "crop_mode": crop_mode,
+            "fps": int(fps), "steps": int(steps), "cfg": float(cfg),
+            "sampler_name": str(sampler_name), "scheduler": str(scheduler),
+            "seed": int(seed), "sampler_obj": sampler, "sigmas": sigmas,
+            "denoise": float(denoise),
+        }
         return io.NodeOutput(latent, denoised_latent, out_info)
