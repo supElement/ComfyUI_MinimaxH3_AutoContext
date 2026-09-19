@@ -86,6 +86,89 @@ def decode_probe_frames(vae, v_lat, probe):
     frames = (pixels[0].clamp(0.0, 1.0) * 255.0).byte().cpu().numpy()
     return frames
 
+# ============ 分段账目 (H3 原生: 17n+5 ↔ 5n+2, FRAME_PER_TOKEN=(1,4,4,4,4)) ============
+def video_latent_frames(pixel_frames):
+    """像素帧数 -> latent token 数 (H3 官方公式)。"""
+    return 2 if pixel_frames <= 5 else ((pixel_frames - 5) // 17) * 5 + 2
+
+def face_split_blocks(seg_sizes, effective_context, expect_tokens=None,
+                      boundaries=None, decoded_frames=None):
+    """主采样分段账目 → H3 token 域分块。递推式与 compute_seam_boundaries /
+    _merge_segment_latents 严格同源: st_i=video_latent_frames(s_i),
+    n_i=0(i=0) else min(ctx_v, st_i-2), c_{i+1}=c_i+(st_i-n_i) (c≡2 mod 5, 相位守恒)。
+    返回 [(dec_k0, dec_k1, keep_p0, keep_p1), ...]:
+      dec_*  解码 token 区间 (起点回退到 ≡0 mod 5 相位 → 切片解码与整段解码逐帧对齐)
+      keep_* 合并时间轴保留像素区间 (无缝平铺 [0,F), 无重叠无遗漏)
+    任一校验不过 → None (调用方回退), 打印具体原因。"""
+    if not seg_sizes or not isinstance(seg_sizes, (list, tuple)):
+        return None
+    ctx_v = video_latent_frames(int(effective_context)) if (effective_context or 0) > 5 else 2
+    ctx_v = max(2, ctx_v)
+    st = []
+    for s in seg_sizes:
+        s = int(s)
+        if s < 5:
+            print("[H3-FaceFix] split: segment < 5 frames -> fallback\n"
+                  "[H3-FaceFix] 分段账目: 存在 <5 帧的段 → 回退")
+            return None
+        st.append(video_latent_frames(s))
+    blocks, cum = [], 0
+    for i, st_i in enumerate(st):
+        n_i = 0 if i == 0 else min(ctx_v, st_i - 2)
+        c0, c1 = cum, cum + (st_i - n_i)          # 本段新增内容占的合并 token 区间
+        blocks.append((c0 - (c0 % 5), c1,          # dec: 相位回退到 5n
+                       _pixels_for_tokens(c0), _pixels_for_tokens(c1)))
+        cum = c1
+    if expect_tokens is not None and cum != int(expect_tokens):
+        print(f"[H3-FaceFix] split: token accounting {cum} != latent tokens {int(expect_tokens)} -> fallback\n"
+              f"[H3-FaceFix] 分段账目: token 账目 {cum} ≠ latent 实际 token 数 {int(expect_tokens)} → 回退")
+        return None
+    if decoded_frames is not None and blocks[-1][3] != int(decoded_frames):
+        print(f"[H3-FaceFix] split: frames {blocks[-1][3]} != expected {int(decoded_frames)} -> fallback\n"
+              f"[H3-FaceFix] 分段账目: 帧数账目 {blocks[-1][3]} ≠ 期望 {int(decoded_frames)} → 回退")
+        return None
+    if boundaries:
+        bnd = [int(x) for x in boundaries]
+        if len(bnd) != len(blocks) - 1 or [b[2] for b in blocks[1:]] != bnd:
+            print("[H3-FaceFix] split: boundaries mismatch -> fallback\n"
+                  "[H3-FaceFix] 分段账目: 与 info.boundaries 不一致 → 回退")
+            return None
+    return blocks
+
+def block_ctx_px(p0, p1):
+    """② 每块编码上下文长度: enc = ctx + (p1-p0) 必须 ≡ 5 (mod 17) 才能过 VAE 往返。
+    返回 ctx ∈ {0,5,17,22}, 且 ≤ min(22, p0) (22=主采样默认锚定帧数)。"""
+    need = (5 - (int(p1) - int(p0))) % 17
+    cap = min(22, int(p0))
+    if cap < need:
+        return 0
+    return ((cap - need) // 17) * 17 + need
+
+def pixel_blocks_on_grid(total):
+    """② 无 info 回退: new_0=73(≡5), 其后 new_i=17m(≡0), ctx=22 → enc=17m+22≡5 恒成立。
+    keep 区间无缝平铺 [0, total)。"""
+    blocks, p0 = [], 0
+    first = min(73, int(total))
+    blocks.append((0, 0, 0, first)); p0 = first
+    while p0 < total:
+        rem = int(total) - p0
+        take = 68 if rem >= 68 + 17 else rem       # 末块至少留 17
+        blocks.append((0, 0, p0, p0 + take)); p0 += take
+    return blocks
+
+def token_blocks(n_tokens, chunk_tokens=22):
+    """① 无 info 回退: 固定滑窗 (块间重叠 2 token=5 帧解码上下文), 起点恒 ≡0 mod 5。"""
+    blocks, k0, keep0 = [], 0, 0
+    total = _pixels_for_tokens(int(n_tokens))
+    while keep0 < total:
+        k1 = min(k0 + int(chunk_tokens), int(n_tokens))
+        keep1 = _pixels_for_tokens(k1)
+        blocks.append((k0, k1, keep0, keep1))
+        keep0 = keep1
+        k0 = max(k1 - 2, k0 + 1)
+    return blocks
+
+
 
 # ================= 检测 =================
 _yolo_model = None
@@ -204,3 +287,4 @@ def _edge_weight(n, f, device, dtype):
 def _rect_weight(h, w, f, device, dtype):
     return _edge_weight(h, f, device, dtype)[:, None] \
         * _edge_weight(w, f, device, dtype)[None, :]
+
