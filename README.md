@@ -49,6 +49,8 @@ V0.7.3
 - H3FaceBlend（Minimax_H3_Face_Blend）— 修脸第 3 步
 - 把重绘后的画布缩放回裁剪尺寸 S×S，按逐帧平滑中心贴回原画面，边缘羽化融合。
 
+三、节点注释/提示 改为 中英双语
+
 V0.7.2
 
 - 修复当 H3Parameter 参数节点的输入端点（total_frames / chunk_frames / context_frames）连接类似 Math Expression 节点后，预计分段的请求会陷入死循环，ComfyUI 网页卡死的 bug。
