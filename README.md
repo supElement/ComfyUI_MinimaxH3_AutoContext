@@ -22,6 +22,33 @@
 
 ## BUG修复及优化
 
+V0.7.3
+
+一、注意力校正
+
+<img width="1730" height="502" alt="image" src="https://github.com/user-attachments/assets/9744cdc5-d812-4498-9df8-99f6de141aa9" />
+
+- H3TSTPatch（Minimax_H3_TST_AttentionPatch）
+- 用途：H3 时间状态传输（TST）注意力校正。通过谱张力诊断帧级传输状态（过度混合/碎片化），对视频行 query 做 per-head 自适应温度缩放
+- 解决的问题：时序闪烁、小脸崩坏
+- 接法：模型加载 → 本节点 → 采样节点；支持与其他 attention patch 节点链式共存（需放在其下游）
+- 参数：tau 校正强度（0 = 透传，可作 A/B 基线；常用 0.1~0.3）
+
+二、高分辨率局部修脸三步管线（3 个）
+
+<img width="1641" height="921" alt="image" src="https://github.com/user-attachments/assets/3d7fb8a4-0c5b-474c-b03b-2a40e40c67bf" />
+
+- 这是一套串联使用的"检测 → 重绘 → 贴回"修脸工作流（只支持单人）：
+
+- H3FaceCut（Minimax_H3_Face_Cut）— 修脸第 1 步
+- 全量解码 latent → 逐帧 YOLO 人脸检测（模型下拉自 models/elementEasy 目录）→ 缺失填补 + 滑动中值平滑 → 固定边长居中裁剪（保证脸恒居中、恒定等大）
+
+- H3FaceResample（Minimax_H3_Face_Resample）— 修脸第 2 步
+- 把裁剪序列 lanczos 放大到 res² 画布 → 用 H3 模型重采样精修脸部 → 解码输出原生分辨率画布。sigmas端口决定重采样步数和去噪强度。
+
+- H3FaceBlend（Minimax_H3_Face_Blend）— 修脸第 3 步
+- 把重绘后的画布缩放回裁剪尺寸 S×S，按逐帧平滑中心贴回原画面，边缘羽化融合。
+
 V0.7.2
 
 - 修复当 H3Parameter 参数节点的输入端点（total_frames / chunk_frames / context_frames）连接类似 Math Expression 节点后，预计分段的请求会陷入死循环，ComfyUI 网页卡死的 bug。
