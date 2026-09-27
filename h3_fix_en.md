@@ -1,5 +1,28 @@
 # MinimaxH3 Face-Fix Pipeline (Face_Cut → Face_Resample → Face_Blend)
 
+### Preserving Facial Identity
+
+**Method 1: reference images (recommended — refine while keeping identity)**
+
+Feed reference images via ref_images and declare them with Picture tags in the prompt:
+
+- Tags must appear in the prompts of the **segments where that character appears** — Resample prompts take effect per segment; a reference is only passed to blocks mapped to that segment;
+- In multi-character videos, the prompt must describe which character the reference image corresponds to (for disambiguation); single-person videos may omit this;
+- Tip: the best reference is the character's sharpest face frame from the source video itself (pick from Face_Cut's crop output) — most stable identity.
+
+**Method 2: weaken the refinement (zero extra setup, trades repair quality for identity)**
+
+Denoise strength is determined by the **first σ value** of the schedule (img2img noise = start σ × noise); lowering the start σ makes the refinement more conservative:
+
+- Use a SplitSigmas node: low_sigmas port → Face_Resample's sigmas port (the low side already ends at 0, naturally satisfying the port's requirement), and **increase SplitSigmas' step**;
+- step must be **strictly smaller** than the total step count, leaving at least a few steps for the low side — as step approaches the total, low_sigmas degenerates toward the final 0 and refinement does nothing (extreme values ≈ pass-through);
+- On newer ComfyUI builds, SplitSigmasDenoise splits directly by a denoise value — no step-to-σ math needed.
+
+**How they relate**: complementary, not either/or. Lowering the start σ preserves the **source crop's** identity (flaws and blotches stay too); references preserve the **reference's** identity (normal refinement while pulling the face toward the reference). Recommended: ref_images as the base + a moderately lowered start σ as a safety net.
+
+> Note: any change to the σ schedule automatically invalidates the Resample cache — no manual clear_cache needed.
+
+
 Three nodes chained, running on the output of the main sampler node (Minimax_H3_AutoContext_Sampler):
 
 | Node | Step | Role |
