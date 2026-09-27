@@ -22,6 +22,19 @@
 
 ## BUG修复及优化
 
+v0.8.5
+
+<img width="2156" height="629" alt="image" src="https://github.com/user-attachments/assets/b0b9373a-258b-485e-b5e8-0b3778f744e3" />
+
+- 增加并优化面部修复节点。详细说明：[中文](h3_fix_zh.md) | [English](h3_fix_en.md)</sub>
+- Minimax_H3_Face_Cut： 检测与裁剪，分镜 + YOLO 检测 + 可选 SeC-4B 追踪。
+- Minimax_H3_Face_Resample： 精修，主采样同款模型做块级 img2img 重采样 (块结构镜像主采样分段 + 块间锚定) 。
+- Minimax_H3_Face_Blend： 贴回，精修脸按几何账本与 mask 逐像素贴回原画面。
+
+V0.7.2
+
+- 修复当 H3Parameter 参数节点的输入端点（total_frames / chunk_frames / context_frames）连接类似 Math Expression 节点后，预计分段的请求会陷入死循环，ComfyUI 网页卡死的 bug。
+
 V0.7.1
 
 - 添加video_guide参数，用于优化视频续写、视频前推、双视频衔接（生成中间片段），支持分段。注意：非none时，采样节点的对应参考端口的参考会被强行剪切为context_frames参数中设置的数值。参考引用逻辑与普通参考相同（提示词中声明了，才会引用）。
