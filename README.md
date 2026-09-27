@@ -22,39 +22,6 @@
 
 ## BUG修复及优化
 
-V0.7.3
-
-一、注意力校正
-
-<img width="1730" height="502" alt="image" src="https://github.com/user-attachments/assets/9744cdc5-d812-4498-9df8-99f6de141aa9" />
-
-- H3TSTPatch（Minimax_H3_TST_AttentionPatch）
-- 用途：H3 时间状态传输（TST）注意力校正。通过谱张力诊断帧级传输状态（过度混合/碎片化），对视频行 query 做 per-head 自适应温度缩放
-- 解决的问题：时序闪烁、小脸崩坏
-- 接法：模型加载 → 本节点 → 采样节点；支持与其他 attention patch 节点链式共存（需放在其下游）
-- 参数：tau 校正强度（0 = 透传，可作 A/B 基线；常用 0.1~0.3）
-
-二、高分辨率局部修脸三步管线（3 个节点）
-
-<img width="1641" height="921" alt="image" src="https://github.com/user-attachments/assets/3d7fb8a4-0c5b-474c-b03b-2a40e40c67bf" />
-
-- 这是一套串联使用的"检测 → 重绘 → 贴回"修脸工作流（只支持单人）：
-
-- H3FaceCut（Minimax_H3_Face_Cut）— 修脸第 1 步
-- 全量解码 latent → 逐帧 YOLO 人脸检测（模型下拉自 models/elementEasy 目录）→ 缺失填补 + 滑动中值平滑 → 固定边长居中裁剪（保证脸恒居中、恒定等大）
-
-- H3FaceResample（Minimax_H3_Face_Resample）— 修脸第 2 步
-- 把裁剪序列 lanczos 放大到 res² 画布 → 用 H3 模型重采样精修脸部 → 解码输出原生分辨率画布。sigmas端口决定重采样步数和去噪强度。
-
-- H3FaceBlend（Minimax_H3_Face_Blend）— 修脸第 3 步
-- 把重绘后的画布缩放回裁剪尺寸 S×S，按逐帧平滑中心贴回原画面，边缘羽化融合。
-
-三、节点注释/提示改为中英双语。
-
-V0.7.2
-
-- 修复当 H3Parameter 参数节点的输入端点（total_frames / chunk_frames / context_frames）连接类似 Math Expression 节点后，预计分段的请求会陷入死循环，ComfyUI 网页卡死的 bug。
-
 V0.7.1
 
 - 添加video_guide参数，用于优化视频续写、视频前推、双视频衔接（生成中间片段），支持分段。注意：非none时，采样节点的对应参考端口的参考会被强行剪切为context_frames参数中设置的数值。参考引用逻辑与普通参考相同（提示词中声明了，才会引用）。
@@ -176,13 +143,13 @@ git clone https://github.com/supElement/ComfyUI_MinimaxH3_AutoContext.git
 | crop_mode | `stretch` | 参考图/首尾帧/参考视频缩放裁剪：`center` / `stretch` / `none` |
 | ref_sync_mode | `segmented` | 参考视频/音频是否按段切片：`global`（每段使用完整素材） / `segmented`（按段的时间比例切片） |
 | width × height | 960×544 | 一采分辨率（二采时被 latent_input 覆盖） |
-| total_frames | 362 | 生成总帧数（17n+5）；在 `Clip_Tag`/`timeline`  模式下仅作为兜底（无标签/无时间标记时），最终被各段之和覆盖 |
+| total_frames | 362 | 生成总帧数（17n+5）；在 `Clip_Tag`/`timeline` 模式下仅作为兜底（无标签/无时间标记时），最终被各段之和覆盖 |
 | fps | 24 | 帧率，用于音频同步和提示词秒数换算 |
 | chunk_frames | 90 | 每段生成帧数（17n+5），仅在 `sequential` / `global` 模式下生效 |
 | context_frames | 22 | 段间续接帧数（17n+5：5/22/39/56…），建议 22 以上 |
 | lock_audio | `true` | 二采时锁定音频区（noise_mask audio=0）：只重新采样视频、保持一采音频不变 |
 | audio_drive | `false` | 音频驱动开关，开启后视频跟随 drive_audio 生成 |
-| video_guide | `none` | 视频延长参数，支持分段。 none: 不启用(不修改视频参考逻辑)；pre_guide: 视频续写（采样节点 ref_video_0 或 + ref_video_audio_0 端口）；post_guide: 视频前推（采样节点 ref_video_0 或 + ref_video_audio_0 端口）；pre_post_guide: 双视频中间衔接（采样节点 ref_video_0 或 + ref_video_audio_0 端口，ref_video_1 或 + ref_video_audio_1 端口）。锚定帧数由 context_frames 决定。注意：非none时，采样节点的对应参考端口的参考会被强行剪切为context_frames参数中设置的数值。参考引用逻辑与普通参考相同（提示词中声明了，才会引用）|
+| video_guide | `none` | 视频延长参数，支持分段。 none: 不启用；pre_guide: 视频续写（采样节点 ref_video_0 或 + ref_video_audio_0 端口）；post_guide: 视频前推（采样节点 ref_video_0 或 + ref_video_audio_0 端口）；pre_post_guide: 双视频中间衔接（采样节点 ref_video_0 或 + ref_video_audio_0 端口，ref_video_1 或 + ref_video_audio_1 端口）。锚定帧数由 context_frames 决定。注意：非none时，采样节点的对应参考端口的参考会被强行剪切为context_frames参数中设置的数值。参考引用逻辑与普通参考相同（提示词中声明了，才会引用）|
 
 > 节点上实时显示「预计分段」预览（前端 JS 计算，不参与推理）。
 

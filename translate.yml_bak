@@ -1,0 +1,468 @@
+name: Translate Readme
+
+on:
+  push:
+    branches: ['main']
+    paths:
+      - 'README.md'
+  workflow_dispatch:        # [FIX] 支持手动触发，便于首次跑通和失败补跑
+
+# [FIX] 防止连续 push 触发多个并行 run 互相冲突 / 旧译文覆盖新译文
+concurrency:
+  group: translate-readme
+  cancel-in-progress: true
+
+jobs:
+  translate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30     # [FIX] 整体超时兜底
+    permissions:
+      contents: write
+    env:
+      ZHIPU_MODEL: glm-4-flash-250414   # [FIX] 模型名可配置，便于切换
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          # [FIX] 移除 fetch-depth: 0，只读工作区+提交单文件无需完整历史
+
+      - name: Translate with Zhipu (Free Forever)
+        env:
+          ZHIPU_KEY: ${{ secrets.ZHIPU_API_KEY }}
+          PYTHONIOENCODING: utf-8
+        run: |
+          python << 'PYEOF'
+          import requests, os, re
+
+          FENCE = '`' * 3
+          CJK_RE = re.compile(r'[\u4e00-\u9fff]+')
+
+          # [FIX] 启动即预检 API Key，缺失时立即失败并给出清晰报错，不再白白重试 3 次
+          MODEL = os.environ.get('ZHIPU_MODEL', 'glm-4-flash-250414')
+          if not os.environ.get('ZHIPU_KEY'):
+              print('缺少 ZHIPU_API_KEY secret，已中止')
+              exit(1)
+
+          with open('README.md', 'r', encoding='utf-8') as f:
+              src = f.read()
+
+          SYSTEM_PROMPT = (
+              "你是一个专业的技术文档翻译员。将用户提供的中文 Markdown 翻译为英文，严格遵守：\n\n"
+              "【格式完整性（最高优先级）】\n"
+              "1. 保持 Markdown 结构：标题层级、列表、表格竖线分隔、HTML 标签、链接的方括号和圆括号结构必须保留。\n"
+              "2. 三反引号代码块（围栏内）的全部内容必须逐字原样保留，包括注释在内一律不翻译、不改写、不增删。\n"
+              "3. 行内代码（反引号包裹）中不含中文的内容必须原样保留。\n"
+              "4. 输出的开头和结尾都不得出现三连反引号代码围栏，不得有任何开场白、结束语或译注，直接输出译文正文。\n\n"
+              "【受保护标记】\n"
+              "5. 形如 %%L1%%、%%I1%%、%%C1%%、%%U1%% 的占位符是受保护标记：必须原样留在原位置，禁止翻译、改写大小写、增删百分号、删除或移动。\n"
+              "6. 数字与单位的组合（如 3s、5ms、30fps、17n+5）必须原样保留，禁止把单位展开成单词（s 不得写成 seconds）。\n\n"
+              "【翻译完整性】\n"
+              "7. 逐句完整翻译，禁止跳过、缩译、省略。除代码块、行内代码、占位符外，译文中不得残留任何中文字符，也不要添加原文中没有的任何说明文字。\n\n"
+              "【标点】\n"
+              "8. 散文部分的中文全角标点（，。：；（）等）转为英文半角（, . : ; ( ) 等）。"
+          )
+
+          LINE_SYSTEM = (
+              "你是翻译助手。将用户给出的每一行中文翻译为英文，输出行数必须与输入完全一致，一行对应一行。"
+              "保留行内的 Markdown 结构，%%L1%%、%%I1%%、%%C1%%、%%U1%% 形式的占位符必须原样不动，数字与单位的组合（如 3s）保持原样。"
+              "只输出译文，不要任何解释。"
+          )
+
+          LINK_RE = re.compile(r'\]\(((?:[^()\n]|\([^()\n]*\))*)\)')
+          # [FIX] 同时保护 <img> 标签和 <https://...> 自动链接，防止 URL 被模型改写
+          IMG_RE = re.compile(r'<img\b[^>]*>|<https?://[^\s>]+>', re.I)
+          TAG_RE = re.compile(r'<!--.*?-->|<[^<>\n]+>', re.S)
+          INLINE_RE = re.compile(r'`[^`\n]+`')
+          # [FIX] 扩充单位白名单（kHz/MHz/GHz/TB/km/cm/mm/px/pt 等）
+          UNIT_RE = re.compile(r'\b\d+(?:\.\d+)?(?:ms|s|min|h|fps|Hz|kHz|MHz|GHz|KB|MB|GB|TB|km|cm|mm|px|pt)\b')
+
+          def mask_links(text):
+              targets = []
+              def _m(m):
+                  targets.append(m.group(1))
+                  return f'](%%L{len(targets)}%%)'
+              return LINK_RE.sub(_m, text), targets
+
+          def mask_imgs(text):
+              imgs = []
+              def _m(m):
+                  imgs.append(m.group(0))
+                  return f'%%I{len(imgs)}%%'
+              return IMG_RE.sub(_m, text), imgs
+
+          def unmask_all(text, targets, imgs, codes, units):
+              def _c(m):
+                  i = int(m.group(1))
+                  return codes[i - 1] if 1 <= i <= len(codes) else m.group(0)
+              text = re.sub(r'%%C(\d+)%%', _c, text)
+
+              def _u(m):
+                  i = int(m.group(1))
+                  return units[i - 1] if 1 <= i <= len(units) else m.group(0)
+              text = re.sub(r'%%U(\d+)%%', _u, text)
+
+              def _l(m):
+                  i = int(m.group(1))
+                  return f'({targets[i - 1]})' if 1 <= i <= len(targets) else m.group(0)
+              text = re.sub(r'\(%%L(\d+)%%\)', _l, text)
+
+              def _i(m):
+                  i = int(m.group(1))
+                  return imgs[i - 1] if 1 <= i <= len(imgs) else m.group(0)
+              return re.sub(r'%%I(\d+)%%', _i, text)
+
+          def normalize_tokens(text):
+              return re.sub(r'%{1,2}([LIUCliuc])(\d+)%{1,2}',
+                            lambda m: f'%%{m.group(1).upper()}{m.group(2)}%%', text)
+
+          BARE_RE = re.compile(r'\[([^\]\n]*)\](?!\s*\()')
+
+          def repair_links(text, n_targets):
+              ids = set(re.findall(r'%%L(\d+)%%', text))
+              missing = [i for i in range(1, n_targets + 1) if str(i) not in ids]
+              if not missing:
+                  return text
+              bare = list(BARE_RE.finditer(text))
+              if len(bare) != len(missing):
+                  return None
+              parts, last = [], 0
+              for m, i in zip(bare, missing):
+                  parts.append(text[last:m.end()])
+                  parts.append(f'(%%L{i}%%)')
+                  last = m.end()
+              parts.append(text[last:])
+              return ''.join(parts)
+
+          def fence_len(line):
+              s = line.lstrip()
+              return len(s) - len(s.lstrip('`')) if s.startswith(FENCE) else 0
+
+          def mask_line_tokens(text):
+              """围栏外按行处理：纯ASCII行内代码与 数字+单位 掩码为占位符。
+              含中文的行内代码不掩码（交给模型翻译），但其内的数字+单位仍会被保护。"""
+              codes, units = [], []
+              out, in_fence, open_len = [], False, 0
+              for ln in text.split('\n'):
+                  n = fence_len(ln)
+                  if n > 0:
+                      if not in_fence:
+                          in_fence, open_len = True, n
+                      elif n >= open_len and ln.strip().strip('`') == '':
+                          in_fence, open_len = False, 0
+                      out.append(ln)
+                      continue
+                  if not in_fence:
+                      def _c(m):
+                          s = m.group(0)
+                          if CJK_RE.search(s):
+                              return s
+                          codes.append(s)
+                          return f'%%C{len(codes)}%%'
+                      ln = INLINE_RE.sub(_c, ln)
+
+                      def _u(m):
+                          units.append(m.group(0))
+                          return f'%%U{len(units)}%%'
+                      ln = UNIT_RE.sub(_u, ln)
+                  out.append(ln)
+              return '\n'.join(out), codes, units
+
+          def strip_code_and_inline(text):
+              out, in_fence, open_len = [], False, 0
+              for ln in text.split('\n'):
+                  n = fence_len(ln)
+                  if n > 0:
+                      if not in_fence:
+                          in_fence, open_len = True, n
+                      elif n >= open_len and ln.strip().strip('`') == '':
+                          in_fence, open_len = False, 0
+                      continue
+                  if not in_fence:
+                      out.append(ln)
+              t = '\n'.join(out)
+              return re.sub(r'`[^`\n]*`', '', t)
+
+          def prose_text(text):
+              t = strip_code_and_inline(text)
+              return TAG_RE.sub(' ', t)
+
+          def extract_fence_spans(text):
+              """返回每个代码围栏块的 (首行行号, 末行行号)，含首尾围栏行"""
+              spans, in_fence, open_len, start = [], False, 0, 0
+              for idx, ln in enumerate(text.split('\n')):
+                  n = fence_len(ln)
+                  if n > 0:
+                      if not in_fence:
+                          in_fence, open_len, start = True, n, idx
+                      elif n >= open_len and ln.strip().strip('`') == '':
+                          spans.append((start, idx))
+                          in_fence = False
+                          continue
+              return spans
+
+          def restore_code_blocks(out_text, src_text):
+              """把译文中每个代码块用源文档对应代码块原样覆盖（机械恢复）。
+              代码块数量对不上时返回 None。"""
+              sl = src_text.split('\n')
+              ol = out_text.split('\n')
+              ss = extract_fence_spans(src_text)
+              oo = extract_fence_spans(out_text)
+              if len(ss) != len(oo):
+                  return None
+              for (a1, a2), (b1, b2) in sorted(zip(ss, oo), key=lambda p: -p[1][0]):
+                  ol[b1:b2 + 1] = sl[a1:a2 + 1]
+              return '\n'.join(ol)
+
+          def validate_masked(text, n_targets, n_imgs, n_codes, n_units):
+              ids = sorted(int(x) for x in re.findall(r'%%L(\d+)%%', text))
+              if ids != list(range(1, n_targets + 1)):
+                  return f"占位符不完整: 期望 {n_targets} 个, 实际 {len(ids)} 个"
+              paren_ids = sorted(int(x) for x in re.findall(r'\(%%L(\d+)%%\)', text))
+              if paren_ids != list(range(1, n_targets + 1)):
+                  return f"占位符缺少圆括号包裹: {paren_ids}"
+              for pat, name, total in ((r'%%I(\d+)%%', '图片', n_imgs),
+                                       (r'%%C(\d+)%%', '行内代码', n_codes),
+                                       (r'%%U(\d+)%%', '单位', n_units)):
+                  pids = sorted(int(x) for x in re.findall(pat, text))
+                  if pids != list(range(1, total + 1)):
+                      return f"{name}占位符不完整: 期望 {total} 个, 实际 {len(pids)} 个"
+              cjk = CJK_RE.findall(prose_text(text))
+              if cjk:
+                  return "译文存在中文残留: " + ", ".join(cjk[:10])
+              return None
+
+          def validate_final(out):
+              a, b = LINK_RE.findall(src), LINK_RE.findall(out)
+              if len(a) != len(b):
+                  return f"整体链接数量不一致: 源 {len(a)} / 译 {len(b)}"
+              bad = [(x, y) for x, y in zip(a, b) if x != y]
+              if bad:
+                  return "整体链接目标不一致: " + "; ".join(f"{x} -> {y}" for x, y in bad[:5])
+              ia, ib = IMG_RE.findall(src), IMG_RE.findall(out)
+              if len(ia) != len(ib):
+                  return f"整体图片/自动链接数量不一致: 源 {len(ia)} / 译 {len(ib)}"
+              fs, fo = extract_fence_spans(src), extract_fence_spans(out)
+              if len(fs) != len(fo):
+                  return f"整体代码块数量不一致: 源 {len(fs)} / 译 {len(fo)}"
+              t = LINK_RE.sub('](URL)', out)
+              cjk = CJK_RE.findall(prose_text(t))
+              if cjk:
+                  return "整体中文残留: " + ", ".join(cjk[:10])
+              # [FIX] 长度比例检查：模型整体缩译时其他校验均能通过，这里兜底
+              sp = len(prose_text(LINK_RE.sub('](URL)', src)))
+              op = len(prose_text(t))
+              if sp > 0 and op < sp * 0.5:
+                  return f"译文长度异常: 源散文 {sp} 字符 / 译散文 {op} 字符，疑似严重缩译"
+              return None
+
+          def split_doc(text):
+              MIN, HARD = 3000, 7000
+              lines = text.split('\n')
+              chunks, cur, in_fence, open_len, size = [], [], False, 0, 0
+
+              def flush():
+                  nonlocal cur, size
+                  if cur:
+                      chunks.append('\n'.join(cur))
+                      cur, size = [], 0
+
+              for ln in lines:
+                  n = fence_len(ln)
+                  if n > 0:
+                      if not in_fence:
+                          in_fence, open_len = True, n
+                      elif n >= open_len and ln.strip().strip('`') == '':
+                          in_fence, open_len = False, 0
+                  if not in_fence and size >= MIN and (ln.startswith('## ') or ln.startswith('# ')):
+                      flush()
+                  elif not in_fence and size >= HARD:
+                      # [FIX] 强制分片兜底：原版只能在空行切割，遇到超长无空行的段落/表格
+                      # 时 chunk 会无限膨胀，输出溢出 max_tokens 导致 3 次重试全失败。
+                      # 现在超出 HARD 后在行边界强制切割（跳过表格行以降低切坏表格的概率，
+                      # 代码围栏内已有 in_fence 保护不会切割）。
+                      if not ln.lstrip().startswith('|'):
+                          flush()
+                  cur.append(ln)
+                  size += len(ln) + 1
+              flush()
+              return chunks
+
+          def api_call(system, user, temperature):
+              resp = requests.post(
+                  "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+                  headers={"Authorization": f"Bearer {os.environ['ZHIPU_KEY']}"},
+                  json={
+                      "model": MODEL,      # [FIX] 使用可配置的模型名
+                      "max_tokens": 16000,
+                      "temperature": temperature,
+                      "messages": [
+                          {"role": "system", "content": system},
+                          {"role": "user", "content": user}
+                      ]
+                  },
+                  timeout=600
+              )
+              if resp.status_code != 200:
+                  raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
+              data = resp.json()
+              if "error" in data:
+                  raise RuntimeError(f"API错误: {data['error']}")
+              if "choices" not in data or len(data["choices"]) == 0:
+                  raise RuntimeError(f"响应格式异常: {data}")
+              choice = data['choices'][0]
+              text = choice.get('message', {}).get('content', '')
+              if choice.get('finish_reason') != 'stop':
+                  raise RuntimeError(f"finish_reason={choice.get('finish_reason')}")
+              return text
+
+          def call_translate(chunk, temperature):
+              return api_call(
+                  SYSTEM_PROMPT,
+                  "请将以下 Markdown 片段翻译为英文。片段中所有 %%L1%%、%%I1%%、%%C1%%、%%U1%% 形式的占位符必须原样保留在原位置。"
+                  "代码块内容逐字保留。数字与单位（如 3s、30fps）保持原样。直接输出译文正文，不要任何解释。\n\n"
+                  + chunk,
+                  temperature)
+
+          def cjk_surgery(text, chunk):
+              """中文残留的定向修复:
+              - 行内中文在源文档中不存在 => 模型自行添加的行 => 删除
+              - 行内中文能在源文档中找到 => 漏译的原文行 => 二次翻译"""
+              lines = text.split('\n')
+              in_fence, open_len = False, 0
+              bad = []
+              for idx, ln in enumerate(lines):
+                  n = fence_len(ln)
+                  if n > 0:
+                      if not in_fence:
+                          in_fence, open_len = True, n
+                      elif n >= open_len and ln.strip().strip('`') == '':
+                          in_fence, open_len = False, 0
+                      continue
+                  if in_fence:
+                      continue
+                  t = re.sub(r'`[^`\n]*`', '', ln)
+                  if CJK_RE.search(t):
+                      bad.append(idx)
+              if not bad:
+                  return text
+              to_fix, to_del = [], []
+              for i in bad:
+                  runs = CJK_RE.findall(lines[i])
+                  if any(r in chunk for r in runs):
+                      to_fix.append(i)
+                  else:
+                      to_del.append(i)
+              for i in to_del:
+                  print(f"  [CJK修复] 删除模型自行添加、源文档中不存在的行: {lines[i].strip()[:60]!r}")
+                  lines[i] = ''
+              if to_fix:
+                  payload = '\n'.join(lines[i] for i in to_fix)
+                  try:
+                      fixed_lines = api_call(
+                          LINE_SYSTEM,
+                          "请将以下各行逐行翻译为英文（输出行数必须与输入一致）:\n\n" + payload,
+                          0.1).strip().split('\n')
+                      if len(fixed_lines) == len(to_fix):
+                          for i, nl in zip(to_fix, fixed_lines):
+                              # [FIX] 保留原行缩进（嵌套列表/引用块），只替换正文，
+                              # 否则 strip() 会破坏 Markdown 层级结构
+                              ws = re.match(r'[ \t]*', lines[i]).group(0)
+                              lines[i] = ws + nl.strip()
+                          print(f"  [CJK修复] 已对 {len(to_fix)} 行漏译内容完成二次翻译")
+                      else:
+                          print(f"  [CJK修复] 二次翻译行数不匹配(出 {len(fixed_lines)}/入 {len(to_fix)})，保留原文")
+                  except Exception as e:
+                      print(f"  [CJK修复] 二次翻译失败: {e}，保留原文")
+              return '\n'.join(lines)
+
+          def strip_fence(content):
+              """[FIX] 原版无条件剥掉译文开头的围栏，当文档本身以代码块开头时会误删，
+              导致围栏数量对不上、restore_code_blocks 失败、整个任务中止。
+              现在只在整个输出被单对围栏完整包裹（首行为围栏、末行为围栏、
+              围栏 span 覆盖全文）且语言标注为空或 markdown/md 时，才认定为模型
+              自行添加的外壳并剥离。"""
+              content = content.strip()
+              lines = content.split('\n')
+              if (len(lines) >= 2 and fence_len(lines[0]) > 0
+                      and fence_len(lines[-1]) >= fence_len(lines[0])
+                      and lines[-1].strip().strip('`') == ''):
+                  spans = extract_fence_spans(content)
+                  if len(spans) == 1 and spans[0] == (0, len(lines) - 1):
+                      lang = lines[0].strip()[fence_len(lines[0]):].strip().lower()
+                      if lang in ('', 'markdown', 'md'):
+                          return '\n'.join(lines[1:-1]).strip()
+              return content
+
+          chunks = split_doc(src)
+          print(f"文档共 {len(src)} 字符，分为 {len(chunks)} 段: {[len(c) for c in chunks]}")
+          # [FIX] 超长分片提前告警（如整个超大代码块无空行，无法安全切割时）
+          big = [len(c) for c in chunks if len(c) > 12000]
+          if big:
+              print(f"警告: 以下分片过长 {big} 字符，若翻译失败请考虑调整 MIN/HARD 或人工拆分文档")
+
+          parts = []
+          for i, chunk in enumerate(chunks, 1):
+              masked_l, targets = mask_links(chunk)
+              masked_i, imgs = mask_imgs(masked_l)
+              masked, codes, units = mask_line_tokens(masked_i)
+
+              done = None
+              for attempt, temp in ((1, 0.1), (2, 0.3), (3, 0.5)):
+                  try:
+                      text = call_translate(masked, temp)
+                  except Exception as e:
+                      print(f"[段{i}/第{attempt}次] 调用失败: {e}")
+                      continue
+                  if not text or not text.strip():
+                      print(f"[段{i}/第{attempt}次] 翻译结果为空")
+                      continue
+                  text = normalize_tokens(strip_fence(text))
+                  fixed = repair_links(text, len(targets))
+                  if fixed is None:
+                      found = len(set(re.findall(r'%%L(\d+)%%', text)))
+                      print(f"[段{i}/第{attempt}次] 占位符丢失且无法机械修复: 源 {len(targets)} 个 / 译出 {found} 个")
+                      print(f"  译段开头: {text[:80].strip()!r}")
+                      continue
+                  # [FIX] 容错清洗：模型可能在括号内加空格 ( %%L1%% ) -> (%%L1%%)
+                  fixed = re.sub(r'\(\s*(%%[A-Z]\d+%%)\s*\)', r'(\1)', fixed)
+                  err = validate_masked(fixed, len(targets), len(imgs), len(codes), len(units))
+                  if err and '中文残留' in err:
+                      fixed = cjk_surgery(fixed, masked)
+                      err = validate_masked(fixed, len(targets), len(imgs), len(codes), len(units))
+                  if err:
+                      print(f"[段{i}/第{attempt}次] 校验失败: {err}")
+                      print(f"  译段开头: {fixed[:80].strip()!r}")
+                      continue
+                  done = unmask_all(fixed, targets, imgs, codes, units)
+                  restored = restore_code_blocks(done, chunk)
+                  if restored is None:
+                      print(f"[段{i}/第{attempt}次] 代码块数量不一致，无法机械恢复")
+                      done = None
+                      continue
+                  done = restored
+                  break
+
+              if done is None:
+                  print(f"第 {i} 段三次尝试均未通过，已中止，不写入 README.en.md")
+                  exit(1)
+              parts.append(done)
+              print(f"[段{i}] 通过（含 {len(targets)} 条链接, {len(imgs)} 张图片/自动链接, "
+                    f"{len(codes)} 处行内代码, {len(units)} 个单位标记）")
+
+          content = '\n'.join(parts)
+          err = validate_final(content)
+          if err:
+              print(f"整体校验失败: {err}")
+              exit(1)
+
+          with open('README.en.md', 'w', encoding='utf-8') as f:
+              f.write(content)
+          print(f"全部 {len(chunks)} 段通过，README.en.md 已更新")
+          PYEOF
+
+      - name: Push changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.en.md
+          git diff --staged --quiet || ( git commit -m "docs: auto translate" && git push )
