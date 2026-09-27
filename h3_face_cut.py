@@ -1,21 +1,41 @@
-"""h3_face_cut.py — 修脸第 1 步: 检测与稳定裁剪 (v10, 分镜感知子轨 + 统一 res² 输出)
+"""h3_face_cut.py — 修脸第 1 步: 分镜优先的检测与稳定裁剪 (v20, 逐帧平滑窗口)
 
-v10: 窗口与输出解耦 —
-- 窗口 (内部): 轨迹按 出现区间 × 尺度突变 切子轨, 每条独立平滑、独立 S_i = 中位脸×(1+expand),
-  小脸子轨 S_i 小 → 归一化后脸占画布比例最大 (最该修的得到最多像素);
-- 输出 (外部): 每条子轨裁剪后立即 lanczos 归一化到统一 res², 拼成单一 crop_images 张量输出
-  (行序 = 子轨序, 与 ② 的画布行结构 1:1 对应)。
-- 无脸帧不进子轨; 中位脸 ≥ res×skip_ratio 的子轨跳过 (无行、无采样)。
-- pack v5: 子轨几何 (f0/f1/S/centers/crop_off) 进 face_pack, crops 不再进 pack。
-解码分块仍按主采样 H3 token 账目 (face_split_blocks / token_blocks)。
+v20 变更 (同一身份裁剪平滑化, 远景小脸占比不受影响):
+- 窗口边长 S 从"每个 DP 分段一个常数"改为"逐帧一条平滑序列":
+    S_t = 该帧脸尺寸 × (1+余量) → 中值滤波 (窗5) → 相邻变化率限速 (_S_RATE)
+    → 包含性地板 (快速推镜头时限速让位, 脸必须完整在窗内) → 钳制 [_MIN_WIN, min(W,H)]。
+  小脸仍得到小 S → res² 画布上占比恒为 ≈1/(1+余量), 与脸的绝对大小无关 —
+  远景小脸不会被稀释 (修脸强度不因远景而打折)。
+- 窗口中心按整条出现区间统一中值平滑; DP 分段只划定 skip 边界, 不再产生几何接缝 —
+  相邻分段的 (S_t, center_t) 序列天然连续, 贴回后同一身份无直切感。
+- 尺寸超比罚 8→2: 逐帧 S 已让段内小脸保持占比, 分段只剩 skip 划分与极端变焦防护。
+- 日志收编: 常规运行只保留入口/出口/警告; 逐子轨细节走 h3ff.vlog
+  (h3_facefix.py 顶部 _VERBOSE=True 打开)。
+- 缓存指纹加 win_v=2: 升级后旧缓存自动失效 (无需手动 clear_cache)。
+
+v19.3 — 分镜检测仅保留官方临时文件路径; 窗口下限提为 _MIN_WIN。
+v19.2 — 删除窗口撑大残留, 窗口只由真实检测框决定。
+v19 — 全帧保留 (17n+5 网格约束移出本节点, 由 Face_Resample 编码期补齐)。
+v18 — 分镜优先 (shot-aware), 官方 PySceneDetect 管线; v17.2 — latent 端口 optional;
+v12 — 尺寸信号 YOLO 实测优先; v11 — multi_sec 内置 SeC-4B 身份追踪 (pack v7)。
 """
-
 import os
+import math
+import shutil
+import tempfile
 import numpy as np
 import torch
 import folder_paths
 import comfy.utils
+import hashlib
+import comfy.model_management
 
+
+try:
+    from . import latent_cache
+except ImportError:
+    import latent_cache
+from comfy_api.latest import io
 try:
     from . import h3_conditioning
     from . import h3_facefix as h3ff
@@ -25,6 +45,53 @@ except ImportError:
 
 MODEL_DIR = os.path.join(folder_paths.models_dir, "elementEasy")
 _MODEL_EXTS = {".pt", ".pth", ".onnx", ".engine", ".torchscript"}
+
+# ---- 可调常量: 窗口下限 (px) ----
+# 裁剪窗口 S 的最小值 (自动 16 对齐)。远景小脸时 S 会被钳在此地板上 —
+# 调小 → 远景占比更高 (脸在画布上更大)
+_MIN_WIN = 48
+
+# ---- 可调常量: 窗口边长时序平滑 (v20) ----
+# 相邻两帧 S 的最大变化率 (0.20 = 每帧最多 ±20%)。调小 → 更平滑但快速推镜头时
+# 更容易触发"包含性地板"跳变; 调大 → 更贴脸但平滑感弱。0.15~0.25 都合理。
+_S_RATE = 0.20
+
+
+def _win_floor():
+    """窗口下限 (16 对齐后的 _MIN_WIN) — 唯一来源, 供窗口规划与 DP 估计共用。"""
+    return ((int(_MIN_WIN) + 15) // 16) * 16
+
+
+# ================= 内置常量=================
+_GAP_TOL = 12        # 检测缺失多少帧内视为同一次出现 (绝不跨镜头)
+_SCALE_SPLIT = 1.2   # 片内容许的最大脸尺寸比 (软目标, 进入 DP 分段代价)
+_SKIP_RATIO = 0.8    # 脸 >= res × 此比例 → 跳过重采样
+_SEC_MEM_SIZE = 12   # SeC-4B 记忆库槽位数 (上游默认; 逐镜头单元独立调用, 12 足够)
+
+
+def _has_scenedetect():
+    """scenedetect 是否可用 (shot_detect 自动降级依据)。"""
+    try:
+        import scenedetect  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def _flash_attn_available():
+    """flash-attn 自动检测: 包已安装 + CUDA 可用 + 设备算力 >= sm_80 (Ampere+)。
+    fp32 权重与 flash-attn 不兼容的情形由 load_sec_model 内部自动关闭, 此处不处理 dtype。"""
+    try:
+        import flash_attn  # noqa: F401
+    except Exception:
+        return False
+    try:
+        if not torch.cuda.is_available():
+            return False
+        major, _minor = torch.cuda.get_device_capability(0)
+        return int(major) >= 8
+    except Exception:
+        return False
 
 
 def _list_models():
@@ -42,231 +109,955 @@ def _size(bx):
     return max(bx[2] - bx[0], bx[3] - bx[1])
 
 
-def _median_smooth(boxes):
+def _median_smooth(seqs):
+    """逐坐标中值平滑 (窗口5, 端点收缩)。全流水线唯一平滑实现 (测量去噪用)。"""
     sm = []
-    for i in range(len(boxes)):
-        win = boxes[max(0, i - 2): i + 3]
-        sm.append([float(np.median([w[k] for w in win])) for k in range(4)])
+    for i in range(len(seqs)):
+        win = seqs[max(0, i - 2): i + 3]
+        sm.append([float(np.median([w[k] for w in win])) for k in range(len(seqs[i]))])
     return sm
 
 
-class H3FaceCut:
-    CATEGORY = "MinimaxH3_AutoContext/FaceFix"
-    DESCRIPTION = ("Face fix step 1: shot-aware subtracks, adaptive crop window, "
-                   "uniform res^2 output.\n"
-                   "修脸第 1 步: 分镜感知子轨, 裁剪窗口自适应, 输出统一 res²。只切不算。")
-    FUNCTION = "execute"
-    RETURN_TYPES = ("IMAGE", "*")
-    RETURN_NAMES = ("crop_images", "face_pack")
-    OUTPUT_TOOLTIPS = ("Uniform res^2 crops of all sampled subtracks (row order = subtrack order)\n"
-                       "所有待采样子轨的统一 res² 裁剪 (行序=子轨序)",
-                       "Subtrack geometry pack (v5): f0/f1/S/centers/crop_off, consumed by ② ③\n"
-                       "子轨几何包 (v5): f0/f1/S/centers/crop_off, 供 ② ③ 使用")
+def _yolo_size_track(sec_boxes, per_frame, iou_thr=0.35):
+    """逐帧用 YOLO 实测尺寸覆盖 SeC 紧致框尺寸 (测量交叉校验)。
+    SeC mask 是分割输出, 天然含头发/肩颈且逐帧波动 — 尺寸信号以 YOLO 实测为准。"""
+    F = len(sec_boxes)
+    out = [None] * F
+    for i in range(F):
+        dets = per_frame[i]
+        if not dets:
+            continue
+        sb = sec_boxes[i]
+        if sb is None:
+            if len(dets) == 1:
+                d = dets[0]
+                out[i] = max(d[2] - d[0], d[3] - d[1])
+            continue
+        best, best_r = None, float(iou_thr)
+        for d in dets:
+            r = h3ff._overlap_ratio(sb[:4], d[:4])
+            if r > best_r:
+                best_r, best = r, d
+        if best is not None:
+            out[i] = max(best[2] - best[0], best[3] - best[1])
+    return out
+
+
+def _images_digest(img):
+    """外部 images 的轻量内容摘要 (抽样 ≤16 帧 × 空间 1/64, fp16 md5) — 缓存键。"""
+    t = img.detach()
+    step = max(1, int(t.shape[0]) // 16)
+    arr = t[::step, ::8, ::8].contiguous().cpu().numpy().astype(np.float16)
+    return hashlib.md5(arr.tobytes()).hexdigest()
+
+
+def _fps_eff(a_lat, F_expect, seg):
+    """有效帧率: 有 a_lat 按音频账本换算 (latent 模式); images 模式 (无 a_lat)
+    取 info.h3_runtime.fps 或默认 24。"""
+    if a_lat is not None:
+        return max(1.0, F_expect * h3ff.AUDIO_LATENTS_PER_SEC / max(int(a_lat.shape[-1]), 1))
+    rt = seg.get("h3_runtime") if isinstance(seg.get("h3_runtime"), dict) else {}
+    return max(1.0, float(rt.get("fps") or seg.get("fps") or 24.0))
+
+# ---- 裁剪窗口放大: 可选放大模型 (upscale_models), 默认 lanczos ----
+def _list_upscale_models():
+    try:
+        return folder_paths.get_filename_list("upscale_models") or []
+    except Exception:
+        return []
+
+
+def _load_sr_model(rel):
+    """加载放大模型: 直接走 spandrel (ComfyUI 官方 UpscaleModelLoader 的实际加载器,
+    requirements 自带依赖)。仅接受图像超分模型, 视频/插帧类模型报错回退 lanczos。"""
+    try:
+        import spandrel
+        from spandrel import ImageModelDescriptor
+    except ImportError:
+        raise RuntimeError("spandrel not installed — ComfyUI 2024.08+ 自带, 请升级 ComfyUI")
+    try:   
+        import spandrel_extra_arches
+        spandrel_extra_arches.install()
+    except Exception:
+        pass
+    path = folder_paths.get_full_path("upscale_models", rel)
+    if not path:
+        raise FileNotFoundError(rel)
+    sd = comfy.utils.load_torch_file(path, safe_load=True)
+    if "module.layers.0.weight" in sd:
+        sd = comfy.utils.state_dict_prefix_replace(sd, {"module.": ""})
+    desc = spandrel.ModelLoader().load_from_state_dict(sd)
+    if not isinstance(desc, ImageModelDescriptor):
+        raise ValueError(f"{rel}: not an image upscale model ({type(desc).__name__})")
+    return desc.eval()
+
+
+
+def _sr_pass(sr_model, x):
+    """单次放大: [N,H,W,3] float 0..1 → [N,H*s,W*s,3]。分批执行, OOM 自动减半批。"""
+    dev = comfy.model_management.get_torch_device()
+    sr_model.to(dev)
+    out, n, bs, i = [], int(x.shape[0]), max(1, min(16, int(x.shape[0]))), 0
+    while i < n:
+        try:
+            b = x[i:i + bs].movedim(-1, 1).to(dev)
+            with torch.no_grad():
+                o = sr_model(b)
+            out.append(o.movedim(1, -1).clamp(0.0, 1.0).cpu())
+            i += bs
+        except comfy.model_management.OOM_EXCEPTION:
+            if bs <= 1:
+                raise
+            bs = max(1, bs // 2)
+    return torch.cat(out, dim=0)
+
+
+def _sr_to_res(sr_model, imgs, res, tag=""):
+    """SR 放大链: 反复套用放大模型直到边长 ≥ res (上限 2 次), 再 lanczos 到精确 res。
+    窗口 S 远小于 res 时 (远景小脸) 由 SR 模型承担主要放大倍数, 消除 lanczos 高倍
+    放大的振铃 → VAE 编码色斑; S 接近 res 时一次 SR 后即为缩小, 收益有限。"""
+    x = imgs
+    n_pass = 0
+    while int(x.shape[1]) < res and n_pass < 2:
+        x = _sr_pass(sr_model, x)
+        n_pass += 1
+        h3ff.vlog(f"[H3-FaceCut] {tag}SR pass {n_pass} -> {int(x.shape[1])}px")
+    if (int(x.shape[1]), int(x.shape[2])) != (res, res):
+        x = comfy.utils.common_upscale(x.movedim(-1, 1).contiguous(), res, res,
+                                       "lanczos", "disabled").movedim(1, -1)
+    return x
+
+
+
+# ================= 分镜检测 (先分镜, 后面部 — 官方 PySceneDetect 管线) =================
+def _detect_shot_cuts_official_file(frames_rgb, threshold, fps_hint):
+    """官方用法 (与 Element_scene_detection.detect_scenes_direct 逐字相同):
+    临时视频文件 + open_video + SceneManager + ContentDetector + get_scene_list。
+    fps 只影响临时文件的时长元数据, 不影响切点帧号 (量化到 1/1001 无副作用)。"""
+    from scenedetect import SceneManager, ContentDetector, open_video
+    import av as _av
+    F = int(frames_rgb.shape[0])
+    H, W = int(frames_rgb.shape[1]), int(frames_rgb.shape[2])
+    fps = float(fps_hint) if fps_hint and float(fps_hint) > 0 else 24.0
+    He, We = H - (H & 1), W - (W & 1)  
+    tmpdir = tempfile.mkdtemp(prefix="h3_shot_")
+    tmppath = os.path.join(tmpdir, "frames.mp4")
+    try:
+        container = _av.open(tmppath, mode="w")
+        from fractions import Fraction
+        fps_q = Fraction(int(round(fps * 1001)), 1001)
+        vstream = container.add_stream("libx264", rate=fps_q)
+        vstream.width, vstream.height = We, He
+        vstream.pix_fmt = "yuv420p"
+        vstream.options = {"crf": "16"}
+        for i in range(F):
+            img = np.ascontiguousarray(frames_rgb[i][:He, :We])
+            for pkt in vstream.encode(_av.VideoFrame.from_ndarray(img, format="rgb24")):
+                container.mux(pkt)
+        for pkt in vstream.encode():
+            container.mux(pkt)
+        container.close()
+        video = open_video(tmppath)
+        scene_manager = SceneManager()
+        scene_manager.add_detector(ContentDetector(threshold=float(threshold)))
+        scene_manager.detect_scenes(video, show_progress=False)
+        scenes = scene_manager.get_scene_list()
+        return [scene[0].get_frames() for scene in scenes[1:]]
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _detect_shot_cuts(frames_rgb, threshold, fps_hint=24.0):
+    """分镜切点 (官方 PySceneDetect 管线): 临时视频文件 + open_video + SceneManager。
+    切点 = 新镜头第一帧 (scene[0].get_frames())。未安装 scenedetect → 仅警告,
+    按无切点处理 (保留上游分段隔离)。"""
+    F = int(frames_rgb.shape[0])
+    if F < 4:
+        return []
+    try:
+        cuts = _detect_shot_cuts_official_file(frames_rgb, threshold, fps_hint)
+        h3ff.log(f"[H3-FaceCut] PySceneDetect (official open_video+SceneManager): "
+                 f"{len(cuts)} cut(s) @ threshold={float(threshold):g}\n"
+                 f"[H3-FaceCut] PySceneDetect (官方 open_video+SceneManager): "
+                 f"阈值={float(threshold):g} 检出 {len(cuts)} 个切点")
+        return sorted({int(c) for c in cuts if 0 < int(c) < F})
+    except Exception as e:
+        h3ff.warn(f"[H3-FaceCut] PySceneDetect unavailable ({e}) — pip install scenedetect; "
+                  f"shot cuts disabled, upstream-segment isolation only\n"
+                  f"[H3-FaceCut] PySceneDetect 不可用 ({e}) — pip install scenedetect; "
+                  f"镜头切点不可用, 仅保留上游分段隔离")
+        return []
+
+
+def _shot_bounds(blocks, cuts, F):
+    """★ 镜头单元 = 仅按真实检测切点划分, 无缝覆盖 [0, F)。
+    上游分段边界 (主采样生成接缝) 不再充当镜头边界: 接缝是生成账本, 不是内容边界 —
+    主采样跨接缝锚定续接, 解码内容在接缝处连续, 面部轨迹必须同样连续。
+    在接缝处切开会产生 [141,144) 这类孤立 3 帧单元: SeC 只有 3 帧上下文、
+    窗口平滑被截断、漏检帧被迫跨切点插值 → 贴回错位。"""
+    shots = []
+    cur = 0
+    for c in cuts:
+        c = int(c)
+        if cur < c < int(F):
+            shots.append((cur, c))
+            cur = c
+    shots.append((cur, int(F)))
+    return shots if shots else [(0, int(F))]
+
+
+
+# ==================================================================
+# ============ v20: 逐帧平滑窗口 (同一身份不再直切) ============
+# ==================================================================
+def _smooth_window_sizes(face_sizes, expand_f, W, H, rate=_S_RATE):
+    """逐帧窗口边长序列 (v20): S_t = 该帧脸尺寸×(1+余量) → 中值滤波(窗5)
+    → 相邻变化率限速 → 包含性地板 → 钳制 [_win_floor(), min(W,H)]。
+    - 远景小脸仍得到小 S → res² 画布上占比恒 ≈ 1/(1+余量), 与脸绝对大小无关;
+    - 平滑只消除瞬时抖动, 不做任何"统一放大";
+    - 快速推镜头时限速让位于包含性 (S 不小于该帧所需), 宁可跳变也不切掉脸。"""
+    fl = _win_floor()
+    cap = max(fl, min(int(W), int(H)))
+    n = len(face_sizes)
+    raw = []
+    for s in face_sizes:
+        s = float(s) * (1.0 + float(expand_f))
+        raw.append(max(fl, min(cap, s)))
+    med = [float(np.median(raw[max(0, i - 2): i + 3])) for i in range(n)]
+    out = [med[0]]
+    for i in range(1, n):
+        prev, tgt = out[-1], med[i]
+        max_d = prev * float(rate)
+        nxt = prev + max(-max_d, min(max_d, tgt - prev))
+        need = raw[i]  
+        if nxt < need:
+            nxt = need
+        out.append(min(cap, nxt))
+    return [max(fl, int(round(s))) for s in out]
+
+
+def _window_centers(boxes, S_seq, W, H):
+    """逐帧钳制窗口中心 (v20): 脸完整在窗内 ∩ 窗完整在帧内 (构造性包含)。
+    boxes 已按整条出现区间中值平滑、S_seq 已平滑 → 相邻帧中心天然连续;
+    仅脸贴近画面边缘时钳制生效。面部宽于窗口 (宽幅帧) 退化为帧内跟随。"""
+    n = len(boxes)
+    px, py = [], []
+    for k in range(n):
+        b = boxes[k]
+        half = S_seq[k] * 0.5
+        cx = (b[0] + b[2]) * 0.5
+        cy = (b[1] + b[3]) * 0.5
+        lo_x = max(b[2] - half, half)        
+        hi_x = min(b[0] + half, W - half)     
+        lo_y = max(b[3] - half, half)
+        hi_y = min(b[1] + half, H - half)
+        if lo_x > hi_x:   
+            lo_x = hi_x = min(max(cx, half), W - half)
+        if lo_y > hi_y:
+            lo_y = hi_y = min(max(cy, half), H - half)
+        px.append(float(min(max(cx, lo_x), hi_x)))
+        py.append(float(min(max(cy, lo_y), hi_y)))
+    return [[a, b] for a, b in zip(px, py)]
+
+
+def _sample_windows(frames, masks_full, use, centers, S_seq):
+    """以逐帧窗口中心/边长提取 S_t×S_t 裁剪与窗口 mask (同窗同变换 → 对齐不变)。
+    grid_sample 双线性; 帧 padding replicate, mask 补 0。S_seq 逐帧 (平滑后)。"""
+    H, W = int(frames.shape[1]), int(frames.shape[2])
+    crops, win_masks = [], []
+    for k, j in enumerate(use):
+        S = int(S_seq[k])
+        cx, cy = float(centers[k][0]), float(centers[k][1])
+        ax = torch.arange(S, dtype=torch.float32)
+        xs = ((cx - S * 0.5 + 0.5 + ax) / W) * 2.0 - 1.0
+        ys = ((cy - S * 0.5 + 0.5 + ax) / H) * 2.0 - 1.0
+        grid = torch.stack([xs[None, :].expand(S, S), ys[:, None].expand(S, S)],
+                           dim=-1).unsqueeze(0)  # [1,S,S,2]
+        fr = torch.from_numpy(frames[j]).permute(2, 0, 1).float().unsqueeze(0)
+        crops.append(torch.nn.functional.grid_sample(
+            fr, grid, mode="bilinear", padding_mode="border", align_corners=False)[0])  # [3,S,S]
+        m = masks_full[j] if (masks_full is not None and j < len(masks_full)) else None
+        if m is not None:
+            mt = torch.from_numpy(m).float().unsqueeze(0).unsqueeze(0)  # [1,1,H,W]
+            win_masks.append(torch.nn.functional.grid_sample(
+                mt, grid, mode="bilinear", padding_mode="zeros", align_corners=False)[0])  # [1,S,S]
+        else:
+            win_masks.append(None)
+    return crops, win_masks
+
+
+def _partition_appearance(sm_sz, S_seq, res, scale_split, skip_thr):
+    """一次出现内的最优分段 (DP), 无手调切分规则。v20:
+    - 采样代价按逐帧窗口累加 (Σ res/S_t, 与逐帧 S 一致);
+    - 尺寸超比罚 8→2: 逐帧 S 已让段内小脸保持占比, 分段只剩 skip 划分与
+      极端变焦防护 — 更少的分段 = 更少的潜在接缝;
+    - mn >= skip_thr → 代价 0 (大脸段跳过重采样)。"""
+    n = len(sm_sz)
+    INF = float("inf")
+    dp = [0.0] + [INF] * n
+    prev = [-1] * (n + 1)
+    for i in range(1, n + 1):
+        mx, mn = 0.0, INF
+        gsum = 0.0
+        for a in range(i - 1, -1, -1): 
+            s = sm_sz[a]
+            if s > mx:
+                mx = s
+            if s < mn:
+                mn = s
+            gsum += res / float(max(1, int(S_seq[a])))
+            L = i - a
+            if L < 5:
+                continue
+            if mn >= skip_thr:
+                c = 0.0
+            else:
+                c = 22.0 + gsum
+                if mx > mn * float(scale_split):
+                    c += (mx / (mn * float(scale_split)) - 1.0) * gsum * 2.0
+            if dp[a] + c < dp[i]:
+                dp[i] = dp[a] + c
+                prev[i] = a
+    if dp[n] == INF:
+        return []
+    out, i = [], n
+    while i > 0:
+        out.append((prev[i], i))
+        i = prev[i]
+    return out[::-1]
+
+
+def _build_subtracks_for_track(boxes_seq, frames, H, W, res, expand_f, scale_split,
+                               skip_ratio, gap_tol, tid, masks_full=None,
+                               size_override=None, shot_id=None, sr_model=None):
+    """单条身份轨迹 → (subtracks, crop_parts, n_rows)。
+    分工: SeC-4B 身份/mask, YOLO 逐帧实测尺寸; 本函数只做应用层几何:
+    DP 分段 (skip 边界) → 逐帧平滑窗口 (S_t 与中心均按整条出现区间计算并时序平滑)
+    → 采样 → 账本。检测帧全部分配, 不丢弃。
+    镜头单元约束: appearance 合并与框插值禁止跨镜头单元 (切镜头处强制断开, 防跳变)。
+    v20.1: 修复逐帧缩放的 BCHW 布局错误; 相邻分段共享同一套连续的 (S_t, center_t)
+    序列 → 段边界不再直切; 小脸占比恒为 1/(1+余量), 与脸绝对大小无关。
+    v19: 不按 17n+5 掐尾 — 全部帧保留, 网格约束由 Face_Resample 编码期补齐。"""
+    F = len(boxes_seq)
+    det_idx = [i for i, b in enumerate(boxes_seq) if b is not None]
+    subtracks, crop_parts, n_rows = [], [], 0
+    if not det_idx:
+        return subtracks, crop_parts, 0
+
+    intervals = []
+    for i in det_idx:
+        pe = intervals[-1][1] if intervals else -1
+        if intervals and i - pe - 1 <= int(gap_tol):
+            intervals[-1][1] = i
+            intervals[-1][2].append(i)
+        else:
+            intervals.append([i, i, [i]])
+
+
+    filled = [None] * F
+    for a, b, dets in intervals:
+        for j in dets:
+            filled[j] = list(boxes_seq[j])
+        for j in range(a, b + 1):
+            if filled[j] is None:
+                if shot_id is not None:
+                    p = max((d for d in dets if d < j and int(shot_id[d]) == int(shot_id[j])), default=None)
+                    n = min((d for d in dets if d > j and int(shot_id[d]) == int(shot_id[j])), default=None)
+                else:
+                    p = max((d for d in dets if d < j), default=None)
+                    n = min((d for d in dets if d > j), default=None)
+                if p is not None and n is not None:
+                    r = (j - p) / float(n - p)
+                    filled[j] = [x + (y - x) * r for x, y in zip(boxes_seq[p], boxes_seq[n])]
+                elif p is not None:
+                    filled[j] = list(boxes_seq[p])   # 切点同侧无后邻 → 定格前一帧
+                elif n is not None:
+                    filled[j] = list(boxes_seq[n])
+
+
+    def _fs(i):
+        if size_override is not None and i < len(size_override) and size_override[i]:
+            return float(size_override[i])
+        if filled[i] is not None:
+            return _size(filled[i])
+        return 0.0
+
+
+    pieces = []
+    for a, b, _dets in intervals:
+        # 按镜头边界预切: 窗口平滑/DP 分段不跨切点 (防窗口几何跳变);
+        # 跨镜头合并仅用于填洞记账 (漏检帧由前后检出框插值)。
+        seg_starts = [a]
+        for i in range(a + 1, b):
+            if shot_id is not None and int(shot_id[i]) != int(shot_id[i - 1]):
+                seg_starts.append(i)
+        seg_starts.append(b + 1)
+        for ra, rb in zip(seg_starts[:-1], seg_starts[1:]):
+            raw_boxes = _median_smooth([filled[j] for j in range(ra, rb)])
+            raw_sz = [_fs(i) for i in range(ra, rb)]
+            sm_sz = [float(np.median(raw_sz[max(0, k - 2): k + 3])) for k in range(len(raw_sz))]
+            S_seq = _smooth_window_sizes(sm_sz, expand_f, W, H)
+            if (rb - ra) < 5:
+                pieces.append((ra, rb, S_seq, raw_boxes))
+                continue
+            for pa, pb in _partition_appearance(sm_sz, S_seq, res, float(scale_split), res * float(skip_ratio)):
+                pieces.append((ra + pa, ra + pb, S_seq[pa:pb], raw_boxes[pa:pb]))
+    if not pieces:
+        return subtracks, crop_parts, 0
+
+
+
+    for si, (pa, pb, S_seq, boxes) in enumerate(pieces):
+        idxs = list(range(pa, pb))
+        med = float(np.median([_fs(j) for j in idxs]))
+        if med <= 0:
+            med = float(np.median([_size(b) for b in boxes]))
+        f0_all, f1_all = pa, pb
+        if med >= res * float(skip_ratio):
+            h3ff.vlog(f"[H3-FaceCut] id{tid} sub{si+1} [{f0_all},{f1_all}) skipped: "
+                      f"face {med:.0f}px >= {float(skip_ratio):.2f}xres({res})\n"
+                      f"[H3-FaceCut] 身份{tid} 子轨{si+1} [{f0_all},{f1_all}) 跳过: "
+                      f"脸 {med:.0f}px 已够大")
+            subtracks.append({"track_id": tid, "f0": f0_all, "f1": f1_all, "S": 0,
+                              "face_med": round(med, 1), "skip": True,
+                              "centers": [], "crop_off": None})
+            continue
+
+        centers = _window_centers(boxes, S_seq, W, H)
+        crops, win_masks = _sample_windows(frames, masks_full, idxs, centers, S_seq)
+
+        have = [i for i, m in enumerate(win_masks) if m is not None]
+        if have:
+            for i in range(len(win_masks)):
+                if win_masks[i] is None:
+                    win_masks[i] = win_masks[min(have, key=lambda k: abs(k - i))]
+
+        proc = [None] * len(crops)
+        k = 0
+        while k < len(crops):
+            k2 = k
+            while k2 < len(crops) and tuple(crops[k2].shape) == tuple(crops[k].shape):
+                k2 += 1
+            grp = torch.stack(crops[k:k2], dim=0)              
+            grp = grp.permute(0, 2, 3, 1) / 255.0              
+            if (int(grp.shape[1]), int(grp.shape[2])) != (res, res):
+                if sr_model is not None:
+                    grp = _sr_to_res(sr_model, grp, res, tag=f"id{tid} sub{si+1} ")
+                else:
+                    grp = comfy.utils.common_upscale(
+                        grp.movedim(-1, 1).contiguous(), res, res,
+                        "lanczos", "disabled").movedim(1, -1)
+   
+            for i in range(grp.shape[0]):
+                proc[k + i] = grp[i]
+            k = k2
+        crop_t = torch.stack(proc, dim=0).contiguous()        
+
+        entry = {"track_id": tid, "f0": int(idxs[0]), "f1": int(idxs[-1]) + 1,
+                 "S": int(round(float(np.median(S_seq)))),
+                 "S_list": [int(s) for s in S_seq],   
+                 "face_med": round(med, 1), "skip": False,
+                 "centers": centers, "crop_off": n_rows}
+        if have:
+            mts = []
+            for m in win_masks:
+                mt = torch.nn.functional.interpolate(
+                    m.unsqueeze(0), size=(res, res), mode="bilinear", align_corners=False)[0]
+                mts.append(mt)
+            m_t = torch.stack(mts, dim=0)  # [K,1,res,res]
+            raw_max = float(max(float(m.max()) for m in win_masks))
+            entry["masks"] = m_t[:, 0].clamp(0.0, 1.0).mul(255.0).to(torch.uint8).contiguous()
+            if int(entry["masks"].max()) == 0:
+                h3ff.warn(f"[H3-FaceCut] id{tid} sub{si+1}: WARNING masks all zero after scale "
+                          f"(raw window max={int(raw_max * 255)})\n"
+                          f"[H3-FaceCut] 身份{tid} 子轨{si+1}: 警告 缩放后 mask 全零 "
+                          f"(缩放前窗口最大值={int(raw_max * 255)})")
+        else:
+            h3ff.vlog(f"[H3-FaceCut] id{tid} sub{si+1}: no SeC mask (blend will use feathered box)\n"
+                      f"[H3-FaceCut] 身份{tid} 子轨{si+1}: 无 SeC mask (贴回将回退羽化框)")
+        subtracks.append(entry)
+        crop_parts.append(crop_t)
+        n_rows += len(idxs)
+        S_med = int(np.median(S_seq))
+        occ_log = (med / float(S_med)) if S_med > 0 else 0.0
+        h3ff.vlog(f"[H3-FaceCut] id{tid} sub{si+1} [{f0_all},{f1_all}) "
+                  f"S={S_med}px (逐帧平滑 S∈[{min(S_seq)},{max(S_seq)}]) face~{med:.0f}px "
+                  f"occ≈{occ_log:.0%} follow-cam -> {res}² rows(local) "
+                  f"[{n_rows - len(idxs)},{n_rows}) ({len(idxs)} frames kept)"
+                  f"{', mask: on' if have else ''}\n"
+                  f"[H3-FaceCut] 身份{tid} 子轨{si+1} [{f0_all},{f1_all}) "
+                  f"S={S_med}px (逐帧平滑, 本段范围 [{min(S_seq)},{max(S_seq)}]) "
+                  f"脸~{med:.0f}px 占比≈{occ_log:.0%} 跟随窗口 → {res}² 局部行 "
+                  f"[{n_rows - len(idxs)},{n_rows}) (保留 {len(idxs)} 帧)"
+                  f"{', mask: 开' if have else ''}")
+    return subtracks, crop_parts, n_rows
+
+
+
+def _fill_mask_rows(subtracks, cursor, res):
+    """按子轨账目把 pack 内置 masks 铺成端口行张量 (缓存命中/未命中共用)。"""
+    mask_rows = torch.zeros(max(1, int(cursor)), res, res, dtype=torch.float32)
+    for st in subtracks:
+        m = st.get("masks")
+        if m is None or st.get("skip") or st.get("crop_off") is None:
+            h3ff.vlog(f"[H3-FaceCut] port skip: tid={st.get('track_id', '?')} "
+                      f"masks={'None' if m is None else 'ok'} skip={st.get('skip')} "
+                      f"crop_off={st.get('crop_off')}\n"
+                      f"[H3-FaceCut] 端口跳过: 身份={st.get('track_id', '?')} "
+                      f"masks={'无' if m is None else '有'} skip={st.get('skip')} "
+                      f"crop_off={st.get('crop_off')}")
+            continue
+        off, K = int(st["crop_off"]), int(st["f1"]) - int(st["f0"])
+        fits = (off + K <= int(mask_rows.shape[0])) and (int(m.shape[0]) == K)
+        h3ff.vlog(f"[H3-FaceCut] port fill: [{st['f0']},{st['f1']}) off={off} K={K} "
+                  f"m.max={int(m.max())} fits={fits}\n"
+                  f"[H3-FaceCut] 端口填充: 子轨 [{st['f0']},{st['f1']}) 偏移={off} "
+                  f"行数={K} m最大值={int(m.max())} 适配={fits}")
+        if fits:
+            mask_rows[off:off + K] = m.to(torch.float32).mul(1.0 / 255.0)
+    if int(cursor) == 0:
+        mask_rows = mask_rows[:1]
+    return mask_rows
+
+
+def _build_pack(a_lat, subtracks, cursor, multi_track_flag, meta, fps_eff):
+    return {"version": 7, "multi_track": bool(multi_track_flag), "a_lat": a_lat,
+            "subtracks": subtracks, "fps_eff": float(fps_eff),
+            "n_crop_rows": int(cursor), "meta": meta}
+
+
+class H3FaceCut(io.ComfyNode):
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        choices = _list_models() or [""]
+        sec_choices = h3ff.list_sec_models()
+        return io.Schema(
+            node_id="H3FaceCut",
+            display_name="Minimax_H3_Face_Cut",
+            category="MinimaxH3_AutoContext/FaceFix",
+            description=("Face fix step 1: shot-aware"
+                         "latent is OPTIONAL: fully untouched in images mode. Outputs "
+                         "shot_info for the parameter node.\n"
+                         "auto-detected; tracking mode is chosen by the sec_model dropdown "
+                         "(None = single face).\n"
+                         "修脸第 1 步: 分镜优先 (官方 PySceneDetect, 依赖缺失自动降级) + YOLO 检测 + 可选内置 "
+                         "latent 为可选输入: images 模式完全不处理。输出 shot_info 供 parameter 节点分配提示词。\n"
+                         "追踪模式由 sec_model 下拉框决定 (None = 单脸)。"),
+            inputs=[
+                io.Combo.Input("face_model", options=choices, tooltip="YOLO face model (ComfyUI/models/elementEasy)\n人脸检测模型"),
+                io.Latent.Input("latent", optional=True, tooltip="Optional. Required in latent mode (no images connected). In images mode: "
+                                 "NOT unpacked / NOT validated / NOT hashed / NOT decoded — completely "
+                                 "untouched (audio ledger is provided via Face_Resample audio port)\n"
+                                 "可选。latent 模式 (未连 images) 必须提供。images 模式下完全不处理 "
+                                 "(不解包/不校验/不 hash/不解码) — 音频账本由 Face_Resample 的 audio 端口提供"),
+                io.Image.Input("images", optional=True, tooltip="Optional external detection source: when connected, shot detection / "
+                               "detection / SeC / crop run on these frames at NATIVE size \n "
+                               "可选外部检测画面: 连接后 分镜检测/检测/SeC/裁剪 直接作用于这些帧 "),
+                io.Vae.Input("vae", tooltip="Video VAE (latent mode only; ignored in images mode)\n视频 VAE (仅 latent 模式使用, images 模式忽略)"),
+                io.Float.Input("yolo_threshold", default=0.3, min=0.05, max=0.9, step=0.05, tooltip="YOLO detection confidence threshold\nYOLO 检测置信度阈值"),
+                io.Float.Input("shot_threshold", default=40.0, min=5.0, max=100.0, step=0.5, tooltip="PySceneDetect ContentDetector threshold (higher = fewer cuts).\n"
+                               "PySceneDetect ContentDetector 阈值 (越高切点越少)。"),
+                io.Combo.Input("upscale_model", options=(["None"] + _list_upscale_models()), default="None",
+                               tooltip="Optional upscale model (ComfyUI/models/upscale_models) for face crops. None = lanczos only. \n"
+                                       "可选放大模型 (upscale_models 目录), None = 仅 lanczos (原行为)。"),
+
+                io.Int.Input("res", default=512, min=256, max=2048, step=32, tooltip="Canvas side length\n画布边长"),
+                io.Int.Input("expand", default=20, min=0, max=100, tooltip="Crop window margin % around the detected face box\n围绕检测面部外框的裁剪窗口余量%"),
+                io.Float.Input("skip_ratio", default=_SKIP_RATIO, min=0.3, max=1.0, step=0.05, tooltip="Skip resampling when face >= res x this\n脸够大时跳过重采样"),
+                io.Combo.Input("sec_model", options=(["None"] + sec_choices) if sec_choices else ["None"], default="None",
+                               tooltip="SeC-4B weights in ComfyUI/models/sams (fp16 recommended). None = single-face "
+                                       "mode (one face per frame); picking a weight enables multi-person identity \n"
+                                       "models/sams 下的 SeC-4B 权重 (建议 fp16)。None = 单脸模式 (每帧单脸); "),
+                io.Float.Input("sec_threshold", default=0.3, min=0.1, max=0.8, step=0.05, tooltip="IoU/overlap threshold to claim a YOLO box to an identity (multi_sec only)\n"
+                               "检测框认领给某身份的重叠率阈值 (仅 multi_sec 模式)"),
+                io.Int.Input("max_identities", default=6, min=1, max=12, tooltip="Max tracked identities per shot unit\n每个镜头单元最多追踪身份个数"),
+                io.Boolean.Input("sec_auto_unload", default=True, tooltip="Unload SeC-4B after tracking to free VRAM\n追踪完成后卸载 SeC-4B 释放显存"),
+                io.Boolean.Input("enable_cache", default=True, tooltip="Clear manually after changing model/VAE/SeC weights or CODE (use clear_cache)\n"
+                                 "更换模型/VAE/SeC 权重或修改代码后请勾 clear_cache"),
+                io.Boolean.Input("clear_cache", default=False, tooltip="Delete this node's cache directory before running\n运行前删除本节点的缓存目录"),
+                io.Dict.Input("info", optional=True, tooltip="Main sampler info (h3_runtime), optional\n主采样 info (可选)"),
+            ],
+            outputs=[
+                io.Image.Output(display_name="crop_images", tooltip="Uniform res^2 crops (row order = subtrack order, ALL frames kept)\n所有待采样子轨的统一 res² 裁剪 (全部帧保留)"),
+                io.Dict.Output(display_name="face_pack", tooltip="Subtrack geometry pack (masks also kept inside for legacy wiring)\n子轨几何包 (mask 同时保留在包内, 兼容旧接线)"),
+                io.Mask.Output(display_name="masks", tooltip="SeC masks [rows,res,res], rows 1:1 with crop_images/canvas rows, 1=face\n"
+                               "SeC mask [行数,res,res], 行与 crop_images/画布 1:1 对齐, 1=人脸"),
+                io.Dict.Output(display_name="shot_info", tooltip="Shot map for Minimax_H3_AutoContext_parameter: shots/cuts/fps\n"
+                               "供 parameter 节点分配分段提示词的镜头表 (shots/cuts/fps)"),
+            ],
+            hidden=[io.Hidden.unique_id],
+        )
 
     @classmethod
-    def INPUT_TYPES(cls):
-        choices = _list_models() or [""]
-        return {
-            "required": {
-                "face_model": (choices, {
-                    "tooltip": ("Face detection model (dropdown = files inside ComfyUI/models/elementEasy)\n"
-                                "人脸检测模型 (下拉 = ComfyUI/models/elementEasy 内的文件)")}),
-                "latent": ("LATENT", {"tooltip": "Full latent output of the sampler node\n"
-                                      "采样节点输出的完整 latent (第一个 latent 口)"}),
-                "vae": ("VAE", {"tooltip": "Video VAE\n视频 VAE (抽帧解码用)"}),
-                "conf": ("FLOAT", {"default": 0.3, "min": 0.05, "max": 0.9, "step": 0.05,
-                                   "tooltip": "Detection confidence threshold\n检测置信度阈值"}),
-                "res": ("INT", {"default": 512, "min": 256, "max": 2048, "step": 32,
-                                "tooltip": "Canvas side length; crops are normalized to res^2 here; "
-                                           "subtracks with face >= res*skip_ratio are skipped\n"
-                                           "画布边长; 裁剪在此归一化到 res²; 脸 ≥ res×skip_ratio 的子轨跳过"}),
-                "expand": ("INT", {"default": 20, "min": 0, "max": 100,
-                                   "tooltip": "Crop window margin %\n裁剪窗口余量%"}),
-                "gap_tol": ("INT", {"default": 12, "min": 0, "max": 60,
-                                    "tooltip": "Max detection gap (frames) treated as one continuous appearance; "
-                                               "longer absence splits subtracks. 12 ≈ 0.5s @24fps\n"
-                                               "检测缺失多少帧内视为同一次出现; 更长的缺席切开子轨。12 ≈ 0.5秒@24fps"}),
-                "scale_split": ("FLOAT", {"default": 1.4, "min": 1.05, "max": 3.0, "step": 0.05,
-                                          "tooltip": "Split a new subtrack when face size exceeds scale_split× the "
-                                                     "running median (shot/scale change)\n"
-                                                     "脸尺寸超过运行中位数的该倍数时切新子轨 (分镜/景别切换)"}),
-                "skip_ratio": ("FLOAT", {"default": 0.8, "min": 0.3, "max": 1.0, "step": 0.05,
-                                         "tooltip": "Skip resampling when a subtrack's median face size >= "
-                                                    "res×this (already large enough)\n"
-                                                    "子轨中位脸尺寸 ≥ res×该值时跳过重采样 (已够大)"}),
-            },
-            "optional": {
-                "info": ("*", {"tooltip": "Main sampler info: decode blocks follow the same H3 token accounting\n"
-                               "主采样 info: 解码分块按同一套 H3 token 账目"}),
-            },
-        }
+    def execute(cls, latent=None, vae=None, face_model="", yolo_threshold=0.3,
+                shot_threshold=40.0, upscale_model="None", res=512, expand=20, skip_ratio=_SKIP_RATIO,
+                sec_model="None", sec_threshold=0.3, max_identities=6,
+                sec_auto_unload=True, enable_cache=True, clear_cache=False,
+                images=None, info=None) -> io.NodeOutput:
+        shot_detect = True   
+        shot_active = shot_detect and _has_scenedetect()
+        gap_tol = _GAP_TOL
+        scale_split = _SCALE_SPLIT
+        mllm_memory_size = _SEC_MEM_SIZE
+        use_flash_attn = _flash_attn_available()
+        face_tracking = ("multi_sec" if str(sec_model) not in (None, "", "None") else "single")
 
-    def execute(self, latent, vae, face_model="", conf=0.3, res=512, expand=20,
-                gap_tol=12, scale_split=1.4, skip_ratio=0.8, info=None):
-        v_lat, a_lat = h3_conditioning.unpack_nested_latent(latent)
-        if v_lat is None or v_lat.dim() != 5 or a_lat is None:
-            raise ValueError("[H3-FaceCut] latent must contain both video+audio"
-                             "\n[H3-FaceCut] latent 必须同时含 video+audio")
-        B, C, T, LH, LW = v_lat.shape
-        if T < 4:
-            raise ValueError(f"[H3-FaceCut] video token count {T} is too small"
-                             f"\n[H3-FaceCut] 视频 token 数 {T} 过短")
-        H, W = LH * 16, LW * 16
-        F_expect = h3ff._pixels_for_tokens(int(T))
+        use_images = images is not None
+        seg = info if isinstance(info, dict) else {}
+        v_lat = a_lat = None
+        imgs = None
+        T = LH = LW = 0
+
+        if use_images:
+            imgs = images
+            if imgs.dim() != 4 or int(imgs.shape[-1]) != 3:
+                raise ValueError(
+                    f"[H3-FaceCut] images must be [F,H,W,3], got {tuple(imgs.shape)}\n"
+                    f"[H3-FaceCut] images 必须为 [F,H,W,3], 实际 {tuple(imgs.shape)}")
+            H, W = int(imgs.shape[1]), int(imgs.shape[2])
+            F_expect = int(imgs.shape[0])
+            if F_expect < 4:
+                raise ValueError(
+                    f"[H3-FaceCut] external images frame count {F_expect} is too small\n"
+                    f"[H3-FaceCut] 外部画面帧数 {F_expect} 过短")
+            h3ff.log(f"[H3-FaceCut] images mode: canvas {W}x{H}, {F_expect} frames — "
+                     f"latent NOT touched\n[H3-FaceCut] images 模式: 画布 {W}x{H}, "
+                     f"{F_expect} 帧 — latent 完全不处理")
+        else:
+            if latent is None:
+                raise ValueError(
+                    "[H3-FaceCut] latent is required when images is not connected\n"
+                    "[H3-FaceCut] 未连接 images 时必须提供 latent")
+            v_lat, a_lat = h3_conditioning.unpack_nested_latent(latent)
+            if v_lat is None or v_lat.dim() != 5 or a_lat is None:
+                raise ValueError("[H3-FaceCut] latent must contain both video+audio\n"
+                                 "[H3-FaceCut] latent 必须同时含 video+audio")
+            B, C, T, LH, LW = v_lat.shape
+            if T < 4:
+                raise ValueError(f"[H3-FaceCut] video token count {T} is too small\n"
+                                 f"[H3-FaceCut] 视频 token 数 {T} 过短")
+            if vae is None:
+                raise ValueError("[H3-FaceCut] vae is required in latent mode (images not connected)\n"
+                                 "[H3-FaceCut] latent 模式 (未连接 images) 必须提供 vae")
+            H, W = LH * 16, LW * 16
+            F_expect = h3ff._pixels_for_tokens(int(T))
 
         model_rel = (face_model or "").strip()
         if not model_rel:
-            raise ValueError(f"[H3-FaceCut] no detection model selected — put the YOLO weights into: {MODEL_DIR}"
-                             f"\n[H3-FaceCut] 未选择检测模型 — 请将 YOLO 权重放入: {MODEL_DIR}")
+            raise ValueError(f"[H3-FaceCut] no detection model selected — put YOLO weights into: {MODEL_DIR}\n"
+                             f"[H3-FaceCut] 未选择检测模型 — 请将 YOLO 权重放入: {MODEL_DIR}")
         model_path = os.path.normpath(os.path.join(MODEL_DIR, model_rel))
         if not os.path.isfile(model_path):
-            raise ValueError(f"[H3-FaceCut] model not found: {model_path}"
-                             f"\n[H3-FaceCut] 模型不存在: {model_path}")
+            raise ValueError(f"[H3-FaceCut] model not found: {model_path}\n"
+                             f"[H3-FaceCut] 模型不存在: {model_path}")
 
-        # ---- 分块账目: H3 token 域 (与主采样同递推 + 三重校验) ----
-        seg = info if isinstance(info, dict) else {}
-        blocks = h3ff.face_split_blocks(
-            seg.get("seg_sizes"), seg.get("effective_context"),
-            expect_tokens=int(T), boundaries=seg.get("boundaries"),
-            decoded_frames=F_expect)
+        blocks = None
+        if use_images:
+            blocks = h3ff.face_split_blocks(
+                seg.get("seg_sizes"), seg.get("effective_context"), decoded_frames=F_expect)
+        else:
+            blocks = h3ff.face_split_blocks(
+                seg.get("seg_sizes"), seg.get("effective_context"),
+                expect_tokens=int(T), boundaries=seg.get("boundaries"), decoded_frames=F_expect)
         if blocks is None:
             blocks = h3ff.token_blocks(int(T), 22)
 
-        # ---- 1) 分块解码 + 逐块检测 ----
-        frames = np.empty((F_expect, H, W, 3), dtype=np.uint8)
-        per_frame = [None] * F_expect
-        opt = {"conf": float(conf), "model": model_path}
-        for bi, (dk0, dk1, kp0, kp1) in enumerate(blocks):
-            blk = h3ff.decode_probe_frames(vae, v_lat, range(dk0, dk1))
-            off = kp0 - h3ff._pixels_for_tokens(dk0)
-            if int(blk.shape[0]) < off + (kp1 - kp0):
-                raise RuntimeError(f"[H3-FaceCut] block {bi + 1}: decoded {int(blk.shape[0])} frames "
-                                   f"< expected {off + kp1 - kp0}\n"
-                                   f"[H3-FaceCut] 块 {bi + 1}: 解码帧数不足")
-            seg_px = blk[off: off + (kp1 - kp0)]
-            frames[kp0:kp1] = seg_px
-            per_frame[kp0:kp1] = h3ff.detect_faces(seg_px, opt)
-            del blk, seg_px
-        n_hit = sum(1 for b in per_frame if b)
-        print(f"[H3-FaceCut] detected {n_hit}/{F_expect} frames\n"
-              f"[H3-FaceCut] 检出 {n_hit}/{F_expect} 帧")
-
-        # ---- 2) 出现区间 (gap≤gap_tol 连续) + 区间内线性填补 ----
-        det_idx = [i for i, b in enumerate(per_frame) if b]
-        intervals = []
-        for i in det_idx:
-            if intervals and i - intervals[-1][1] - 1 <= int(gap_tol):
-                intervals[-1][1] = i
-                intervals[-1][2].append(i)
-            else:
-                intervals.append([i, i, [i]])
-        filled = [None] * F_expect
-        for a, b, dets in intervals:
-            for j in dets:
-                filled[j] = list(max(per_frame[j], key=lambda x: x[4])[:4])
-            for j in range(a, b + 1):
-                if filled[j] is None:
-                    p = max(d for d in dets if d < j)
-                    n = min(d for d in dets if d > j)
-                    r = (j - p) / float(n - p)
-                    filled[j] = [x + (y - x) * r for x, y in zip(filled[p], filled[n])]
-
-        # ---- 3) 尺度突变切分 → 子轨 (<5 帧碎片能并则并, 否则丢弃) ----
-        ratio = float(scale_split)
-        pieces = []
-        for a, b, _dets in intervals:
-            cur, sizes = [a], [_size(filled[a])]
-            for i in range(a + 1, b + 1):
-                s_i = _size(filled[i])
-                med = float(np.median(sizes))
-                if med > 0 and (s_i > med * ratio or s_i < med / ratio):
-                    pieces.append(cur)
-                    cur, sizes = [i], [s_i]
+        try:
+            unique_id = cls.hidden.unique_id
+        except AttributeError:
+            unique_id = None
+        if clear_cache and unique_id is not None:
+            try:
+                target = os.path.join(folder_paths.get_output_directory(), "cache", f"node_{unique_id}")
+                if latent_cache.clear_cache_dir(target):
+                    h3ff.log(f"[H3-FaceCut] 🗑️ Cache cleared: {target}\n[H3-FaceCut] 🗑️ 缓存已清除: {target}")
                 else:
-                    cur.append(i)
-                    sizes.append(s_i)
-            pieces.append(cur)
-        merged = []
-        for p in pieces:
-            if len(p) >= 5:
-                merged.append(p)
-                continue
-            if merged:
-                med_prev = float(np.median([_size(filled[j]) for j in merged[-1]]))
-                if med_prev > 0 and _size(filled[p[0]]) <= med_prev * ratio:
-                    merged[-1].extend(p)
-                    continue
-            print(f"[H3-FaceCut] drop tiny face run ({len(p)} frames) at [{p[0]},{p[-1]}]\n"
-                  f"[H3-FaceCut] 丢弃过短人脸片段 ({len(p)} 帧) @ [{p[0]},{p[-1]})")
+                    h3ff.vlog("[H3-FaceCut] ℹ️ Cache dir does not exist, nothing to clear\n[H3-FaceCut] ℹ️ 缓存目录不存在，无需清除")
+            except Exception as e:
+                h3ff.warn(f"[H3-FaceCut] ⚠️ Failed to clear cache: {e}\n[H3-FaceCut] ⚠️ 清除缓存失败: {e}")
+        cache_dir = ""
+        if enable_cache and unique_id is not None:
+            try:
+                cache_dir = os.path.join(folder_paths.get_output_directory(), "cache", f"node_{unique_id}")
+            except Exception:
+                cache_dir = ""
 
-        # ---- 4) 每条子轨: 独立平滑 / S_i / skip / 17n+5 吸附 / 裁剪 / 归一化 res² ----
-        expand_f = max(float(expand) / 100.0, 0.10)
-        fps_eff = max(1.0, F_expect * h3ff.AUDIO_LATENTS_PER_SEC
-                      / max(int(a_lat.shape[-1]), 1))
+        _fp_common = {"win_v": 2,
+                      "face_model": model_rel, "yolo_threshold": float(yolo_threshold),
+                      "shot_active": bool(shot_active), "shot_threshold": float(shot_threshold),
+                      "upscale_model": str(upscale_model or "None"),
+                      "res": int(res), "expand": int(expand),
+                      "gap_tol": int(gap_tol), "scale_split": float(scale_split),
+                      "skip_ratio": float(skip_ratio), "face_tracking": str(face_tracking),
+                      "sec_model": str(sec_model), "sec_threshold": float(sec_threshold),
+                      "mllm_memory_size": int(mllm_memory_size), "use_flash_attn": bool(use_flash_attn),
+                      "max_identities": int(max_identities)}
+        if use_images:
+            fp = {"src": "images", "images_digest": _images_digest(imgs),
+                  "F": int(F_expect), "W": int(W), "H": int(H), **_fp_common}
+        else:
+            fp = {"src": "latent", "latent_hash": latent_cache.compute_input_hash(latent),
+                  "T": int(T), "LH": int(LH), "LW": int(LW),
+                  "blocks_hash": hashlib.md5(str(blocks).encode()).hexdigest(), **_fp_common}
+
+        blob = "cut_result_ext.pt" if use_images else "cut_result.pt"
+        cached = (latent_cache.load_blob(cache_dir, blob, fp, sensitive_keys=list(fp.keys()))
+                  if cache_dir else None)
+        if isinstance(cached, dict) and cached.get("subtracks") is not None \
+                and cached.get("crop_images") is not None:
+            try:
+                crop_images = cached["crop_images"].float()
+                subtracks = cached["subtracks"]
+                cursor = int(cached["n_crop_rows"])
+                mask_rows = _fill_mask_rows(subtracks, cursor, res)
+                fps_eff = _fps_eff(a_lat, F_expect, seg)
+                _cmeta = cached.get("meta") or {}
+                pack = _build_pack(a_lat, subtracks, cursor, bool(cached.get("multi_track")), _cmeta, fps_eff)
+                shot_info = {"shots": [[int(s), int(e)] for s, e in (_cmeta.get("shots") or [[0, int(F_expect)]])],
+                             "shot_cuts": [int(c) for c in (_cmeta.get("shot_cuts") or [])],
+                             "n_shots": int(_cmeta.get("n_shots") or len(_cmeta.get("shots") or [])) or 1,
+                             "fps": float(fps_eff)}
+                mz = float(mask_rows.max()) if mask_rows.numel() else 0.0
+                print("\033[33m" + f"[H3-FaceCut] cache hit: {len(subtracks)} subtracks, "
+                      f"crop {tuple(crop_images.shape)}, masks_max={mz:.2f} — shot/decode/detect/SeC skipped\n"
+                      f"[H3-FaceCut] 缓存命中: {len(subtracks)} 条子轨, 裁剪 {tuple(crop_images.shape)}, "
+                      f"mask最大值={mz:.2f} — 已跳过 分镜/解码/检测/SeC" + "\033[0m")
+                return io.NodeOutput(crop_images.contiguous(), pack, mask_rows.contiguous(), shot_info)
+            except Exception as e:
+                h3ff.warn(f"[H3-FaceCut] cache load failed ({e}), recomputing\n[H3-FaceCut] 缓存载入失败 ({e})，重新计算")
+
+        per_frame = [None] * F_expect
+        opt = {"conf": float(yolo_threshold), "model": model_path}
+        if use_images:
+            frames = np.clip(imgs.detach().cpu().numpy() * 255.0, 0.0, 255.0).astype(np.uint8)
+            per_frame = h3ff.detect_faces(frames, opt)
+            n_hit = sum(1 for b in per_frame if b)
+            h3ff.log(f"[H3-FaceCut] input source: external images ({F_expect} frames @ {W}x{H}), "
+                     f"detected {n_hit}/{F_expect}\n"
+                     f"[H3-FaceCut] 输入来源: 外部画面 ({F_expect} 帧 @ {W}x{H}), "
+                     f"已跳过 latent 解码, 检出 {n_hit}/{F_expect} 帧")
+        else:
+            frames = np.empty((F_expect, H, W, 3), dtype=np.uint8)
+            for bi, (dk0, dk1, kp0, kp1) in enumerate(blocks):
+                blk = h3ff.decode_probe_frames(vae, v_lat, range(dk0, dk1))
+                off = kp0 - h3ff._pixels_for_tokens(dk0)
+                if int(blk.shape[0]) < off + (kp1 - kp0):
+                    raise RuntimeError(f"[H3-FaceCut] block {bi+1}: decoded {int(blk.shape[0])} frames < expected {off + kp1 - kp0}\n"
+                                       f"[H3-FaceCut] 块 {bi+1}: 解码帧数不足")
+                seg_px = blk[off: off + (kp1 - kp0)]
+                frames[kp0:kp1] = seg_px
+                per_frame[kp0:kp1] = h3ff.detect_faces(seg_px, opt)
+                del blk, seg_px
+            n_hit = sum(1 for b in per_frame if b)
+            h3ff.log(f"[H3-FaceCut] detected {n_hit}/{F_expect} frames\n[H3-FaceCut] 检出 {n_hit}/{F_expect} 帧")
+
         res = int(res)
-        subtracks, crop_parts, cursor = [], [], 0
-        for si, idxs in enumerate(merged):
-            boxes = _median_smooth([filled[j] for j in idxs])
-            med = float(np.median([_size(b) for b in boxes]))
-            S = max(64, (min(int(round(med * (1.0 + expand_f))), 1024) // 16) * 16)
-            f0_all, f1_all = int(idxs[0]), int(idxs[-1]) + 1
-            if med >= res * float(skip_ratio):
-                print(f"[H3-FaceCut] subtrack {si + 1} [{f0_all},{f1_all}) skipped: face {med:.0f}px >= "
-                      f"{float(skip_ratio):.2f}×res({res}) — already large enough\n"
-                      f"[H3-FaceCut] 子轨 {si + 1} [{f0_all},{f1_all}) 跳过: 脸 {med:.0f}px ≥ "
-                      f"{float(skip_ratio):.2f}×res({res}) — 已够大, 无需重采样")
-                subtracks.append({"f0": f0_all, "f1": f1_all, "S": int(S),
-                                  "face_med": round(med, 1), "skip": True,
-                                  "centers": [], "crop_off": None})
-                continue
-            K = len(idxs)
-            K_g = ((K - 5) // 17) * 17 + 5
-            if K_g < 5:
-                print(f"[H3-FaceCut] subtrack {si + 1} too short ({K} frames), dropped\n"
-                      f"[H3-FaceCut] 子轨 {si + 1} 过短 ({K} 帧), 丢弃")
-                continue
-            if K != K_g:
-                print(f"[H3-FaceCut] subtrack {si + 1}: {K} -> {K_g} frames (17n+5 grid, tail trimmed)\n"
-                      f"[H3-FaceCut] 子轨 {si + 1}: {K} → {K_g} 帧 (17n+5 网格, 尾部裁剪)")
-            use = idxs[:K_g]
-            half = S / 2.0
-            centers, crops = [], []
-            for j, (x1, y1, x2, y2) in zip(use, boxes):
-                cx = min(max((x1 + x2) * 0.5, half), W - half)
-                cy = min(max((y1 + y2) * 0.5, half), H - half)
-                ix1 = max(0, min(int(round(cx - half)), W - S))
-                iy1 = max(0, min(int(round(cy - half)), H - S))
-                centers.append([ix1 + half, iy1 + half])
-                crops.append(frames[j][iy1:iy1 + S, ix1:ix1 + S])
-            crop_t = torch.from_numpy(np.stack(crops)).to(torch.float32) / 255.0  # [K,S,S,C]
-            if (S, S) != (res, res):
-                crop_t = comfy.utils.common_upscale(
-                    crop_t.movedim(-1, 1), res, res, "lanczos", "disabled").movedim(1, -1)
-            subtracks.append({"f0": int(use[0]), "f1": int(use[-1]) + 1, "S": int(S),
-                              "face_med": round(med, 1), "skip": False,
-                              "centers": centers, "crop_off": cursor})
-            crop_parts.append(crop_t.contiguous())
-            cursor += K_g
-            print(f"[H3-FaceCut] subtrack {si + 1} [{f0_all},{f1_all}) S={S}px -> {res}² "
-                  f"({float(res) / S:.2f}x) rows [{cursor - K_g},{cursor})\n"
-                  f"[H3-FaceCut] 子轨 {si + 1} [{f0_all},{f1_all}) S={S}px → {res}² "
-                  f"(放大 {float(res) / S:.2f}x) 行 [{cursor - K_g},{cursor})")
+        expand_f = max(float(expand) / 100.0, 0.10)
+        fps_eff = _fps_eff(a_lat, F_expect, seg)
+
+        shot_cuts, shots = [], [(0, int(F_expect))]
+        if bool(shot_active):
+            _rt = seg.get("h3_runtime") if isinstance(seg.get("h3_runtime"), dict) else {}
+            fps_hint = float(_rt.get("fps") or seg.get("fps") or 24.0)
+            shot_cuts = _detect_shot_cuts(frames, float(shot_threshold), fps_hint)
+            shots = _shot_bounds(blocks, shot_cuts, F_expect)
+            if shot_cuts:
+                h3ff.log(f"[H3-FaceCut] shot map: {len(shots)} unit(s), cuts={shot_cuts}\n"
+                         f"[H3-FaceCut] 镜头划分: {len(shots)} 个处理单元, 切点={shot_cuts}")
+            else:
+                h3ff.vlog(f"[H3-FaceCut] shot map: no cuts ({len(shots)} unit(s))\n"
+                          f"[H3-FaceCut] 镜头划分: 无切点 ({len(shots)} 个处理单元)")
+        elif shot_detect:
+            h3ff.warn("[H3-FaceCut] shot_detect ON but scenedetect is not installed — "
+                      "pip install scenedetect; falling back to upstream-segment isolation only\n"
+                      "[H3-FaceCut] 分镜检测已开启但未安装 scenedetect — pip install scenedetect; "
+                      "已降级为仅上游分段隔离")
+        shot_id = np.zeros(F_expect, dtype=np.int64)
+        for _si, (_s, _e) in enumerate(shots):
+            shot_id[_s:_e] = _si
+
+        tracks = None
+        if face_tracking == "multi_sec" and any(per_frame):
+            sec_handle = h3ff.load_sec_model(model_file=str(sec_model), device="auto",
+                                             use_flash_attn=use_flash_attn, allow_mask_overlap=True)
+            try:
+                tracks = []
+                nid = 0
+                _prev_unit_ids = []   
+                for (s0, e0) in shots:
+                    sub_det = per_frame[s0:e0]
+                    if not any(sub_det):
+                        _prev_unit_ids = []   
+                        continue
+                    st_list = h3ff.sec_track_identities(
+                        sec_handle, frames[s0:e0], sub_det,
+                        tracking_direction="bidirectional",
+                        mllm_memory_size=int(mllm_memory_size),
+                        offload_video_to_cpu=True,
+                        iou_thr=float(sec_threshold),
+                        max_ids=int(max_identities),
+                        tag=(f" [shot {s0}-{e0}]" if len(shots) > 1 else ""))
+                    got = 0
+                    n_new = len(st_list or [])                                  
+                    _continue_id = (len(_prev_unit_ids) == 1 and n_new == 1)    
+                    for t in (st_list or []):
+                        boxes_f = [None] * F_expect
+                        masks_f = [None] * F_expect
+                        for kk, b in enumerate(t["boxes"]):
+                            if b is not None:
+                                boxes_f[s0 + kk] = b
+                        if t.get("masks") is not None:
+                            for kk, m in enumerate(t["masks"]):
+                                if kk < len(masks_f) and m is not None:
+                                    masks_f[s0 + kk] = m
+                        if _continue_id:                        
+                            _id = _prev_unit_ids[0]             
+                        else:
+                            _id = nid
+                            nid += 1
+                        tracks.append({"id": _id, "anchor": s0 + int(t["anchor"]),
+                                       "boxes": boxes_f, "masks": masks_f})
+                        got += 1
+                    _prev_unit_ids = [t["id"] for t in tracks[-got:]] if got > 0 else []   
+                    if got:
+                        h3ff.vlog(f"[H3-FaceCut] shot [{s0},{e0}): {got} identit(ies)"
+                                  f"{', continued from previous unit (single-identity link)' if _continue_id else ''}\n"
+                                  f"[H3-FaceCut] 镜头 [{s0},{e0}): {got} 个身份"
+                                  f"{', 单人续接上一单元身份' if _continue_id else ''}")
+
+                if tracks:
+                    _n_distinct = len({t["id"] for t in tracks})
+                    h3ff.log(f"[H3-FaceCut] identities tracked across {len(shots)} shot unit(s): "
+                             f"{len(tracks)} track(s) -> {_n_distinct} distinct id(s) "
+                             f"(flash_attn={'on' if use_flash_attn else 'off'})\n"
+                             f"[H3-FaceCut] 跨 {len(shots)} 个镜头单元共追踪到 {len(tracks)} 条轨迹 "
+                             f"-> {_n_distinct} 个独立身份 (flash_attn={'开' if use_flash_attn else '关'})")
+
+                else:
+                    h3ff.log("[H3-FaceCut] SeC returned no identities, falling back to single-face\n"
+                             "[H3-FaceCut] SeC 未产出身份, 回退单脸路径")
+                    tracks = None
+            finally:
+                if sec_auto_unload:
+                    h3ff.unload_sec_model()
+        elif face_tracking == "multi_sec":
+            h3ff.log("[H3-FaceCut] multi_sec requested but no detections, falling back to single-face\n"
+                     "[H3-FaceCut] multi_sec 模式但无任何检测框, 回退单脸路径")
+
+        sr_model, sr_name = None, str(upscale_model or "None")
+        if sr_name != "None":
+            try:
+                sr_model = _load_sr_model(sr_name)
+                h3ff.log(f"[H3-FaceCut] crop upscale: {sr_name} (SR chain -> {res}px, max 2 passes)\n"
+                         f"[H3-FaceCut] 裁剪放大: {sr_name} (SR 链 → {res}px, 最多 2 次)")
+            except Exception as e:
+                h3ff.warn(f"[H3-FaceCut] upscale model load failed ({e}) — falling back to lanczos\n"
+                          f"[H3-FaceCut] 放大模型加载失败 ({e}) — 回退 lanczos")
+                sr_model = None
+
+        if tracks:
+            src_tracks = []
+            for t in tracks:
+                sz = _yolo_size_track(t["boxes"], per_frame) if per_frame is not None else None
+                src_tracks.append((t["id"], t["boxes"], t.get("masks"), sz))
+            n_meas = sum(1 for _i, _b, _m, sz in src_tracks for v in (sz or []) if v is not None)
+            n_all = sum(sum(1 for b in _b if b is not None) for _i, _b, _m, sz in src_tracks if sz)
+            h3ff.log(f"[H3-FaceCut] size signal: YOLO measured {n_meas}/{n_all} frames "
+                     f"(SeC box fallback on the rest)\n"
+                     f"[H3-FaceCut] 尺寸信号: {n_meas}/{n_all} 帧用 YOLO 实测 (其余回退 SeC 框)")
+        else:
+            filled_single = [list(max(per_frame[j], key=lambda x: x[4])[:4]) if per_frame[j] else None
+                             for j in range(F_expect)]
+            src_tracks = [(0, filled_single, None, None)]
+
+        subtracks, crop_parts = [], []
+        cursor = 0
+        for tid, boxes_seq, masks_full, sz_override in src_tracks:
+            sts, cps, n_rows = _build_subtracks_for_track(
+                boxes_seq, frames, H, W, res, expand_f, float(scale_split), float(skip_ratio),
+                int(gap_tol), tid, masks_full=masks_full,
+                size_override=(sz_override if face_tracking == "multi_sec" else None),
+                shot_id=shot_id, sr_model=sr_model)
+            for st in sts:
+                if not st["skip"]:
+                    st["crop_off"] = cursor + int(st["crop_off"])  
+            subtracks.extend(sts)
+            crop_parts.extend(cps)
+            cursor += n_rows
+
+        if sr_model is not None:
+            try:
+                sr_model.cpu()
+            except Exception:
+                pass
+            del sr_model
+            comfy.model_management.soft_empty_cache()
+
 
         if crop_parts:
             crop_images = torch.cat(crop_parts, dim=0).contiguous()
         else:
             crop_images = torch.zeros(1, res, res, 3)
         n_sampled = sum(1 for st in subtracks if not st["skip"])
-        pack = {"version": 5, "a_lat": a_lat, "subtracks": subtracks,
-                "fps_eff": float(fps_eff), "n_crop_rows": int(cursor),
-                "meta": {"T": int(T), "LH": int(LH), "LW": int(LW), "W": int(W), "H": int(H),
-                         "res": res, "n_hit": int(n_hit), "n_frames": F_expect,
-                         "n_subtracks": len(subtracks), "n_sampled": n_sampled,
-                         "gap_tol": int(gap_tol), "scale_split": float(scale_split),
-                         "skip_ratio": float(skip_ratio)}}
-        info_str = [(st["f0"], st["f1"], st["S"]) for st in subtracks if not st["skip"]]
-        print(f"\033[35m[H3-FaceCut] {len(subtracks)} subtracks ({n_sampled} sampled): "
-              f"(f0,f1,S)={info_str}, crop_images {tuple(crop_images.shape)}\n"
-              f"[H3-FaceCut] 共 {len(subtracks)} 条子轨 ({n_sampled} 条待采样): "
-              f"(f0,f1,S)={info_str}, 裁剪输出 {tuple(crop_images.shape)}\033[0m")
-        return (crop_images, pack)
+
+        mask_rows = _fill_mask_rows(subtracks, cursor, res)
+        multi_track_flag = tracks is not None
+        src_tracks = None
+        tracks = None
+
+        meta = {"T": int(T), "LH": int(LH), "LW": int(LW),  
+                "W": int(W), "H": int(H), "res": res, "n_hit": int(n_hit),
+                "n_frames": F_expect, "n_subtracks": len(subtracks), "n_sampled": n_sampled,
+                "n_identities": len({st.get("track_id", 0) for st in subtracks}),
+                "face_tracking": face_tracking, "gap_tol": int(gap_tol),
+                "scale_split": float(scale_split), "skip_ratio": float(skip_ratio),
+                "yolo_threshold": float(yolo_threshold), "sec_threshold": float(sec_threshold),
+                "shot_active": bool(shot_active), "shot_threshold": float(shot_threshold),
+                "flash_attn": bool(use_flash_attn), "sec_memory": int(mllm_memory_size),
+                "n_shots": len(shots), "shot_cuts": [int(c) for c in shot_cuts],
+                "shots": [[int(s), int(e)] for (s, e) in shots],
+                "source": "images" if use_images else "latent"}
+        pack = _build_pack(a_lat, subtracks, cursor, multi_track_flag, meta, fps_eff)
+        shot_info = {"shots": [[int(s), int(e)] for s, e in shots],
+                     "shot_cuts": [int(c) for c in shot_cuts],
+                     "n_shots": len(shots), "fps": float(fps_eff)}
+
+       
+        skip_str = [(st.get("track_id", 0), st["f0"], st["f1"]) for st in subtracks if st.get("skip")]
+        if skip_str:
+            h3ff.warn(f"[H3-FaceCut] skipped subtracks (face >= {res * float(skip_ratio):.0f}px): {skip_str}\n"
+                      f"[H3-FaceCut] 跳过重采样的子轨 (脸 >= {res * float(skip_ratio):.0f}px): {skip_str}")
+    
+        covered = sorted((int(st["f0"]), int(st["f1"])) for st in subtracks if not st.get("skip"))
+        gaps, cur = [], 0
+        for s, e in covered:
+            if s > cur:
+                gaps.append((cur, s))
+            cur = max(cur, e)
+        if cur < F_expect:
+            gaps.append((cur, F_expect))
+        if gaps:
+            h3ff.warn(f"[H3-FaceCut] UNCOVERED frame ranges (passthrough, no resample): {gaps}\n"
+                      f"[H3-FaceCut] 未覆盖帧区间 (原样透传, 不重采样): {gaps}")
+    
+        info_str = [(st.get("track_id", 0), st["f0"], st["f1"], st["S"]) for st in subtracks if not st["skip"]]
+        
+        mz = float(mask_rows.max()) if mask_rows.numel() else 0.0
+        print("\033[35m" + f"[H3-FaceCut] {len(subtracks)} subtracks ({n_sampled} sampled, "
+              f"masks_max={mz:.2f}): (tid,f0,f1,S)={info_str}, "
+              f"crop_images {tuple(crop_images.shape)}, masks {tuple(mask_rows.shape)}, "
+              f"shots={len(shots)}\n"
+              f"[H3-FaceCut] 共 {len(subtracks)} 条子轨 ({n_sampled} 条待采样, mask最大值={mz:.2f}): "
+              f"(身份,帧起,帧止,S)={info_str}, 裁剪输出 {tuple(crop_images.shape)}, "
+              f"mask输出 {tuple(mask_rows.shape)}, 镜头 {len(shots)} 个\033[0m")
+        if face_tracking == "multi_sec" and mz <= 0.0:
+            h3ff.warn("[H3-FaceCut] WARNING: masks output all zero — SeC masks missing (check SeC logs above)\n"
+                      "[H3-FaceCut] 警告: mask 输出全零 — SeC mask 缺失 (检查上方 SeC 日志)")
+        if cache_dir:
+            latent_cache.save_blob_async(
+                cache_dir, blob,
+                {"crop_images": crop_images.detach().to(torch.float16).cpu().contiguous(),
+                 "subtracks": subtracks, "n_crop_rows": int(cursor),
+                 "multi_track": bool(multi_track_flag), "meta": meta}, fp)
+            h3ff.vlog(f"[H3-FaceCut] cache save submitted (async)\n[H3-FaceCut] 缓存保存已提交 (异步)")
+        return io.NodeOutput(crop_images.contiguous(), pack, mask_rows.contiguous(), shot_info)

@@ -90,94 +90,63 @@ class H3ParameterNode(io.ComfyNode):
             display_name="Minimax_H3_AutoContext_parameter",
             category="MinimaxH3_AutoContext",
             description="H3 parameter group: centralizes segmentation/resolution/audio parameters, outputs parameter for the main node, "
-                        "and previews the expected segments"
-                        "\nH3 参数组：集中管理分段/分辨率/音频等参数，输出 parameter 供主节点使用，并预览预计分段",
+                        "and previews the expected segments. When shot_info (from Minimax_H3_Face_Cut) is connected, "
+                        "segment prompts are assigned to the detected shots: prompt count > shots → take the first N; "
+                        "< shots → repeat the last; the shot time interval replaces the time marks inside each prompt "
+                        "(parameter.shot_prompts, consumed by Face_Resample in BOTH wiring modes)\n"
+                        "H3 参数组：集中管理分段/分辨率/音频等参数，输出 parameter 供主节点使用，并预览预计分段。"
+                        "接入 shot_info (来自 Minimax_H3_Face_Cut) 后，分段提示词按检测到的镜头分配：提示词数多于镜头数取前 N 条，"
+                        "少于则重复最后一条；镜头时间段代替每条提示词内的时间标注 "
+                        "(parameter.shot_prompts，Face_Resample 在两种接线模式下都消费)",
             inputs=[
-                io.String.Input("long_prompt", multiline=True, dynamic_prompts=True,
-                    socketless=False, default="",
-                    tooltip="Prompt (passed to the main node for inference and also used for the \"expected segments\" preview)"
-                            "\n提示词 (传给主节点推理，同时用于「预计分段」预览)"),
-                io.Combo.Input("clip_mode",
-                    options=["Clip_Tag", "timeline", "sequential", "global"],
-                    default="Clip_Tag",
-                    tooltip=_CLIP_MODE_TOOLTIP),
-                io.String.Input("clip_tag", multiline=False, dynamic_prompts=True,
-                    socketless=False, default="段1",
-                    tooltip=_CLIP_TAG_TOOLTIP),
-                io.Combo.Input("prompt_format",
-                    options=["official", "legacy", "raw"],
-                    default="official",
-                    tooltip=_PROMPT_FORMAT_TOOLTIP),
-                io.Combo.Input("crop_mode",
-                    options=["center", "stretch", "none"],
-                    default="stretch",
-                    tooltip=_CROP_MODE_TOOLTIP),
-                io.Combo.Input("ref_sync_mode",
-                    options=["global", "segmented"],
-                    default="segmented",
-                    tooltip=_REF_SYNC_MODE_TOOLTIP),
+                io.String.Input("long_prompt", multiline=True, dynamic_prompts=True, socketless=False, default="", tooltip="Prompt (passed to the main node for inference and also used for the \"expected segments\" preview)" 
+                                "\n提示词 (传给主节点推理，同时用于「预计分段」预览)"),
+                io.Combo.Input("clip_mode", options=["Clip_Tag", "timeline", "sequential", "global"], default="Clip_Tag", tooltip=_CLIP_MODE_TOOLTIP),
+                io.String.Input("clip_tag", multiline=False, dynamic_prompts=True, socketless=False, default="段1", tooltip=_CLIP_TAG_TOOLTIP),
+                io.Combo.Input("prompt_format", options=["official", "legacy", "raw"], default="official", tooltip=_PROMPT_FORMAT_TOOLTIP),
+                io.Combo.Input("crop_mode", options=["center", "stretch", "none"], default="stretch", tooltip=_CROP_MODE_TOOLTIP),
+                io.Combo.Input("ref_sync_mode", options=["global", "segmented"], default="segmented", tooltip=_REF_SYNC_MODE_TOOLTIP),
                 io.Int.Input("width", default=960, min=64, max=4096, step=32),
                 io.Int.Input("height", default=544, min=64, max=4096, step=32),
-                io.Int.Input("total_frames", default=362, min=5, max=16376, step=17,
-                    tooltip="Total frames to generate; must satisfy 17n+5 (5,22,39,56,73,90,...). Times inside the prompt are still parsed in seconds."
-                            "In Clip_Tag and timeline modes this value is ignored and computed from the prompt content."
-                            "\n生成总帧数，需满足 17n+5 (5,22,39,56,73,90,...)。提示词内时间仍按秒解析。"
-                            "在 Clip_Tag 和 timeline 模式下，该值被忽略，由提示词内容自动计算。"),
-                io.Int.Input("fps", default=24, min=8, max=60, step=1,
-                    tooltip="Frame rate, used only for audio sync and for converting seconds inside the prompt"
-                            "\n帧率，仅用于音频同步和提示词内秒数换算"),
-                io.Int.Input("chunk_frames", default=90, min=5, max=2880, step=17,
-                    tooltip="Frames generated per segment; must satisfy 17n+5 (5,22,39,...). Set it to >= total_frames to generate the whole video as one segment."
-                            "In Clip_Tag and timeline modes this value is ignored and computed from the prompt content."
-                            "\n每段生成帧数，需满足 17n+5 (5,22,39,...)。设为 ≥ total_frames 时不拆分，整个视频作为一段生成。"
-                            "在 Clip_Tag 和 timeline 模式下，该值被忽略，由提示词内容自动计算。"),
-                io.Int.Input("context_frames", default=22, min=5, max=124, step=1,
-                    tooltip=_CONTEXT_FRAMES_TOOLTIP),
-                io.Boolean.Input("lock_audio",
-                    default=True,
-                    tooltip="Lock the audio region on the second pass (noise_mask audio=0): only the video is resampled and the first-pass audio stays unchanged. "
-                            "Only takes effect when latent_input is connected"
-                            "\n二采时锁定音频区 (noise_mask audio=0)：只重新采样视频、保持一采音频不变。仅在连接 latent_input 时生效"),
-                io.Boolean.Input("audio_drive",
-                    default=False,
-                    tooltip="Audio-drive switch. When checked, drive_audio is encoded and locked into the latent (noise_mask=0, "
-                            "audio is not regenerated) and the video is generated to follow it. "
-                            "Note: this node does not output audio, so connect the same source audio straight to the video-composition node "
-                            "(that also avoids a lossy VAE round trip). Unchecked (default): audio is generated normally"
-                            "\n音频驱动开关。勾选后把 drive_audio 编码后锁进 latent (noise_mask=0，"
-                            "不重新生成音频)，视频照它生成。"
-                            "注意：本节点不输出音频，请把同一条源音频直接接到视频合成节点 "
-                            "(这样也避免了 VAE 有损往返)。不勾选 (默认): 音频照常生成"),
-                
-                io.Combo.Input("video_guide",
-                    options=["none", "pre_guide", "post_guide", "pre_post_guide"],
-                    default="none",
-                    tooltip="Strongly anchors multiple frames using the video fed into the ref_video ports.\n"
-                            "none: normal generation (default); even when ref_video is connected it is only a plain reference;\n"
-                            "pre_guide: anchor the beginning with the tail of ref_video_0 (video continuation);\n"
-                            "post_guide: anchor the ending with the head of ref_video_0 (video pushed forward);\n"
-                            "pre_post_guide: anchor the beginning with the tail of ref_video_0 + the ending with the head of ref_video_1 (mid stitching).\n"
-                            "The number of anchored frames is decided by context_frames."
-                            "\n利用 ref_video 端口输入的视频进行多帧强锚定。\n"
-                            "none: 常规生成（默认），即使 ref_video 有输入也只作普通参考；\n"
-                            "pre_guide: 用 ref_video_0 的尾部锚定开头（视频续写）；\n"
-                            "post_guide: 用 ref_video_0 的头部锚定结尾（视频前推）；\n"
-                            "pre_post_guide: 用 ref_video_0 尾部锚定开头 + ref_video_1 头部锚定结尾（中间衔接）。\n"
-                            "锚定帧数由 context_frames 决定。"),
-                            
+                io.Int.Input("total_frames", default=362, min=5, max=16376, step=17, tooltip="Total frames to generate; must satisfy 17n+5 (5,22,39,56,73,90,...). Times inside the prompt are still parsed in seconds."
+                             "In Clip_Tag and timeline modes this value is ignored and computed from the prompt content."
+                             "\n生成总帧数，需满足 17n+5 (5,22,39,56,73,90,...)。提示词内时间仍按秒解析。"
+                             "在 Clip_Tag 和 timeline 模式下，该值被忽略，由提示词内容自动计算。"),
+                io.Int.Input("fps", default=24, min=8, max=60, step=1, tooltip="Frame rate, used only for audio sync and for converting seconds inside the prompt. "
+                        "Face_Resample standalone mode also uses it for audio slicing (lip sync) — must match the footage"
+                        "\n帧率，仅用于音频同步和提示词内秒数换算。Face_Resample 独立模式同样用它做音频切片 (口型) — 必须与素材一致"),
+            
+                io.Int.Input("chunk_frames", default=90, min=5, max=2880, step=17, tooltip="Frames generated per segment; must satisfy 17n+5 (5,22,39,...). Set it to >= total_frames to generate the whole video as one segment."
+                             "In Clip_Tag and timeline modes this value is ignored and computed from the prompt content."
+                             "\n每段生成帧数，需满足 17n+5 (5,22,39,...)。设为 ≥ total_frames 时不拆分，整个视频作为一段生成。"
+                             "在 Clip_Tag 和 timeline 模式下，该值被忽略，由提示词内容自动计算。"),
+                io.Int.Input("context_frames", default=22, min=5, max=124, step=1, tooltip=_CONTEXT_FRAMES_TOOLTIP),
+                io.Boolean.Input("lock_audio", default=True, tooltip="Lock the audio region on the second pass / face resample (noise_mask audio=0): only the video is resampled and the audio stays unchanged."
+                                 "\n二采/修脸时锁定音频区 (noise_mask audio=0)：只重新采样视频、音频保持不变。"),
+                io.Boolean.Input("audio_drive", default=False, tooltip="Audio-drive switch. When checked, the audio region is locked (noise_mask=0) and the video is generated to follow it."
+                                 "\n音频驱动开关。勾选后音频区锁定 (noise_mask=0)，视频照音频生成。"),
+                io.Combo.Input("video_guide", options=["none", "pre_guide", "post_guide", "pre_post_guide"], default="none", tooltip="Strongly anchors multiple frames using the video fed into the ref_video ports. Only consumed by the main sampler node "
+                               "(Face_Resample has no head/tail anchoring path and ignores it)\n"
+                               "利用 ref_video 端口输入的视频进行多帧强锚定。仅主采样节点消费 "
+                               "(Face_Resample 无头尾锚定路径, 会忽略该键)。"),
+                io.Dict.Input("shot_info", optional=True,
+                              tooltip="Optional shot map from Minimax_H3_Face_Cut's shot_info output. When connected, the segment prompts are assigned to "
+                              "these shot intervals: prompt count > shots → take the first N; < shots → repeat the last; "
+                              "the shot interval replaces the time marks inside each prompt\n"
+                              "可选: Minimax_H3_Face_Cut 的 shot_info 输出。"
+                              "接入后分段提示词按镜头区间分配: 提示词数多于镜头数取前 N 条, 少于则重复最后一条; "
+                              "镜头时间段代替每条提示词内的时间标注"),
             ],
-            outputs=[
-                io.Dict.Output(display_name="parameter"),
-            ],
+            outputs=[io.Dict.Output(display_name="parameter")],
         )
 
+
     @classmethod
-    def execute(cls, long_prompt="", clip_mode="Clip_Tag", clip_tag="段1",
-                prompt_format="official", crop_mode="stretch", ref_sync_mode="segmented",
-                width=960, height=544, total_frames=362, fps=24, chunk_frames=90,
-                context_frames=22, lock_audio=True, audio_drive=False,
-                video_guide="none", 
-                ) -> io.NodeOutput:
+    def execute(cls, long_prompt="", clip_mode="Clip_Tag", clip_tag="段1", prompt_format="official",
+                crop_mode="stretch", ref_sync_mode="segmented", width=960, height=544,
+                total_frames=362, fps=24, chunk_frames=90, context_frames=22,
+                lock_audio=True, audio_drive=False, video_guide="none",
+                shot_info=None) -> io.NodeOutput:
         parameter = {
             "long_prompt": long_prompt,
             "clip_mode": clip_mode,
@@ -195,7 +164,55 @@ class H3ParameterNode(io.ComfyNode):
             "audio_drive": audio_drive,
             "video_guide": video_guide,
         }
+        # ---- shot_info: 把分段提示词按镜头区间分配 → parameter["shot_prompts"] ----
+        shots = None
+        if isinstance(shot_info, dict) and shot_info.get("shots"):
+            shots = [(int(s), int(e)) for s, e in shot_info["shots"]]
+        if shots and (long_prompt or "").strip():
+            from . import h3_utils
+            n = len(shots)
+            if clip_mode == "Clip_Tag":
+                ts = h3_utils.build_tag_schedule(long_prompt, clip_tag, default_seconds=1.0)
+                texts = [t for t, _d in ts["segments"]]
+                prefix = ts.get("prefix", "")
+            else:
+                mode = clip_mode if clip_mode in ("timeline", "sequential", "global") else "global"
+                sched = h3_utils.build_prompt_schedule(long_prompt, 1.0, mode=mode)
+                if sched.get("mode") == "global":
+                    texts = [long_prompt]
+                else:
+                    texts = [s["label"] + ("\n" + s["content"] if s["content"] else "")
+                             for s in sched["segments"]]
+                prefix = "\n\n".join(x for x in (sched.get("prefix", ""), sched.get("suffix", "")) if x)
+            texts = [t for t in texts if t and t.strip()] or [long_prompt.strip()]
+            assigned = texts[:n] if len(texts) >= n else texts + [texts[-1]] * (n - len(texts))
+            if len(texts) != n:
+                print(f"[H3-Param] shot prompts: {len(texts)} written vs {n} shots — "
+                      f"{'truncated' if len(texts) > n else 'last repeated'}\n"
+                      f"[H3-Param] 分段提示词 {len(texts)} 条 vs 镜头 {n} 个 — "
+                      f"{'截取前段' if len(texts) > n else '末条重复补齐'}")
+            shot_prompts = []
+            for (s, e), txt in zip(shots, assigned):
+                if prompt_format == "raw":
+                    body = txt
+                else:  
+                    seg = {"start": 0.0, "end": float(e - s), "label": txt, "content": "",
+                           "block": None, "bracket": False}
+                    body = h3_utils.compose_window_prompt(
+                        {"segments": [seg], "prefix": "", "suffix": "", "mode": "timeline"},
+                        0.0, float(e - s), fmt=prompt_format)
+                shot_prompts.append({"start": s, "end": e,
+                                     "text": (body + "\n\n" + prefix).strip() if prefix else body})
+            parameter["shot_prompts"] = shot_prompts
+            print(f"[H3-Param] shot_prompts built: {len(shot_prompts)} shot(s) mapped to "
+                  f"{len(assigned)} prompt(s), format={prompt_format}\n"
+                  f"[H3-Param] shot_prompts 已生成: {len(shot_prompts)} 个镜头 ↔ {len(assigned)} 条提示词, "
+                  f"格式={prompt_format}")
+        elif shots:
+            print("[H3-Param] shot_info connected but prompt is empty — shot_prompts not built\n"
+                  "[H3-Param] 已接 shot_info 但提示词为空 — 未生成 shot_prompts")
         return io.NodeOutput(parameter)
+
 
 
 class H3AutoContextSampler(io.ComfyNode):

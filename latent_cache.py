@@ -202,3 +202,90 @@ def save_segment_latent_async(cache_dir, seg_idx, samples, x0, metadata=None):
 def flush_save_queue():
     """等待所有保存任务完成（可选，在程序退出前调用）"""
     _save_queue.join()
+    
+# ================= 通用缓存块 (FaceCut / FaceResample 用, 与段缓存同规则) =================
+_blob_thread_started = False
+_blob_queue = queue.Queue()
+
+
+def save_blob_sync(cache_dir, name, payload, metadata=None):
+    """保存任意 torch.save 可序列化结构 (dict/tensor/list/str/...) 为单个缓存块 (原子写)。"""
+    if not cache_dir or not name:
+        return
+    directory = normalize_cache_dir(cache_dir)
+    try:
+        os.makedirs(directory, exist_ok=True)
+    except Exception:
+        return
+    path = os.path.join(directory, name)
+    tmp = path + ".tmp"
+    try:
+        torch.save({"payload": payload, "metadata": metadata or {}}, tmp)
+        os.replace(tmp, path)
+    except Exception as e:
+        print(f"[H3-Cache] Failed to save blob {name}: {e}\n[H3-Cache] 缓存块 {name} 保存失败: {e}")
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def load_blob(cache_dir, name, current_metadata=None, sensitive_keys=()):
+    """加载缓存块；任一敏感键与当前值不一致 → 删除旧缓存并返回 None (与段缓存同规则)。"""
+    if not cache_dir or not name:
+        return None
+    path = os.path.join(normalize_cache_dir(cache_dir), name)
+    if not os.path.exists(path):
+        return None
+    try:
+        data = torch.load(path, map_location="cpu")
+    except Exception as e:
+        print(f"[H3-Cache] Failed to load blob {name}: {e}\n[H3-Cache] 缓存块 {name} 加载失败: {e}")
+        return None
+    if current_metadata:
+        saved = data.get("metadata", {})
+        for k in sensitive_keys:
+            if k in current_metadata and saved.get(k) != current_metadata[k]:
+                print("\033[33m" + f"[H3-Cache] blob {name} mismatch on '{k}', deleting stale cache\n"
+                      f"[H3-Cache] 缓存块 {name} 键 '{k}' 不一致，删除旧缓存" + "\033[0m")
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+                return None
+    return data.get("payload")
+
+
+def clear_cache_dir(cache_dir):
+    """删除整个缓存目录 (节点 clear_cache 开关用)。返回是否删除了内容。"""
+    if not cache_dir:
+        return False
+    d = normalize_cache_dir(cache_dir)
+    if os.path.isdir(d):
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+        return True
+    return False
+
+
+def _blob_worker():
+    while True:
+        try:
+            item = _blob_queue.get(timeout=1)
+        except queue.Empty:
+            continue
+        try:
+            if item is None:
+                break
+            save_blob_sync(*item)
+        except Exception as e:
+            print(f"[H3-Cache] Async blob thread error: {e}\n[H3-Cache] 异步缓存线程异常: {e}")
+
+
+def save_blob_async(cache_dir, name, payload, metadata=None):
+    """异步保存缓存块 (后台线程, 与段缓存异步保存同风格)。"""
+    global _blob_thread_started
+    if not cache_dir:
+        return
+    if not _blob_thread_started:
+        threading.Thread(target=_blob_worker, daemon=True).start()
+        _blob_thread_started = True
+    _blob_queue.put((cache_dir, name, payload, metadata))
