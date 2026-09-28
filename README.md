@@ -13,7 +13,7 @@ H3 的显存需求随分辨率、时长（每 +5s 翻倍）、精度（fp8→bf1
 支持二次采样。视频续写、视频前推、双视频衔接。
 支持latent缓存存取，方便推理过程中因某种原因导致推理中断后，快速跳过已推理分段，缓存文件以分段为单位存储，在采样节点上游参数不变的情况下，读取已有latent cache 文件。
 
-⚠️注意：更改模型,包括lora、sageattention等加速节点时，latent检测不会发现更改，所以必须删除latent缓存，两种删除latent缓存的方法：
+⚠️注意：更改模型,包括lora、sageattention等加速节点时，latent检测不会发现更改，所以必须删除latent缓存，两种删除latent缓存的方法：  
 - 开启Minimax_H3_AutoContext_Sampler节点上的 clear_cache 参数，这会在采样开始时，强制重新建立本节点缓存文件。
 - 手动删除缓存目录中的对应文件夹（\ComfyUI\output\cache），文件夹名为“node_” + “节点ID”。
 
