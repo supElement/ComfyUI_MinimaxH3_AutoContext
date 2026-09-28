@@ -26,7 +26,7 @@ H3 的显存需求随分辨率、时长（每 +5s 翻倍）、精度（fp8→bf1
 
 v0.8.5
 
-<img width="2156" height="629" alt="image" src="https://github.com/user-attachments/assets/b0b9373a-258b-485e-b5e8-0b3778f744e3" />  <br>
+<img width="2156" height="629" alt="image" src="https://github.com/user-attachments/assets/b0b9373a-258b-485e-b5e8-0b3778f744e3" />  <br>  
 
  增加Minimax_H3_TST_AttentionPatch 注意力校正节点；H3 TST 注意力校正 — 谱张力诊断 + 视频行 query 自适应缩放，抑制时序闪烁/小脸崩坏。tau 强度（0.2），需放在其它 attention patch 下游。
   
