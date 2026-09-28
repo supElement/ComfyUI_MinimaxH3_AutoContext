@@ -22,7 +22,15 @@
 
 ## BUG修复及优化
 
-v0.8.5 （这个更新不在main主分支中，在本仓库test分支中）
+v0.8.5 
+
+> **新节点在 `test` 分支。**
+>
+> - 首次安装（要 test 分支）：
+>   `git clone -b test https://github.com/supElement/ComfyUI_MinimaxH3_AutoContext.git`
+> - 已安装，从 main 切到 test：
+>   `git fetch origin` → `git checkout test` → `git pull`
+> - Manager 用户：在 Manager 里把分支切到 `test`，再点 Update。
 
 <img width="2156" height="629" alt="image" src="https://github.com/user-attachments/assets/b0b9373a-258b-485e-b5e8-0b3778f744e3" />  <br>
   
