@@ -43,28 +43,27 @@ jobs:
               print('缺少 ZHIPU_API_KEY secret，已中止')
               exit(1)
 
-          with open('README.md', 'r', encoding='utf-8') as f:
-              src = f.read()
-
           SYSTEM_PROMPT = (
               "你是一个专业的技术文档翻译员。将用户提供的中文 Markdown 翻译为英文，严格遵守：\n\n"
               "【格式完整性（最高优先级）】\n"
               "1. 保持 Markdown 结构：标题层级、列表、表格竖线分隔、HTML 标签、链接的方括号和圆括号结构必须保留。\n"
-              "2. 三反引号代码块（围栏内）的全部内容必须逐字原样保留，包括注释在内一律不翻译、不改写、不增删。\n"
-              "3. 行内代码（反引号包裹）中不含中文的内容必须原样保留。\n"
-              "4. 输出的开头和结尾都不得出现三连反引号代码围栏，不得有任何开场白、结束语或译注，直接输出译文正文。\n\n"
+              "2. 真正的三反引号代码块（如 ```bash、```python 等）内容必须逐字原样保留，包括注释在内一律不翻译、不改写、不增删。\n"
+              "3. 被 [[[TRANSLATE_FENCE_n:lang]]] 和 [[[END_TRANSLATE_FENCE_n]]] 包裹的内容是示例文本块，必须将其中文翻译为英文，但标记本身必须原样保留在输出中。\n"
+              "4. 行内代码已由 %%C1%%、%%C2%% 等占位符保护，必须原样保留占位符，不得翻译、改写或删除。\n"
+              "5. 输出的开头和结尾都不得出现三连反引号代码围栏，不得有任何开场白、结束语或译注，直接输出译文正文。\n\n"
               "【受保护标记】\n"
-              "5. 形如 %%L1%%、%%I1%%、%%C1%%、%%U1%% 的占位符是受保护标记：必须原样留在原位置，禁止翻译、改写大小写、增删百分号、删除或移动。\n"
-              "6. 数字与单位的组合（如 3s、5ms、30fps、17n+5）必须原样保留，禁止把单位展开成单词（s 不得写成 seconds）。\n\n"
+              "6. 形如 %%L1%%、%%I1%%、%%C1%%、%%U1%% 的占位符以及 [[[TRANSLATE_FENCE_n:lang]]]、[[[END_TRANSLATE_FENCE_n]]] 标记都是受保护标记：必须原样留在原位置，禁止翻译、改写大小写、增删括号或百分号、删除或移动。\n"
+              "7. 数字与单位的组合（如 3s、5ms、30fps、17n+5）必须原样保留，禁止把单位展开成单词（s 不得写成 seconds）。\n\n"
               "【翻译完整性】\n"
-              "7. 逐句完整翻译，禁止跳过、缩译、省略。除代码块、行内代码、占位符外，译文中不得残留任何中文字符，也不要添加原文中没有的任何说明文字。\n\n"
+              "8. 逐句完整翻译，禁止跳过、缩译、省略。除真正的代码块、行内代码占位符、受保护标记外，译文中不得残留任何中文字符，也不要添加原文中没有的任何说明文字。\n\n"
               "【标点】\n"
-              "8. 散文部分的中文全角标点（，。：；（）等）转为英文半角（, . : ; ( ) 等）。"
+              "9. 散文部分的中文全角标点（，。：；（）等）转为英文半角（, . : ; ( ) 等）。"
           )
 
           LINE_SYSTEM = (
               "你是翻译助手。将用户给出的每一行中文翻译为英文，输出行数必须与输入完全一致，一行对应一行。"
-              "保留行内的 Markdown 结构，%%L1%%、%%I1%%、%%C1%%、%%U1%% 形式的占位符必须原样不动，数字与单位的组合（如 3s）保持原样。"
+              "保留行内的 Markdown 结构，%%L1%%、%%I1%%、%%C1%%、%%U1%% 形式的占位符必须原样不动，"
+              "[[[TRANSLATE_FENCE_n:lang]]] 和 [[[END_TRANSLATE_FENCE_n]]] 标记也必须原样保留，数字与单位的组合（如 3s）保持原样。"
               "只输出译文，不要任何解释。"
           )
 
@@ -144,9 +143,61 @@ jobs:
               s = line.lstrip()
               return len(s) - len(s.lstrip('`')) if s.startswith(FENCE) else 0
 
+          def protect_translatable_fences(text):
+              """把 ```text / ```markdown / 空语言 且含中文的围栏块标记为可翻译示例文本块。
+              这样它们不会被 restore_code_blocks 当作代码块机械覆盖，而是交给模型翻译。"""
+              lines = text.split('\n')
+              out = []
+              fences = {}
+              i = 0
+              idx = 0
+              while i < len(lines):
+                  ln = lines[i]
+                  n = fence_len(ln)
+                  if n > 0:
+                      s = ln.strip()
+                      lang = s[n:].strip().lower()
+                      j = i + 1
+                      close_j = -1
+                      while j < len(lines):
+                          n2 = fence_len(lines[j])
+                          if n2 >= n and lines[j].strip().strip('`') == '':
+                              close_j = j
+                              break
+                          j += 1
+                      if close_j != -1:
+                          content_lines = lines[i+1:close_j]
+                          content = '\n'.join(content_lines)
+                          if lang in ('text', 'markdown', 'md', '') and CJK_RE.search(content):
+                              idx += 1
+                              fences[idx] = lang or 'text'
+                              out.append(f'[[[TRANSLATE_FENCE_{idx}:{lang or "text"}]]]')
+                              out.extend(content_lines)
+                              out.append(f'[[[END_TRANSLATE_FENCE_{idx}]]]')
+                              i = close_j + 1
+                              continue
+                          else:
+                              out.extend(lines[i:close_j+1])
+                              i = close_j + 1
+                              continue
+                  out.append(ln)
+                  i += 1
+              return '\n'.join(out), fences
+
+          def restore_translatable_fences(text, fences):
+              def _open(m):
+                  idx = int(m.group(1))
+                  lang = fences.get(idx, 'text')
+                  return f'```{lang}'
+              def _close(m):
+                  return '```'
+              text = re.sub(r'\[\[\[\s*TRANSLATE_FENCE_(\d+)\s*:\s*[^\]]*?\s*\]\]\]', _open, text, flags=re.I)
+              text = re.sub(r'\[\[\[\s*END_TRANSLATE_FENCE_(\d+)\s*\]\]\]', _close, text, flags=re.I)
+              return text
+
           def mask_line_tokens(text):
-              """围栏外按行处理：纯ASCII行内代码与 数字+单位 掩码为占位符。
-              含中文的行内代码不掩码（交给模型翻译），但其内的数字+单位仍会被保护。"""
+              """围栏外按行处理：行内代码与 数字+单位 掩码为占位符。
+              行内代码一律掩码（包括含中文的），避免参数标签等被翻译。"""
               codes, units = [], []
               out, in_fence, open_len = [], False, 0
               for ln in text.split('\n'):
@@ -161,8 +212,6 @@ jobs:
                   if not in_fence:
                       def _c(m):
                           s = m.group(0)
-                          if CJK_RE.search(s):
-                              return s
                           codes.append(s)
                           return f'%%C{len(codes)}%%'
                       ln = INLINE_RE.sub(_c, ln)
@@ -343,7 +392,8 @@ jobs:
               return api_call(
                   SYSTEM_PROMPT,
                   "请将以下 Markdown 片段翻译为英文。片段中所有 %%L1%%、%%I1%%、%%C1%%、%%U1%% 形式的占位符必须原样保留在原位置。"
-                  "代码块内容逐字保留。数字与单位（如 3s、30fps）保持原样。直接输出译文正文，不要任何解释。\n\n"
+                  "[[[TRANSLATE_FENCE_n:lang]]] 和 [[[END_TRANSLATE_FENCE_n]]] 标记必须原样保留，其内部内容翻译为英文。"
+                  "真正的代码块内容逐字保留。数字与单位（如 3s、30fps）保持原样。直接输出译文正文，不要任何解释。\n\n"
                   + chunk,
                   temperature)
 
@@ -360,8 +410,8 @@ jobs:
               except Exception as e:
                   print(f"  [CJK修复] 逐词翻译失败 {token!r}: {e}")
               return token  # 失败就原样保留，交给最终校验报错
-          
-          
+
+
           def replace_cjk_safe(line):
               """对一行做中文逐词替换，先保护行内代码和 URL，避免误伤"""
               saved = []
@@ -425,12 +475,12 @@ jobs:
                           print(f"  [CJK修复] 二次翻译行数不匹配(出 {len(fl)}/入 {len(to_fix)})，转逐词兜底")
                   except Exception as e:
                       print(f"  [CJK修复] 二次翻译失败: {e}，转逐词兜底")
-              
+
                   if fixed_lines is not None:
                       for i, nl in zip(to_fix, fixed_lines):
                           ws = re.match(r'[ \t]*', lines[i]).group(0)
                           lines[i] = ws + nl.strip()
-              
+
                   # 兜底：整行翻译后仍残留中文的行，做逐词替换
                   for i in to_fix:
                       if CJK_RE.search(lines[i]):
@@ -438,7 +488,7 @@ jobs:
                           lines[i] = replace_cjk_safe(lines[i])
                           if lines[i] != before:
                               print(f"  [CJK修复] 逐词兜底: {before.strip()[:70]!r}")
-              
+
                   print(f"  [CJK修复] 已处理 {len(to_fix)} 行漏译内容")
               return '\n'.join(lines)
 
@@ -460,7 +510,12 @@ jobs:
                           return '\n'.join(lines[1:-1]).strip()
               return content
 
-          chunks = split_doc(src)
+          with open('README.md', 'r', encoding='utf-8') as f:
+              src = f.read()
+
+          src_for_translate, fences = protect_translatable_fences(src)
+
+          chunks = split_doc(src_for_translate)
           print(f"文档共 {len(src)} 字符，分为 {len(chunks)} 段: {[len(c) for c in chunks]}")
           # [FIX] 超长分片提前告警（如整个超大代码块无空行，无法安全切割时）
           big = [len(c) for c in chunks if len(c) > 12000]
@@ -517,6 +572,7 @@ jobs:
                     f"{len(codes)} 处行内代码, {len(units)} 个单位标记）")
 
           content = '\n'.join(parts)
+          content = restore_translatable_fences(content, fences)
           err = validate_final(content)
           if err:
               print(f"整体校验失败: {err}")
