@@ -347,6 +347,32 @@ jobs:
                   + chunk,
                   temperature)
 
+          def translate_token(token):
+              """把单个中文片段翻成英文，用于 cjk_surgery 兜底"""
+              try:
+                  out = api_call(
+                      "你是翻译助手。将用户给出的中文片段翻译为英文。只输出译文本身，"
+                      "不要引号、不要解释、不要加标点包裹。保留其中的英文单词、数字、符号不变。",
+                      token, 0.1).strip()
+                  out = out.strip('"\'` ').strip()
+                  if out and not CJK_RE.search(out):
+                      return out
+              except Exception as e:
+                  print(f"  [CJK修复] 逐词翻译失败 {token!r}: {e}")
+              return token  # 失败就原样保留，交给最终校验报错
+          
+          
+          def replace_cjk_safe(line):
+              """对一行做中文逐词替换，先保护行内代码和 URL，避免误伤"""
+              saved = []
+              def _save(m):
+                  saved.append(m.group(0))
+                  return f'\x00{len(saved) - 1}\x00'
+              line = re.sub(r'`[^`\n]*`|https?://\S+', _save, line)
+              line = CJK_RE.sub(lambda m: translate_token(m.group(0)), line)
+              line = re.sub(r'\x00(\d+)\x00', lambda m: saved[int(m.group(1))], line)
+              return line
+
           def cjk_surgery(text, chunk):
               """中文残留的定向修复:
               - 行内中文在源文档中不存在 => 模型自行添加的行 => 删除
@@ -386,22 +412,34 @@ jobs:
                   lines[i] = ''
               if to_fix:
                   payload = '\n'.join(lines[i] for i in to_fix)
+                  fixed_lines = None
                   try:
-                      fixed_lines = api_call(
+                      fl = api_call(
                           LINE_SYSTEM,
-                          "请将以下各行逐行翻译为英文（输出行数必须与输入一致）:\n\n" + payload,
+                          "请将以下各行逐行翻译为英文（输出行数必须与输入一致）。"
+                          "特别注意：行内即使只有一两个中文字也必须翻译，不得保留任何中文字符：\n\n" + payload,
                           0.1).strip().split('\n')
-                      if len(fixed_lines) == len(to_fix):
-                          for i, nl in zip(to_fix, fixed_lines):
-                              # [FIX] 保留原行缩进（嵌套列表/引用块），只替换正文，
-                              # 否则 strip() 会破坏 Markdown 层级结构
-                              ws = re.match(r'[ \t]*', lines[i]).group(0)
-                              lines[i] = ws + nl.strip()
-                          print(f"  [CJK修复] 已对 {len(to_fix)} 行漏译内容完成二次翻译")
+                      if len(fl) == len(to_fix):
+                          fixed_lines = fl
                       else:
-                          print(f"  [CJK修复] 二次翻译行数不匹配(出 {len(fixed_lines)}/入 {len(to_fix)})，保留原文")
+                          print(f"  [CJK修复] 二次翻译行数不匹配(出 {len(fl)}/入 {len(to_fix)})，转逐词兜底")
                   except Exception as e:
-                      print(f"  [CJK修复] 二次翻译失败: {e}，保留原文")
+                      print(f"  [CJK修复] 二次翻译失败: {e}，转逐词兜底")
+              
+                  if fixed_lines is not None:
+                      for i, nl in zip(to_fix, fixed_lines):
+                          ws = re.match(r'[ \t]*', lines[i]).group(0)
+                          lines[i] = ws + nl.strip()
+              
+                  # 兜底：整行翻译后仍残留中文的行，做逐词替换
+                  for i in to_fix:
+                      if CJK_RE.search(lines[i]):
+                          before = lines[i]
+                          lines[i] = replace_cjk_safe(lines[i])
+                          if lines[i] != before:
+                              print(f"  [CJK修复] 逐词兜底: {before.strip()[:70]!r}")
+              
+                  print(f"  [CJK修复] 已处理 {len(to_fix)} 行漏译内容")
               return '\n'.join(lines)
 
           def strip_fence(content):
