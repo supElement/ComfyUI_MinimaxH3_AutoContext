@@ -26,9 +26,9 @@ v0.8.5
 
 > **新节点在 `test` 分支**
 >
-> 首次安装（要 test 分支）：
+> 首次安装（要 test 分支）：  
 >   `git clone -b test https://github.com/supElement/ComfyUI_MinimaxH3_AutoContext.git`  
-> 已安装，从 main 切到 test：
+> 已安装，从 main 切到 test：  
 >   `git fetch origin` → `git checkout test` → `git pull`  
 > Manager 用户：在 Manager 里把分支切到 `test`，再点 Update。
 
@@ -36,7 +36,7 @@ v0.8.5
   
 增加Minimax_H3_TST_AttentionPatch 注意力校正节点；H3 TST 注意力校正 — 谱张力诊断 + 视频行 query 自适应缩放，抑制时序闪烁/小脸崩坏。tau 强度（0.2），需放在其它 attention patch 下游。
 
-增加并优化面部修复节点。详细说明：[中文](h3_fix_zh.md) | [English](h3_fix_en.md)</sub>
+增加并优化面部修复节点。详细说明：[中文](https://github.com/supElement/ComfyUI_MinimaxH3_AutoContext/blob/test/h3_fix_zh.md) | [English](https://github.com/supElement/ComfyUI_MinimaxH3_AutoContext/blob/test/h3_fix_en.md)</sub>
 - Minimax_H3_Face_Cut： 检测与裁剪，分镜 + YOLO 检测 + 可选 SeC-4B 追踪。
 - Minimax_H3_Face_Resample： 精修，主采样同款模型做块级 img2img 重采样 (块结构镜像主采样分段 + 块间锚定) 。
 - Minimax_H3_Face_Blend： 贴回，精修脸按几何账本与 mask 逐像素贴回原画面。
