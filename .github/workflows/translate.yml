@@ -2,7 +2,7 @@ name: Translate Readme
 
 on:
   push:
-    branches: ['main']
+    branches: ['test']
     paths:
       - 'README.md'
   workflow_dispatch:        # [FIX] 支持手动触发，便于首次跑通和失败补跑
