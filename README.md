@@ -22,7 +22,19 @@ H3 的显存需求随分辨率、时长（每 +5s 翻倍）、精度（fp8→bf1
 
 <img width="2209" height="1030" alt="image" src="https://github.com/user-attachments/assets/9bbdda2a-d4ce-4836-b108-e359e72e31de" />
 
-## BUG修复及优化
+## BUG修复、优化和新功能
+V0.9.0
+
+- 集成项目MiniMax-H3-Semantic-Bridge的语义桥能力：将 SenseNova U1.5 教师桥蒸馏出的 ~11MB 学生适配器混合进 H3 条件，增强提示词遵循度（空间关系/计数/材质/反射等），推理时无需 SenseNova 参与。语义桥并非通用方法，部分情况会产生劣化，所以非必要不要开启。
+- `Minimax_H3_AutoContext_parameter` 节点新增 4 个参数：`semantic_bridge`（开关）、`semantic_bridge_adapter`（适配器文件）、`semantic_bridge_alpha`（融合强度，默认 0.10，官方 A/B 示例用 0.15）、`semantic_bridge_magnitude`（幅度对齐方式，默认 per_token）。
+- 只变换条件张量，不修改 H3 DiT 权重；段间续接锚定与参考素材通道不受影响，可随时启用或断开。
+- ⚠️ 上游 v1 仅验证 FL2VA/文本路径；Ref2VA 参考路径（ref_video / ref_audio，含口型同步）未验证，实测可能劣化口型与演唱表现，使用前请自行开/关 A/B 对比。
+- 注：修脸链路（Face_Cut / Face_Resample / Face_Blend）暂不应用语义桥。
+
+- 优化面部修复节点处理逻辑；优化内存和显存占用；SR 放大前可选卸载主模型/VAE/CLIP。
+- 固定提示词时，不再每块重载文本编码器，并在此情况下，加强指纹校验(像素内容指纹)，避免换图假命中。
+- 新增	sr_batch（默认 4，范围 1~16）	SR 每次前向的帧数；只影响速度与显存峰值，不影响结果。
+- 移除	sec_auto_unload，SeC-4B追踪结束后现在始终自动卸载，无需开关。
 
 v0.8.5
 
@@ -167,8 +179,21 @@ git clone https://github.com/supElement/ComfyUI_MinimaxH3_AutoContext.git
 | lock_audio | `true` | 二采时锁定音频区（noise_mask audio=0）：只重新采样视频、保持一采音频不变 |
 | audio_drive | `false` | 音频驱动开关，开启后视频跟随 drive_audio 生成 |
 | video_guide | `none` | 视频延长参数，支持分段。 none: 不启用；pre_guide: 视频续写（采样节点 ref_video_0 或 + ref_video_audio_0 端口）；post_guide: 视频前推（采样节点 ref_video_0 或 + ref_video_audio_0 端口）；pre_post_guide: 双视频中间衔接（采样节点 ref_video_0 或 + ref_video_audio_0 端口，ref_video_1 或 + ref_video_audio_1 端口）。锚定帧数由 context_frames 决定。注意：非none时，采样节点的对应参考端口的参考会被强行剪切为context_frames参数中设置的数值。参考引用逻辑与普通参考相同（提示词中声明了，才会引用）|
+| semantic_bridge | false | 语义桥开关：将 SenseNova 蒸馏的 ~11MB 学生适配器按 C = H + alpha*(S-H) 混合进条件张量，增强提示词遵循度。只变换条件，不动模型权重；段间续接锚定与参考通道不受影响。适配器放入 models/semantic_bridge/ |
+| semantic_bridge_adapter | none | 语义桥适配器文件（models/semantic_bridge/ 下的 .safetensors）。none = 禁用。启动后新放入的文件需重启 ComfyUI 才会出现在下拉框 |
+| semantic_bridge_alpha | 0.10 | 融合强度。官方推荐起点 0.10，官方 A/B 示例用 0.15，建议在 0.10~0.15 之间微调 |
+| semantic_bridge_magnitude | per_token | 融合前幅度对齐：per_token 逐 token RMS 对齐（官方推荐）/ global 全张量标量对齐 / none 不对齐 |
 
 > 节点上实时显示「预计分段」预览（前端 JS 计算，不参与推理）。
+
+关于语义桥
+
+- 上游项目：Speach1sdef178/MiniMax-H3-Semantic-Bridge（适配器下载：[HuggingFace](https://huggingface.co/speach1sdef178/MiniMax-H3-Semantic-Bridge)）
+- 连接方式：**无需改工作流接线** —— 在 parameter 节点开启 `semantic_bridge` 并选择适配器即可，主采样节点逐段自动应用
+- 影响范围：只混合文本/FL2VA 条件张量；段间续接锚定与参考素材通道不受影响
+- 适配器安装：下载 `.safetensors` 放入 `ComfyUI/models/semantic_bridge/`（目录自动创建），重启 ComfyUI 后在 `semantic_bridge_adapter` 下拉框中选择
+- 缓存行为：桥参数参与分段缓存指纹，改 alpha / 换适配器 / 开关桥后对应段自动重建
+- ⚠️ 适用范围：上游 v1 仅验证 FL2VA/文本路径；Ref2VA（参考视频/音频）未验证，实测可能劣化口型与演唱，请自行 A/B
 
 ### Minimax_H3_AutoContext_Sampler（主节点）
 
