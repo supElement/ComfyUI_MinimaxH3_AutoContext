@@ -47,7 +47,7 @@ Three nodes chained, running on the output of the main sampler node (Minimax_H3_
 
 ## 2. Face_Cut — Detection & Cropping
 
-Pipeline: PySceneDetect shot detection → YOLO face detection → optional SeC-4B identity tracking → per-frame smoothed-window cropping.
+Pipeline: PySceneDetect shot detection → YOLO face detection → optional SeC-4B identity tracking → per-frame smoothed-window cropping.Multi-person scenes: identity arbitration compares per-pixel masks (boxes are only a fallback), and detections inside tracking gaps are first attributed back to existing tracks before any new identity is spawned — crossed paths / brief mutual occlusion no longer split one identity into several pieces; small residual gaps are bridged by in-track interpolation (default cap 24 frames).
 
 Model download: [huggingface](https://huggingface.co/cglearned/Minimax_H3_Face_Cut/tree/main)
 
@@ -69,10 +69,13 @@ PySceneDetect is a Python dependency, not a model: pip install scenedetect if mi
 | images / latent | Pick one. images mode recommended: detect on external frames at native size, never touches latent; latent mode decodes probe frames via VAE |
 | yolo_threshold | Detection confidence (default 0.3); lower it if faces are missed |
 | shot_threshold | Shot-cut threshold; higher = fewer cuts (default 40) |
-| upscale_model | Optional SR chain: repeatedly upscale until ≥ canvas size (≤3 passes), then lanczos to the exact size; fixes ringing-induced color blotches on tiny faces; None = lanczos only |
+| upscale_model | Optional SR chain: repeatedly upscale until ≥ canvas size (≤2 passes), then lanczos to the exact size; fixes ringing-induced color blotches on tiny faces; None = lanczos only |
 | res / expand | Canvas size (default 512) / crop-window padding % (default 20) |
 | skip_ratio | Faces ≥ res × this ratio skip resampling (default 0.8) |
-| sec_model / sec_threshold / max_identities | None = single-face mode (largest face per frame, no mask); select a weight = multi-identity tracking + SeC masks |
+| sec_model / sec_threshold / max_identities | None = single-face mode (largest face per frame, no mask); select a weight = multi-identity tracking + SeC masks. SeC-4B is always unloaded automatically right after tracking |
+| sr_batch | Frames per SR forward pass during crop upscale (default 4, 1–16). Higher = faster but higher VRAM peak; 4 on 16GB, 8–16 on 24GB+. Affects only speed/VRAM, never results |
+| unload_main_models | Unload H3/VAE/CLIP from VRAM after detection & SeC tracking, before the crop/SR stage (default on; recommended on 12–16GB cards). The SR model loads via spandrel outside ComfyUI model management, so a resident main model can push VRAM past physical capacity; on Windows the OOM is masked by “shared GPU memory” and shows up as sudden extreme slowdown. SeC-4B is always unloaded after tracking regardless |
+
 
 ## 3. Face_Resample — Canvas Refinement
 
@@ -83,7 +86,7 @@ Uses the crop rows as a canvas and refines them block by block via img2img; bloc
 | Parameter | Notes |
 |---|---|
 | sigmas | Refinement σ schedule (from a scheduler); fewer steps = more conservative retouch |
-| seed | Block sampling seed (auto-offset per block) |
+| seed | Block sampling seed (auto-offset per block); keep the widget’s control_after_generate = fixed, otherwise the row cache can never hit |
 | color_match | Per-subtrack Reinhard color match back to the source crops (default on) |
 | ref_images | Reference images; passed only when declared as a Picture tag in the prompt |
 
@@ -117,3 +120,7 @@ Per-subtrack scaling + pixel paste-back, **zero VAE** (entirely in pixel space, 
 | SR model fails to load | Auto-fallback to lanczos; image SR models only (video/interpolation models like RIFE unsupported) |
 | Per-subtrack verbose log | Set _VERBOSE = True at the top of h3_facefix.py |
 | Cache location | output/cache/node_<node id>/ — the whole folder can be deleted |
+| One identity split into pieces / phantom short identities when two people cross paths | Auto-repaired since v20.4: mask arbitration + gap attribution + in-track interpolation bridging. “N frame(s) attributed to existing track(s)” in the SeC log means the repair fired. If it still splits, lower sec_threshold |
+| Extreme slowdown during crop/SR on 16GB cards without any OOM error | Windows silently spills VRAM into “shared GPU memory” instead of raising OOM. Keep unload_main_models on and lower sr_batch to 2 |
+| Checked clear_cache on Face_Cut but Face_Resample reused old results | clear_cache clears only that node’s own cache. Face_Resample’s crop-row cache auto-invalidates when crop pixels change (content hash) or when the σ schedule changes; after code edits, delete each node’s cache folder output/cache/node_<id>/ |
+| Old workflow shows red/unset inputs after node update | v20.3 schema change: sec_auto_unload was removed (SeC is now always unloaded); re-wire the new unload_main_models and sr_batch inputs |

@@ -139,6 +139,7 @@ def load_segment_latent(cache_dir, seg_idx, current_metadata=None):
             "segment_fingerprint",      
             "upstream_global_hash",
             "video_guide", "tst_tau",
+            "semantic_bridge", "semantic_bridge_adapter", "semantic_bridge_alpha", "semantic_bridge_magnitude",
         ]
 
         mismatch = False

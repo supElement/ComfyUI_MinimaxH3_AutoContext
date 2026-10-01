@@ -25,12 +25,26 @@ import folder_paths
 
 try:
     import comfy.utils
+    import comfy.model_management
     _HAS_COMFY = True
+    _INTERRUPT_EXC = comfy.model_management.InterruptProcessingException
 except ImportError:
     _HAS_COMFY = False
+    _INTERRUPT_EXC = None
 
-_VERBOSE = False
+_VERBOSE = False   # debug
 
+
+def _check_interrupt():
+    """ComfyUI 队列取消检查点: 用户点'取消当前队列'后, 下一次调用抛 InterruptProcessingException。
+    SeC 追踪是引擎内部的长推理循环, ComfyUI 只在节点边界或显式检查点感知取消 — 本函数即检查点。"""
+    if _HAS_COMFY:
+        comfy.model_management.throw_exception_if_processing_interrupted()
+
+
+def _is_interrupt(e):
+    """判断异常是否为用户取消 (非 ComfyUI 环境恒为 False)。"""
+    return _INTERRUPT_EXC is not None and isinstance(e, _INTERRUPT_EXC)
 
 def log(*args, **kwargs):
     """主干信息: 每节点入口/出口摘要、关键统计 — 始终输出。"""
@@ -155,9 +169,9 @@ def token_blocks(n_tokens, chunk_tokens=22):
 # ================= 检测 =================
 _yolo_model = None
 _yolo_path = None
+_YOLO_BATCH_DEFAULT = 16  # 检测批大小: 单批显存与视频总长无关 (list 输入会被 ultralytics 当成一个大批次)
 
-
-def detect_faces_yolo(frames_u8, conf=0.3, model_path=""):
+def detect_faces_yolo(frames_u8, conf=0.3, model_path="", batch_size=_YOLO_BATCH_DEFAULT):
     global _yolo_model, _yolo_path
     from ultralytics import YOLO
     if not model_path:
@@ -166,24 +180,32 @@ def detect_faces_yolo(frames_u8, conf=0.3, model_path=""):
     if _yolo_model is None or _yolo_path != model_path:
         _yolo_model = YOLO(model_path)
         _yolo_path = model_path
-    bgr_frames = [np.ascontiguousarray(f[..., ::-1]) for f in frames_u8]
-    results = _yolo_model.predict(source=bgr_frames, conf=conf, verbose=False)
+    bs = max(1, int(batch_size))
     out = []
-    for r in results:
-        boxes = []
-        if r.boxes is not None and len(r.boxes) > 0:
-            xyxy = r.boxes.xyxy.cpu().numpy()
-            confs = r.boxes.conf.cpu().numpy()
-            for (x1, y1, x2, y2), s in zip(xyxy, confs):
-                boxes.append((float(x1), float(y1), float(x2), float(y2), float(s)))
-        out.append(boxes)
+    pbar = comfy.utils.ProgressBar(len(frames_u8)) if _HAS_COMFY else None   
+    for start in range(0, len(frames_u8), bs):
+        _check_interrupt()
+        bgr_frames = [np.ascontiguousarray(f[..., ::-1]) for f in frames_u8[start:start + bs]]
+        results = _yolo_model.predict(source=bgr_frames, conf=conf, verbose=False)
+        for r in results:
+            boxes = []
+            if r.boxes is not None and len(r.boxes) > 0:
+                xyxy = r.boxes.xyxy.cpu().numpy()
+                confs = r.boxes.conf.cpu().numpy()
+                for (x1, y1, x2, y2), s in zip(xyxy, confs):
+                    boxes.append((float(x1), float(y1), float(x2), float(y2), float(s)))
+            out.append(boxes)
+        if pbar is not None:                                                  
+            pbar.update(min(bs, len(frames_u8) - start))                      
     return out
+
 
 
 def detect_faces(frames_u8, opt):
     conf = float(opt.get("conf", 0.3))
     model_path = (opt.get("model") or "").strip()
-    return detect_faces_yolo(frames_u8, conf, model_path)
+    batch_size = int(opt.get("batch_size", _YOLO_BATCH_DEFAULT))
+    return detect_faces_yolo(frames_u8, conf, model_path, batch_size=batch_size)
 
 
 # ================= 稳定轨迹 (旧单脸路径兼容保留) =================
@@ -464,21 +486,15 @@ def _mask_to_box(mask):
         return None
     return [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())]
 
-
 def sec_track_identities(model, frames_u8, per_frame, tracking_direction="bidirectional",
                          mllm_memory_size=12, offload_video_to_cpu=True,
                          iou_thr=0.3, max_ids=6, attempt_gap=16, max_runs=None, tag=""):
     """YOLO 多框检测结果 → SeC-4B 逐身份跨帧追踪。
     返回: [{"id", "anchor", "boxes": [F] bbox|None, "masks": [F] uint8[0/1] [H,W]|None}, ...]
-    masks 供 H3FaceCut 裁窗口 mask、H3FaceBlend 做 mask 贴回 (box 仅用于几何账目)。
-    注意 masks 为全分辨率, 内存 ≈ F × H × W 字节 (1080p/192帧 ≈ 400MB, 瞬时, 用完即释放)。
-    修复记录:
-    - max_frame_num_to_track 必须 None (SeC 不处理负数, -1 → 空区间 → 0 帧)
-    - init_mask 传锚点帧 mask (来自 add_new_points_or_box 返回值, 语义记忆需要)
-    - mask 经 _mask2d 压 2D (修复 np.nonzero 对 [1,H,W] 的 unpack 错误)
-    - box 以 numpy float32 传入; 锚点 bbox 直接用 YOLO 原框 (全分辨率, 不反推)
-    - 种子全败即放弃 / 锚点最小间隔 attempt_gap / 总尝试预算 max_runs
-    """
+    masks 供 H3FaceCut 裁窗口 mask、H3FaceBlend 做 mask 贴回。
+    v20.4: ① 门控冲突仲裁升级为 mask 优先 (box 仅在对方 mask 缺失时回退);
+           ② 覆盖缺口的检出先尝试"归属"给现有轨迹 (fill_into 重传播补 mask),
+              归属不成 (真·第三人) 才新建身份 — 修复交叉换位时同一身份被切碎。"""
     from PIL import Image
     F = int(frames_u8.shape[0])
     det_counts = [len(b) for b in per_frame]
@@ -491,36 +507,51 @@ def sec_track_identities(model, frames_u8, per_frame, tracking_direction="bidire
     tmpdir = tempfile.mkdtemp(prefix="h3_sec_")
     try:
         for i in range(F):
+            _check_interrupt()
             Image.fromarray(frames_u8[i]).save(os.path.join(tmpdir, f"{i:07d}.jpg"))
         state = model.grounding_encoder.init_state(
-            video_path=tmpdir,
-            offload_video_to_cpu=bool(offload_video_to_cpu),
+            video_path=tmpdir, offload_video_to_cpu=bool(offload_video_to_cpu),
             offload_state_to_cpu=False)
 
-        def _track_one(anchor, box, obj_id, occupied=None):
+        _pbar_box = {"bar": None, "total": 0, "n": 0}
+
+        def _shared_pbar():
+            if not _HAS_COMFY:
+                return None
+            if _pbar_box["bar"] is None:
+                _pbar_box["total"] = max(1, n_planned * F)
+                _pbar_box["bar"] = comfy.utils.ProgressBar(_pbar_box["total"])
+            return _pbar_box["bar"]
+
+        def _pbar_tick(bar):
+            if bar is None:
+                return
+            if _pbar_box["n"] < _pbar_box["total"]:
+                _pbar_box["n"] += 1
+                bar.update(1)
+
+        def _track_one(anchor, box, obj_id, occupied=None, fill_into=None, bail_frames=0):
+            _check_interrupt()
             if runs_left[0] <= 0:
                 warn(f"[H3-FaceFix]{tag} SeC run budget exhausted, skip anchor@{anchor}\n"
                      f"[H3-FaceFix]{tag} SeC 尝试次数已达上限, 跳过锚点@{anchor}")
                 return None
             runs_left[0] -= 1
             x1, y1, x2, y2 = [float(v) for v in box[:4]]
-            boxes = [None] * F
-            masks = [None] * F
+            pbar = _shared_pbar()
+            if fill_into is not None:
+                boxes, masks = fill_into   
+            else:
+                boxes = [None] * F
+                masks = [None] * F
             struct_logged = [False]
 
             def _prompt_at(frame_idx, bx):
-                """reset + box prompt → init_mask。
-                ⚠️ 必须返回 CPU numpy: SeC 在场景切换时做概念记忆回放
-                (label_img_with_mask 内部 np.uint8(mask)), CUDA 张量必崩;
-                引擎自己追加的记忆项也是 (video_res_masks[0]>0).cpu().numpy(), 同款约定。"""
                 model.grounding_encoder.reset_state(state)
                 bx1, by1, bx2, by2 = [float(v) for v in bx[:4]]
                 r = model.grounding_encoder.add_new_points_or_box(
-                    inference_state=state,
-                    frame_idx=int(frame_idx),
-                    obj_id=int(obj_id),
-                    points=None,
-                    labels=None,
+                    inference_state=state, frame_idx=int(frame_idx), obj_id=int(obj_id),
+                    points=None, labels=None,
                     box=np.asarray([bx1, by1, bx2, by2], dtype=np.float32))
                 raw = _mask_extract(r[2] if isinstance(r, (tuple, list)) else r)
                 if raw is None or not torch.is_tensor(raw):
@@ -531,46 +562,75 @@ def sec_track_identities(model, frames_u8, per_frame, tracking_direction="bidire
                     raise RuntimeError("empty anchor mask from box prompt\n锚点 box 产出空 mask")
                 boxes[int(frame_idx)] = [int(bx1), int(by1), int(bx2), int(by2)]
                 masks[int(frame_idx)] = init_np
-                return init_np.copy()  
+                return init_np.copy()
 
-            def _run(reverse, init_mask, start_idx):
+            class _SeCBailout(Exception):
+                pass
+
+            def _run(reverse, init_mask, start_idx, bail_frames=0):
+                _since = [0]
                 for f_idx, _obj_ids, out in model.propagate_in_video(
-                        state,
-                        start_frame_idx=int(start_idx),
-                        max_frame_num_to_track=None,  
-                        reverse=reverse,
-                        init_mask=init_mask,
+                        state, start_frame_idx=int(start_idx), max_frame_num_to_track=None,
+                        reverse=reverse, init_mask=init_mask,
                         mllm_memory_size=int(mllm_memory_size)):
+                    _check_interrupt()
                     if not struct_logged[0]:
                         struct_logged[0] = True
-                        shp = tuple(out.shape) if torch.is_tensor(out) else "-"
                     if f_idx is None or int(f_idx) < 0 or int(f_idx) >= F:
                         continue
+                    _claimed = False
                     if boxes[int(f_idx)] is None:
                         raw = _mask_extract(out)
-                        if raw is None:
-                            continue
-                        m = _mask2d(raw)
-                        if m.max() <= 0:
-                            continue
-                        nb = _mask_to_box(m)
-                        if nb is None:
-                            continue
-                        if occupied is not None and any(
-                                _overlap_ratio(nb, cb) >= float(iou_thr) for cb in occupied[int(f_idx)]):
-                            continue  
-                        boxes[int(f_idx)] = nb
-                        masks[int(f_idx)] = m
+                        if raw is not None:
+                            m = _mask2d(raw)
+                            if m.max() > 0:
+                                nb = _mask_to_box(m)
+                                if nb is not None:
+                                    _conflict = False
+                                    if occupied is not None:
+                                        for cb, cm in occupied[int(f_idx)]:
+                                            if cm is not None:
+                                                _mb, _cb = m > 0, cm > 0
+                                                _amin = min(int(_mb.sum()), int(_cb.sum()))
+                                                if _amin > 0 and float(
+                                                        np.logical_and(_mb, _cb).sum()) / _amin >= float(iou_thr):
+                                                    _conflict = True
+                                                    break
+                                                continue
+                                            if _overlap_ratio(nb, cb) >= float(iou_thr):
+                                                _conflict = True
+                                                break
+                                    if not _conflict:
+                                        boxes[int(f_idx)] = nb
+                                        masks[int(f_idx)] = m
+                                        _pbar_tick(pbar)
+                                        _claimed = True
+                    if _claimed:
+                        _since[0] = 0
+                    else:
+                        _since[0] += 1
+                        if int(bail_frames) > 0 and _since[0] >= int(bail_frames):
+                            raise _SeCBailout()
 
-            def _safe(direction_name, reverse, start_idx, init_mask):
-                """单向传播 + 断点续传 (最多 3 次): 中断后用最后一个有效帧的紧致框
-                重新打点、从下一帧接着跑 — 轨迹不再被一次异常截断。"""
+
+            def _safe(direction_name, reverse, start_idx, init_mask, bail_frames=0):
                 cur_init, cur_start = init_mask, int(start_idx)
                 for attempt in range(3):
                     try:
-                        _run(reverse, cur_init, cur_start)
+                        _run(reverse, cur_init, cur_start, bail_frames=bail_frames)
                         return
+                    
+                    except _SeCBailout:
+                        vlog(f"[H3-FaceFix]{tag} identity#{obj_id}: no claim for {bail_frames} frame(s), "
+                             f"{direction_name} propagation terminated early\n"
+                             f"[H3-FaceFix]{tag} 身份#{obj_id}: 连续 {bail_frames} 帧无认领, "
+                             f"{direction_name} 传播提前终止")
+                        return
+
+                    
                     except Exception as e:
+                        if _is_interrupt(e):
+                            raise
                         import traceback
                         warn(f"[H3-FaceFix]{tag} SeC identity#{obj_id} anchor@{anchor} "
                              f"{direction_name} attempt{attempt + 1}: propagate error: {e}\n"
@@ -607,8 +667,8 @@ def sec_track_identities(model, frames_u8, per_frame, tracking_direction="bidire
             elif tracking_direction == "backward":
                 _safe("backward", True, anchor, init)
             else:  # bidirectional
-                _safe("forward", False, anchor, init)
-                _safe("backward", True, anchor, _prompt_at(anchor, box))
+                _safe("forward", False, anchor, init, bail_frames=bail_frames)
+                _safe("backward", True, anchor, _prompt_at(anchor, box), bail_frames=bail_frames)
             n_hit = sum(1 for b in boxes if b is not None)
             n_msk = sum(1 for m in masks if m is not None)
             vlog(f"[H3-FaceFix]{tag} SeC identity#{obj_id} anchor@{anchor}: {n_hit}/{F} frames, masks {n_msk}/{F}\n"
@@ -618,7 +678,6 @@ def sec_track_identities(model, frames_u8, per_frame, tracking_direction="bidire
         tracks = []
 
         def _yolo_dedup(fx):
-            """帧 fx 的 YOLO 检出互相去重 (同脸重复检出只算一个)。"""
             out, used = [], []
             for d in per_frame[fx]:
                 if any(_bbox_iou(d[:4], u) > 0.5 for u in used):
@@ -628,8 +687,6 @@ def sec_track_identities(model, frames_u8, per_frame, tracking_direction="bidire
             return out
 
         def _distinct_sec(fx):
-            """帧 fx 上 SeC 传播框的独立人数: 互相重叠率 >= iou_thr 的框视为同一人。
-            去重是必须的 — 否则重复/垃圾身份虚增人数, 把真人永久堵在门外。"""
             uniq = []
             for t in tracks:
                 b = t["boxes"][fx]
@@ -644,7 +701,6 @@ def sec_track_identities(model, frames_u8, per_frame, tracking_direction="bidire
             return (not dets) or len(dets) <= len(_distinct_sec(fx))
 
         def _coverage_of(fx, det):
-            """检出框被现有 SeC 框覆盖的最大重叠率 (越小 → 越可能是新人)。"""
             c = 0.0
             for t in tracks:
                 b = t["boxes"][fx]
@@ -653,7 +709,34 @@ def sec_track_identities(model, frames_u8, per_frame, tracking_direction="bidire
             return c
 
         def _occ_snapshot():
-            return [[t["boxes"][i] for t in tracks if t["boxes"][i] is not None] for i in range(F)]
+            return [[(t["boxes"][i], (t["masks"][i] if t["masks"] is not None else None))
+                     for t in tracks if t["boxes"][i] is not None] for i in range(F)]
+
+        def _try_attribute(fx, det):
+            """缺口内检出归还给现有轨迹。v20.4b: ±60 帧内所有有效框都参与比对、
+            取最大重叠率 (交叉段邻近框常是劣化框, 只看最近一帧会漏), 候选唯一
+            或最高票显著领先才归属 (歧义宁不并)。"""
+            cands = []
+            for t in tracks:
+                if t["boxes"][fx] is not None:
+                    continue
+                best_r, found = 0.0, False
+                for d in range(1, 61):
+                    for j in (fx - d, fx + d):
+                        if 0 <= j < F and t["boxes"][j] is not None:
+                            found = True
+                            best_r = max(best_r, _overlap_ratio(det[:4], t["boxes"][j][:4]))
+                    if found and d >= 12:
+                        break
+                if found and best_r >= float(iou_thr):
+                    cands.append((best_r, t))
+            if not cands:
+                return None
+            cands.sort(key=lambda x: -x[0])
+            if len(cands) >= 2 and cands[1][0] > cands[0][0] * 0.7:
+                return None
+            return cands[0][1]
+
 
         anchor0 = max(range(F), key=lambda i: det_counts[i])
         seeds, used = [], []
@@ -664,21 +747,22 @@ def sec_track_identities(model, frames_u8, per_frame, tracking_direction="bidire
             seeds.append((anchor0, b[:4]))
             if len(seeds) >= int(max_ids):
                 break
-
+        n_planned = min(len(seeds), int(max_ids))
         for anchor, box in seeds:
             if len(tracks) >= int(max_ids) or runs_left[0] <= 0:
                 break
             res = _track_one(anchor, box, obj_id=len(tracks) + 1, occupied=_occ_snapshot())
             if res is None:
                 continue
-            tracks.append({"id": len(tracks), "anchor": int(anchor),
-                           "boxes": res[0], "masks": res[1]})
+            tracks.append({"id": len(tracks), "anchor": int(anchor), "boxes": res[0], "masks": res[1]})
 
         BRIDGE = 3
         for _pass in range(3):
             created = 0
+            attr_total = 0
             f = 0
             while f < F:
+                _check_interrupt()
                 if len(tracks) >= int(max_ids) or runs_left[0] <= 0:
                     break
                 if _frame_covered(f):
@@ -701,35 +785,51 @@ def sec_track_identities(model, frames_u8, per_frame, tracking_direction="bidire
                     continue
                 picked, pboxes = [], []
                 for d in sorted(_yolo_dedup(best), key=lambda d: _coverage_of(best, d)):
-                    if len(picked) >= quota:
-                        break
                     if any(_bbox_iou(d[:4], pb) > 0.5 for pb in pboxes):
                         continue
                     picked.append(d)
                     pboxes.append(d[:4])
                 seeded = 0
+                attributed = 0
                 for d in picked:
-                    if len(tracks) >= int(max_ids) or runs_left[0] <= 0:
-                        break
-                    res = _track_one(best, d[:4], obj_id=len(tracks) + 1, occupied=_occ_snapshot())
+                    if _coverage_of(best, d) >= float(iou_thr):
+                        continue  
+                    t_attr = _try_attribute(best, d)
+                    if t_attr is not None:
+                        if _track_one(best, d[:4], obj_id=int(t_attr["id"]) + 1,
+                                      occupied=_occ_snapshot(),
+                                      fill_into=(t_attr["boxes"], t_attr["masks"]), bail_frames=24) is not None:
+                            attributed += 1
+                        continue
+                    
+                    if seeded >= quota or len(tracks) >= int(max_ids) or runs_left[0] <= 0:
+                        continue
+                    res = _track_one(best, d[:4], obj_id=len(tracks) + 1, occupied=_occ_snapshot(), bail_frames=24)
                     if res is None:
                         continue
-                    tracks.append({"id": len(tracks), "anchor": int(best),
-                                   "boxes": res[0], "masks": res[1]})
+                    tracks.append({"id": len(tracks), "anchor": int(best), "boxes": res[0], "masks": res[1]})
                     seeded += 1
                 created += seeded
+                attr_total += attributed
                 vlog(f"[H3-FaceFix]{tag} uncovered gap [{gap[0]},{gap[1]}) -> "
-                     f"{seeded} new identity(ies) anchored@{best} "
-                     f"(yolo {len(_yolo_dedup(best))} vs sec {len(_distinct_sec(best))})\n"
-                     f"[H3-FaceFix]{tag} 覆盖缺口 [{gap[0]},{gap[1]}) → {seeded} 个新身份 "
-                     f"打点@{best} (检出 {len(_yolo_dedup(best))} vs SeC {len(_distinct_sec(best))})")
-            if created == 0 or len(tracks) >= int(max_ids) or runs_left[0] <= 0:
-                break
+                     f"{attributed} frame(s) attributed to existing track(s), "
+                     f"{seeded} new identity(ies) (yolo {len(_yolo_dedup(best))} vs "
+                     f"sec {len(_distinct_sec(best))})\n"
+                     f"[H3-FaceFix]{tag} 覆盖缺口 [{gap[0]},{gap[1]}) → "
+                     f"{attributed} 帧归属现有轨迹, {seeded} 个新身份 "
+                     f"(检出 {len(_yolo_dedup(best))} vs SeC {len(_distinct_sec(best))})")
+                if (created == 0 and attr_total == 0) or len(tracks) >= int(max_ids) or runs_left[0] <= 0:
+                    break
+            if created == 0 and attr_total == 0:
+                break  
+
+        tracks = [t for t in tracks
+                  if sum(1 for b in t["boxes"] if b is not None) >= 3]
 
         if tracks:
             n_cov = sum(1 for i in range(F) if any(t["boxes"][i] is not None for t in tracks))
-            n_det_notrack = sum(1 for i in range(F)
-                                if per_frame[i] and not any(t["boxes"][i] is not None for t in tracks))
+            n_det_notrack = sum(1 for i in range(F) if per_frame[i] and not any(
+                t["boxes"][i] is not None for t in tracks))
             log(f"[H3-FaceFix]{tag} coverage: {n_cov}/{F} frames covered "
                 f"(YOLO dets on {sum(det_counts)} frames, "
                 f"{n_det_notrack} det-frames without track)\n"

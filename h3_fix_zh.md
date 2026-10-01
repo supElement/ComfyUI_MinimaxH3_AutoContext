@@ -48,7 +48,7 @@
 
 ## 二、Face_Cut — 检测与裁剪
 
-流程: PySceneDetect 分镜 → YOLO 检测 → 可选 SeC-4B 身份追踪 → 逐帧平滑窗口裁剪。
+流程: PySceneDetect 分镜 → YOLO 检测 → 可选 SeC-4B 身份追踪 → 逐帧平滑窗口裁剪。多人场景: 身份仲裁按逐像素 mask 比对 (box 仅作回退), 追踪缺口内的检出会先归还给既有轨迹、再考虑新建身份 — 交叉换位/短暂互相遮挡不再把同一身份切成数块; 残留小缺口由轨迹内插值桥接 (默认上限 24 帧)。
 模型下载地址：[huggingface](https://huggingface.co/cglearned/Minimax_H3_Face_Cut/tree/main)
 
 ### 模型放置目录
@@ -69,10 +69,12 @@ PySceneDetect 是 Python 依赖而非模型: 缺失时 pip install scenedetect, 
 | images / latent | 二选一。images 模式推荐: 外部画面原生尺寸检测, 完全不碰 latent; latent 模式用 VAE 解码探针帧 |
 | yolo_threshold | 检测置信度 (默认 0.3), 漏检多就调低 |
 | shot_threshold | 分镜阈值, 越高切点越少 (默认 40) |
-| upscale_model | 可选 SR 链: 反复放大至 ≥ 画布边长 (≤3 次) 再 lanczos 到精确尺寸, 修小脸高倍放大的振铃色斑; None = 仅 lanczos |
+| upscale_model | 可选 SR 链: 反复放大至 ≥ 画布边长 (≤2 次) 再 lanczos 到精确尺寸, 修小脸高倍放大的振铃色斑; None = 仅 lanczos |
 | res / expand | 画布边长 (默认 512) / 裁剪窗口余量 % (默认 20) |
 | skip_ratio | 脸 ≥ res×此比例 → 跳过重采样 (默认 0.8) |
-| sec_model / sec_threshold / max_identities | None = 单脸 (每帧最大脸, 无 mask); 选权重 = 多身份追踪 + SeC mask |
+| sec_model / sec_threshold / max_identities | None = 单脸 (每帧最大脸, 无 mask); 选权重 = 多身份追踪 + SeC mask; SeC-4B 追踪结束后始终自动卸载 |
+| sr_batch | 裁剪放大阶段每次 SR 前向的帧数 (默认 4, 1–16)。越大越快但显存峰值越高; 16GB 用 4, 24GB+ 可 8~16。只影响速度与显存, 不影响结果 |
+| unload_main_models | 检测与 SeC 追踪完成后、裁剪/SR 放大前, 把 H3 主模型/VAE/CLIP 移出显存 (默认开; 12~16GB 显存建议开启)。SR 模型经 spandrel 直进显存、不受 ComfyUI 模型管理调度, 主模型驻留会把显存挤过物理上限; Windows 会以"共享 GPU 内存"溢出掩盖 OOM, 表现为速度骤降。无论此项开关, SeC-4B 追踪结束后始终卸载 |
 
 
 ## 三、Face_Resample — 画布精修
@@ -84,7 +86,7 @@ PySceneDetect 是 Python 依赖而非模型: 缺失时 pip install scenedetect, 
 | 参数 | 说明 |
 |---|---|
 | sigmas | 精修 σ 阶梯 (调度器输出); 步数越少修脸越保守 |
-| seed | 块采样种子 (每块自动偏移) |
+| seed | 块采样种子 (每块自动偏移); 控件 control_after_generate 保持 fixed, 否则行缓存永不命中 |
 | color_match | 逐子轨 Reinhard 色彩匹配回源裁剪 (默认开) |
 | ref_images | 参考图; 提示词声明 Picture 标签才传递 |
 
@@ -120,4 +122,7 @@ PySceneDetect 是 Python 依赖而非模型: 缺失时 pip install scenedetect, 
 | SR 加载失败 | 自动回退 lanczos; 仅支持图像超分模型 (RIFE 等视频类不支持) |
 | 看逐子轨详细日志 | h3_facefix.py 顶部 _VERBOSE = True |
 | 缓存位置 | output/cache/node_<节点id>/, 可整目录手动删除 |
-
+| 两人交叉换位时同一身份被切碎 / 凭空多出短命身份 | v20.4 起自动修复: mask 仲裁 + 缺口归属 + 轨迹内插值桥接。SeC 日志出现 “N 帧归属现有轨迹” 即修复生效。仍被切碎时调低 sec_threshold |
+| 16GB 卡裁剪/SR 阶段速度骤降但无 OOM 报错 | Windows 把显存溢出静默转入"共享 GPU 内存"而不报错。保持 unload_main_models 开启, 并把 sr_batch 降到 2 |
+| Face_Cut 勾了 clear_cache 但 Face_Resample 仍用旧结果 | clear_cache 只清该节点自己的缓存。Face_Resample 的裁剪行缓存在裁剪像素变化 (内容哈希) 或 σ 阶梯变化时自动失效; 节点id变化后需删除各节点缓存目录 output/cache/node_<节点id>/ |
+| 升级节点后旧工作流端口标红/被重置 | v20.3 起移除 sec_auto_unload (SeC 现在始终自动卸载), 新增 unload_main_models 与 sr_batch, 需重新接线勾选 |

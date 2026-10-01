@@ -116,14 +116,11 @@ def _plan_blocks_segments(K, f0, boundaries, total, ctx_budget):
         blocks = [(0, K, 0)]
     return blocks
 
-
-
 def _pick_prompt(fc, boundaries, seg_prompts, long_prompt):
     if not seg_prompts:
         return long_prompt, "global prompt / 全局提示词"
     idx = min(sum(1 for b in (boundaries or []) if b <= fc), len(seg_prompts) - 1)
     return seg_prompts[idx], f"segment {idx + 1} prompt / 段{idx + 1}提示词"
-
 
 def _normalize_sigmas(sigmas, device):
     if sigmas is None:
@@ -147,7 +144,6 @@ def _normalize_sigmas(sigmas, device):
                  f"[H3-FaceResample] sigmas 末值非 0, 自动补 0: {[round(float(x), 4) for x in s]}")
     return s
 
-
 def _color_match_rows(rows, ref_rows, eps=1e-4):
     """逐子轨色彩匹配 (Reinhard 统计): 把 rows 的逐通道均值/方差迁移到 ref_rows 水平。
     rows/ref_rows: [K,H,W,3] float 0..1。整条子轨一组统计 → 帧间变换恒定, 不引入时间闪烁。"""
@@ -158,13 +154,32 @@ def _color_match_rows(rows, ref_rows, eps=1e-4):
     out = (rows - mx) * (sr + eps) / (sx + eps) + mr
     return out.clamp(0.0, 1.0)
 
+def _text_cond_fingerprint(prompt, ri, rv, ra):
+    """块文本条件的内容指纹 — text-cond 缓存的键。
+    Qwen3-VL 会把图像/视频的像素内容嵌入文本条件，键必须含像素内容而非仅数量，
+    否则同 prompt 换参考图会假命中、复用旧图的嵌入；音频不经过文本编码器，只记数量。"""
+    h = hashlib.md5()
+    h.update(prompt.encode("utf-8"))
+    for img in (ri or []):
+        p = img.get("pixel")
+        if torch.is_tensor(p):
+            h.update(str(tuple(p.shape)).encode())
+            h.update(p.detach().reshape(-1)[:: max(1, p.numel() // 2048)][:2048].float().cpu().numpy().tobytes())
+    for vid in (rv or []):
+        h.update(("vid_a" if vid.get("audio_latent") is not None else "vid").encode())
+        p = vid.get("pixel")
+        if torch.is_tensor(p):
+            h.update(str(tuple(p.shape)).encode())
+            h.update(p.detach().reshape(-1)[:: max(1, p.numel() // 2048)][:2048].float().cpu().numpy().tobytes())
+    h.update(f"a:{len(ra or [])}".encode())
+    return h.hexdigest()
+
 
 # ================= 独立模式支持 (修复普通视频, 不经过主采样节点) =================
 _SAMPLERS = ["euler", "euler_ancestral", "euler_cfg_pp", "res_multistep", "res_multistep_cfg_pp",
              "dpmpp_2m", "dpmpp_2m_cfg_pp", "dpmpp_2m_sde", "dpmpp_3m_sde",
              "uni_pc", "uni_pc_bh2", "ddpm", "lms", "heun", "dpm_2", "dpm_2_ancestral"]
 _SCHEDULERS = ["simple", "normal", "karras", "exponential", "sgm_uniform", "beta", "linear_quadratic"]
-
 
 def _autogrow_to_list(ag_dict, prefix, max_count):
     if not ag_dict:
@@ -193,7 +208,6 @@ def _resolve_audio_latent(raw):
     if torch.is_tensor(raw):
         return raw if raw.dim() < 5 else None
     return None
-
 
 def _merge_runtime(rt_info, parameter, model, vae, audio_vae, clip, sampler_name,
                    scheduler, sampler_obj, seed, ref_images):
@@ -237,7 +251,6 @@ def _merge_runtime(rt_info, parameter, model, vae, audio_vae, clip, sampler_name
             rt_local[k] = str(v)
     return rt_local
 
-
 def _make_standalone_prompt_fn(long_prompt, clip_mode, clip_tag, fmt, fps, n_frames):
     """独立模式: 用 h3_utils 的调度器把提示词映射到块。"""
     lp = (long_prompt or "").strip()
@@ -275,7 +288,6 @@ def _make_standalone_prompt_fn(long_prompt, clip_mode, clip_tag, fmt, fps, n_fra
         return (h3_utils.compose_window_prompt(sched, g0 / fps, g1 / fps, fmt=fmt),
                 f"{used} window [{g0},{g1})")
     return _win_fn
-
 
 class H3FaceResample(io.ComfyNode):
     @classmethod
@@ -638,6 +650,10 @@ class H3FaceResample(io.ComfyNode):
 
         _face_tracking = str((pack.get("meta") or {}).get("face_tracking") or "single")
 
+        # 避免"每个采样块重载一次 TE" 。
+        text_cond_cache = {}
+        text_cond_hits = 0
+
         canvas_rows = []
         for pi, p in enumerate(plans):
             group, tid, off, K = p["group"], p["tid"], p["off"], p["K"]
@@ -748,10 +764,6 @@ class H3FaceResample(io.ComfyNode):
                     base_lat = base_lat.to(device=device, dtype=torch.float32)
 
                     # ---- 块间续接锚定 (与主采样 _copy_overlap_tail + noise_mask=0 同逻辑) ----
-                    # 非首块把上一块"真实内容尾部"的 latent 写进本块 ctx 头并精确冻结:
-                    # 块边界的上下文从此留在重采样域, 修掉"尾部块被原画面 ctx 拉回原样"的问题。
-                    # 相位对齐: 相邻块时间线偏移为 17 的倍数 → token 分解一致, 逐帧对齐;
-                    # ctx 头解码后被裁掉, 不进入最终行, 只作时间上下文。
                     vh = min(h3ff.video_latent_frames(ctx), T_blk - 1) if ctx > 0 else 0   
                     if bi > 0 and prev_v is not None and vh > 0:
                         _anchor_ok = True
@@ -817,6 +829,7 @@ class H3FaceResample(io.ComfyNode):
                         except Exception:
                             mask = (vm, am)
 
+
                     payload = h3_conditioning.build_conditioning_payload(
                         seed=int(rt.get("seed", 0)) + 1 + gi_base + bi,
                         frame_count=b1 - b0,
@@ -824,10 +837,24 @@ class H3FaceResample(io.ComfyNode):
                         ref_vid_data=blk_rv,
                         ref_aud_latents=[a["latent"] for a in blk_ra if a.get("latent") is not None],
                         fps=ref_fps)
-                    positive = h3_conditioning.encode_text_with_references(
-                        clip, prompt_b, payload["ref_items_for_clip"], device,
-                        images_for_clip=payload.get("images_for_clip"))
+                    
+                    # ---- 文本条件缓存: 同 prompt + 同参考素材跳过 Qwen3-VL 编码 ----
+                    _cond_key = _text_cond_fingerprint(prompt_b, blk_ri, blk_rv, blk_ra)
+                    _cond_hit = text_cond_cache.get(_cond_key)
+                    if _cond_hit is not None:
+                        positive = _cond_hit
+                        text_cond_hits += 1
+                        h3ff.vlog(f"[H3-FaceResample] identity {tid} block {bi + 1}: text-cond cache hit, "
+                                  f"Qwen3-VL encode skipped\n"
+                                  f"[H3-FaceResample] 身份 {tid} 块 {bi + 1}: 文本条件缓存命中, 跳过 Qwen3-VL 编码")
+                    else:
+                        positive = h3_conditioning.encode_text_with_references(
+                            clip, prompt_b, payload["ref_items_for_clip"], device,
+                            images_for_clip=payload.get("images_for_clip"))
+                        text_cond_cache[_cond_key] = positive
                     positive = h3_conditioning.inject_conditioning_data(positive, payload)
+
+
                     s = block_seeds[bi]
                     noise = comfy.sample.prepare_noise(latent_i, s)
                     try:
@@ -907,6 +934,11 @@ class H3FaceResample(io.ComfyNode):
         h3ff.log(f"[H3-FaceResample] done: canvas {tuple(px.shape)} ({int(px.shape[0])} rows, "
                  f"same row structure as crop_images)\n"
                  f"[H3-FaceResample] 完成: 画布 {tuple(px.shape)} ({int(px.shape[0])} 行, 与 crop_images 行结构一致)")
-        return io.NodeOutput(px.contiguous(),
-                             {"version": int(pack.get("version") or 5), "subtracks": subs,
-                              "a_lat": a_lat, "meta": pack.get("meta", {})})
+        if text_cond_hits:
+            h3ff.log(f"[H3-FaceResample] text-cond cache: {len(text_cond_cache)} unique combo(s), "
+                     f"{text_cond_hits} block(s) reused, Qwen3-VL encoded once\n"
+                     f"[H3-FaceResample] 文本条件缓存: {len(text_cond_cache)} 个唯一组合, "
+                     f"{text_cond_hits} 个块复用, Qwen3-VL 仅编码一次")
+        
+        return io.NodeOutput(px.contiguous(), {"version": int(pack.get("version") or 5), "subtracks": subs, "a_lat": a_lat, "meta": pack.get("meta", {})})
+

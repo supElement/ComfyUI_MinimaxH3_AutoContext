@@ -30,6 +30,12 @@ import comfy.sample
 import comfy.samplers
 import comfy.model_management
 import comfy.utils
+
+try:
+    from . import h3_semantic_bridge
+except ImportError:
+    h3_semantic_bridge = None
+
 import comfy.nested_tensor
 
 from . import h3_patches
@@ -479,7 +485,11 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
                                 ignore_latent_hash=False,
                                 unique_id=None,
                                 info=None,
-                                video_guide="none"):
+                                video_guide="none",
+                                semantic_bridge=False,
+                                semantic_bridge_adapter="none",
+                                semantic_bridge_alpha=0.10,
+                                semantic_bridge_magnitude="per_token"):
     h3_patches.apply_patches()
 
     device = comfy.model_management.get_torch_device()
@@ -850,6 +860,13 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
             images_for_clip=payload.get("images_for_clip"))
     
         positive = h3_conditioning.inject_conditioning_data(positive, payload)
+        
+        if semantic_bridge and h3_semantic_bridge is not None:
+            positive = h3_semantic_bridge.apply_semantic_bridge(
+                positive,
+                adapter_name=semantic_bridge_adapter,
+                alpha=semantic_bridge_alpha,
+                magnitude_match=semantic_bridge_magnitude)
     
         drive_aud_latent = None
         if drive_waveform is not None and not is_second_pass:
@@ -944,6 +961,11 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
             "conditions_hash": conditions_hash,
             "video_guide": video_guide,
             "tst_tau": _tst_tau,
+            "semantic_bridge": semantic_bridge,
+            "semantic_bridge_adapter": semantic_bridge_adapter if semantic_bridge else None,
+            "semantic_bridge_alpha": float(semantic_bridge_alpha) if semantic_bridge else None,
+            "semantic_bridge_magnitude": semantic_bridge_magnitude if semantic_bridge else None,
+
         }
 
     

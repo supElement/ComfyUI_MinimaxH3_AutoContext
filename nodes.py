@@ -19,6 +19,12 @@ import folder_paths
 from comfy_api.latest import io
 from . import h3_sampler
 
+# ---- 语义桥: 注册 models/semantic_bridge 目录----
+_SEMANTIC_BRIDGE_DIR = os.path.join(folder_paths.models_dir, "semantic_bridge")
+os.makedirs(_SEMANTIC_BRIDGE_DIR, exist_ok=True)
+folder_paths.add_model_folder_path("semantic_bridge", _SEMANTIC_BRIDGE_DIR)
+
+
 _SAMPLERS = [
     "euler", "euler_ancestral", "euler_cfg_pp",
     "res_multistep", "res_multistep_cfg_pp", "dpmpp_2m", "dpmpp_2m_cfg_pp",
@@ -129,6 +135,26 @@ class H3ParameterNode(io.ComfyNode):
                                "(Face_Resample has no head/tail anchoring path and ignores it)\n"
                                "利用 ref_video 端口输入的视频进行多帧强锚定。仅主采样节点消费 "
                                "(Face_Resample 无头尾锚定路径, 会忽略该键)。"),
+                io.Boolean.Input("semantic_bridge", default=False,
+                    tooltip="Semantic Bridge (upstream: github.com/Speach1sdef178/MiniMax-H3-Semantic-Bridge). "
+                            "C = H + alpha*(S-H). Distills SenseNova U1.5 teacher into a ~11MB SiLU MLP (5120→512→512→5120) "
+                            "that boosts prompt adherence on the FL2VA/text path. Only transforms the cond tensor; "
+                            "cross-segment keyframe anchors and ref channels are untouched. "
+                            "Put MiniMaxH3_SemanticBridge_v1.safetensors into models/semantic_bridge/.\n"
+                            "语义桥 (上游: Speach1sdef178/MiniMax-H3-Semantic-Bridge)。C = H + alpha*(S-H)。"
+                            "把 SenseNova U1.5 教师蒸馏为 ~11MB SiLU MLP (5120→512→512→5120)，增强 FL2VA/文本路径的提示词遵循度。"
+                            "只变换条件张量，段间续接锚定与参考素材通道不受影响。"
+                            "适配器放入 models/semantic_bridge/。"),
+                io.Combo.Input("semantic_bridge_adapter", options=["none"] + folder_paths.get_filename_list("semantic_bridge"),
+                    tooltip="Adapter file. 'none' disables the bridge.\n适配器文件，'none' 表示禁用。"),
+                io.Float.Input("semantic_bridge_alpha", default=0.10, min=0.0, max=1.0, step=0.01,
+                    tooltip="Blend strength. Official starting point 0.10; official A/B examples use 0.15. Tune in 0.10~0.15.\n"
+                            "融合强度。官方起点 0.10，A/B 示例 0.15。建议在 0.10~0.15 之间微调。"),
+                io.Combo.Input("semantic_bridge_magnitude", options=["per_token", "global", "none"], default="per_token",
+                    tooltip="Magnitude alignment before blending. Official recommended: per_token.\n"
+                            "融合前的幅度对齐方式。官方推荐 per_token。"),
+
+                
                 io.Dict.Input("shot_info", optional=True,
                               tooltip="Optional shot map from Minimax_H3_Face_Cut's shot_info output. When connected, the segment prompts are assigned to "
                               "these shot intervals: prompt count > shots → take the first N; < shots → repeat the last; "
@@ -146,6 +172,8 @@ class H3ParameterNode(io.ComfyNode):
                 crop_mode="stretch", ref_sync_mode="segmented", width=960, height=544,
                 total_frames=362, fps=24, chunk_frames=90, context_frames=22,
                 lock_audio=True, audio_drive=False, video_guide="none",
+                semantic_bridge=False, semantic_bridge_adapter="none",
+                semantic_bridge_alpha=0.10, semantic_bridge_magnitude="per_token",
                 shot_info=None) -> io.NodeOutput:
         parameter = {
             "long_prompt": long_prompt,
@@ -163,6 +191,11 @@ class H3ParameterNode(io.ComfyNode):
             "lock_audio": lock_audio,
             "audio_drive": audio_drive,
             "video_guide": video_guide,
+            "semantic_bridge": semantic_bridge,
+            "semantic_bridge_adapter": semantic_bridge_adapter,
+            "semantic_bridge_alpha": float(semantic_bridge_alpha),
+            "semantic_bridge_magnitude": semantic_bridge_magnitude,
+
         }
         # ---- shot_info: 把分段提示词按镜头区间分配 → parameter["shot_prompts"] ----
         shots = None
@@ -357,6 +390,11 @@ class H3AutoContextSampler(io.ComfyNode):
         p = parameter or {}
         video_guide = p.get("video_guide", "none")
 
+        semantic_bridge = bool(p.get("semantic_bridge", False))
+        semantic_bridge_adapter = p.get("semantic_bridge_adapter", "none")
+        semantic_bridge_alpha = float(p.get("semantic_bridge_alpha", 0.10) or 0.0)
+        semantic_bridge_magnitude = p.get("semantic_bridge_magnitude", "per_token")
+
         long_prompt = p.get("long_prompt", "")
         clip_mode = p.get("clip_mode", "Clip_Tag")
         clip_tag = p.get("clip_tag", "段1")
@@ -488,6 +526,11 @@ class H3AutoContextSampler(io.ComfyNode):
             ignore_latent_hash=ignore_latent_hash,
             info=info,
             video_guide=video_guide,
+            semantic_bridge=semantic_bridge,
+            semantic_bridge_adapter=semantic_bridge_adapter,
+            semantic_bridge_alpha=semantic_bridge_alpha,
+            semantic_bridge_magnitude=semantic_bridge_magnitude,
+
         )
         if seam_info:
             out_info.update(seam_info)

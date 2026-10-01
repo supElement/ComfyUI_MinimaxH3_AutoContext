@@ -20,7 +20,6 @@ v18 — 分镜优先 (shot-aware), 官方 PySceneDetect 管线; v17.2 — latent
 v12 — 尺寸信号 YOLO 实测优先; v11 — multi_sec 内置 SeC-4B 身份追踪 (pack v7)。
 """
 import os
-import math
 import shutil
 import tempfile
 import numpy as np
@@ -56,6 +55,13 @@ _MIN_WIN = 48
 # 更容易触发"包含性地板"跳变; 调大 → 更贴脸但平滑感弱。0.15~0.25 都合理。
 _S_RATE = 0.20
 
+# ---- 可调常量: SR 放大的尺寸桶宽 (v20.3) ----
+_SR_BUCKET = 32
+
+# ---- 可调常量: DP 单段帧数上限 (v20.2) ----
+# 只用于把 DP 复杂度从 O(n²) 压到 O(n·上限); 切段无几何接缝 (逐帧窗口跨段连续)。
+_SEG_MAX = 240
+
 
 def _win_floor():
     """窗口下限 (16 对齐后的 _MIN_WIN) — 唯一来源, 供窗口规划与 DP 估计共用。"""
@@ -63,7 +69,7 @@ def _win_floor():
 
 
 # ================= 内置常量=================
-_GAP_TOL = 12        # 检测缺失多少帧内视为同一次出现 (绝不跨镜头)
+_GAP_TOL = 24        # 检测缺失多少帧内视为同一次出现 (绝不跨镜头)
 _SCALE_SPLIT = 1.2   # 片内容许的最大脸尺寸比 (软目标, 进入 DP 分段代价)
 _SKIP_RATIO = 0.8    # 脸 >= res × 此比例 → 跳过重采样
 _SEC_MEM_SIZE = 12   # SeC-4B 记忆库槽位数 (上游默认; 逐镜头单元独立调用, 12 足够)
@@ -120,9 +126,18 @@ def _median_smooth(seqs):
 
 def _yolo_size_track(sec_boxes, per_frame, iou_thr=0.35):
     """逐帧用 YOLO 实测尺寸覆盖 SeC 紧致框尺寸 (测量交叉校验)。
-    SeC mask 是分割输出, 天然含头发/肩颈且逐帧波动 — 尺寸信号以 YOLO 实测为准。"""
+    v20.2: SeC 漏检帧的"单检出兜底"必须先过时间连续性校验 (与本身份最近的有效框
+    比重叠率), 否则多人场景会把别人的脸错归因到本轨迹。"""
     F = len(sec_boxes)
     out = [None] * F
+
+    def _neighbor_ref(i):
+        for d in range(1, F):
+            for j in (i - d, i + d):
+                if 0 <= j < F and sec_boxes[j] is not None:
+                    return sec_boxes[j]
+        return None
+
     for i in range(F):
         dets = per_frame[i]
         if not dets:
@@ -130,8 +145,10 @@ def _yolo_size_track(sec_boxes, per_frame, iou_thr=0.35):
         sb = sec_boxes[i]
         if sb is None:
             if len(dets) == 1:
+                ref = _neighbor_ref(i)
                 d = dets[0]
-                out[i] = max(d[2] - d[0], d[3] - d[1])
+                if ref is None or h3ff._overlap_ratio(d[:4], ref[:4]) >= float(iou_thr):
+                    out[i] = max(d[2] - d[0], d[3] - d[1])
             continue
         best, best_r = None, float(iou_thr)
         for d in dets:
@@ -141,6 +158,7 @@ def _yolo_size_track(sec_boxes, per_frame, iou_thr=0.35):
         if best is not None:
             out[i] = max(best[2] - best[0], best[3] - best[1])
     return out
+
 
 
 def _images_digest(img):
@@ -191,13 +209,13 @@ def _load_sr_model(rel):
         raise ValueError(f"{rel}: not an image upscale model ({type(desc).__name__})")
     return desc.eval()
 
-
-
-def _sr_pass(sr_model, x):
-    """单次放大: [N,H,W,3] float 0..1 → [N,H*s,W*s,3]。分批执行, OOM 自动减半批。"""
+def _sr_pass(sr_model, x, batch_size=4):
+    """单次放大: [N,H,W,3] float 0..1 → [N,H*s,W*s,3]。分批执行, OOM 自动减半批。
+    batch_size: 每次前向帧数上限 — SR 走 spandrel 直进显存、不经 ComfyUI 模型管理,
+    峰值显存 ≈ batch × 窗口² 特征图; 16GB 卡建议 2~4, 24GB+ 可 8~16。"""
     dev = comfy.model_management.get_torch_device()
     sr_model.to(dev)
-    out, n, bs, i = [], int(x.shape[0]), max(1, min(16, int(x.shape[0]))), 0
+    out, n, bs, i = [], int(x.shape[0]), max(1, min(int(batch_size), int(x.shape[0]))), 0
     while i < n:
         try:
             b = x[i:i + bs].movedim(-1, 1).to(dev)
@@ -205,29 +223,13 @@ def _sr_pass(sr_model, x):
                 o = sr_model(b)
             out.append(o.movedim(1, -1).clamp(0.0, 1.0).cpu())
             i += bs
+            del b, o
         except comfy.model_management.OOM_EXCEPTION:
             if bs <= 1:
                 raise
             bs = max(1, bs // 2)
+            comfy.model_management.soft_empty_cache()
     return torch.cat(out, dim=0)
-
-
-def _sr_to_res(sr_model, imgs, res, tag=""):
-    """SR 放大链: 反复套用放大模型直到边长 ≥ res (上限 2 次), 再 lanczos 到精确 res。
-    窗口 S 远小于 res 时 (远景小脸) 由 SR 模型承担主要放大倍数, 消除 lanczos 高倍
-    放大的振铃 → VAE 编码色斑; S 接近 res 时一次 SR 后即为缩小, 收益有限。"""
-    x = imgs
-    n_pass = 0
-    while int(x.shape[1]) < res and n_pass < 2:
-        x = _sr_pass(sr_model, x)
-        n_pass += 1
-        h3ff.vlog(f"[H3-FaceCut] {tag}SR pass {n_pass} -> {int(x.shape[1])}px")
-    if (int(x.shape[1]), int(x.shape[2])) != (res, res):
-        x = comfy.utils.common_upscale(x.movedim(-1, 1).contiguous(), res, res,
-                                       "lanczos", "disabled").movedim(1, -1)
-    return x
-
-
 
 # ================= 分镜检测 (先分镜, 后面部 — 官方 PySceneDetect 管线) =================
 def _detect_shot_cuts_official_file(frames_rgb, threshold, fps_hint):
@@ -308,14 +310,12 @@ def _shot_bounds(blocks, cuts, F):
 
 
 # ==================================================================
-# ============ v20: 逐帧平滑窗口 (同一身份不再直切) ============
+# ============ 逐帧平滑窗口 (同一身份不再直切) ============
 # ==================================================================
 def _smooth_window_sizes(face_sizes, expand_f, W, H, rate=_S_RATE):
-    """逐帧窗口边长序列 (v20): S_t = 该帧脸尺寸×(1+余量) → 中值滤波(窗5)
-    → 相邻变化率限速 → 包含性地板 → 钳制 [_win_floor(), min(W,H)]。
-    - 远景小脸仍得到小 S → res² 画布上占比恒 ≈ 1/(1+余量), 与脸绝对大小无关;
-    - 平滑只消除瞬时抖动, 不做任何"统一放大";
-    - 快速推镜头时限速让位于包含性 (S 不小于该帧所需), 宁可跳变也不切掉脸。"""
+    """逐帧窗口边长序列 (v20.3): S_t = 该帧脸尺寸×(1+余量) → 中值滤波(窗5) →
+    变化率限速 → 包含性地板 → 钳制 [_win_floor(), min(W,H)]。
+    合批改由放大期的"尺寸桶 + pad"承担, 本函数几何与 v20 完全一致。"""
     fl = _win_floor()
     cap = max(fl, min(int(W), int(H)))
     n = len(face_sizes)
@@ -329,12 +329,11 @@ def _smooth_window_sizes(face_sizes, expand_f, W, H, rate=_S_RATE):
         prev, tgt = out[-1], med[i]
         max_d = prev * float(rate)
         nxt = prev + max(-max_d, min(max_d, tgt - prev))
-        need = raw[i]  
+        need = raw[i]
         if nxt < need:
             nxt = need
         out.append(min(cap, nxt))
     return [max(fl, int(round(s))) for s in out]
-
 
 def _window_centers(boxes, S_seq, W, H):
     """逐帧钳制窗口中心 (v20): 脸完整在窗内 ∩ 窗完整在帧内 (构造性包含)。
@@ -358,7 +357,6 @@ def _window_centers(boxes, S_seq, W, H):
         px.append(float(min(max(cx, lo_x), hi_x)))
         py.append(float(min(max(cy, lo_y), hi_y)))
     return [[a, b] for a, b in zip(px, py)]
-
 
 def _sample_windows(frames, masks_full, use, centers, S_seq):
     """以逐帧窗口中心/边长提取 S_t×S_t 裁剪与窗口 mask (同窗同变换 → 对齐不变)。
@@ -385,30 +383,30 @@ def _sample_windows(frames, masks_full, use, centers, S_seq):
             win_masks.append(None)
     return crops, win_masks
 
-
 def _partition_appearance(sm_sz, S_seq, res, scale_split, skip_thr):
-    """一次出现内的最优分段 (DP), 无手调切分规则。v20:
-    - 采样代价按逐帧窗口累加 (Σ res/S_t, 与逐帧 S 一致);
-    - 尺寸超比罚 8→2: 逐帧 S 已让段内小脸保持占比, 分段只剩 skip 划分与
-      极端变焦防护 — 更少的分段 = 更少的潜在接缝;
-    - mn >= skip_thr → 代价 0 (大脸段跳过重采样)。"""
+    """一次出现内的最优分段 (DP)。v20.2: gsum 改前缀和 O(1) 取段代价 + 段长上限 _SEG_MAX,
+    复杂度 O(n·_SEG_MAX)。其余语义与 v20 一致。"""
     n = len(sm_sz)
+    if n < 5:
+        return []
     INF = float("inf")
+    pre = [0.0] * (n + 1)
+    for k in range(n):
+        pre[k + 1] = pre[k] + res / float(max(1, int(S_seq[k])))
     dp = [0.0] + [INF] * n
     prev = [-1] * (n + 1)
     for i in range(1, n + 1):
         mx, mn = 0.0, INF
-        gsum = 0.0
-        for a in range(i - 1, -1, -1): 
+        for a in range(i - 1, max(0, i - _SEG_MAX) - 1, -1):
             s = sm_sz[a]
             if s > mx:
                 mx = s
             if s < mn:
                 mn = s
-            gsum += res / float(max(1, int(S_seq[a])))
             L = i - a
             if L < 5:
                 continue
+            gsum = pre[i] - pre[a]
             if mn >= skip_thr:
                 c = 0.0
             else:
@@ -429,7 +427,7 @@ def _partition_appearance(sm_sz, S_seq, res, scale_split, skip_thr):
 
 def _build_subtracks_for_track(boxes_seq, frames, H, W, res, expand_f, scale_split,
                                skip_ratio, gap_tol, tid, masks_full=None,
-                               size_override=None, shot_id=None, sr_model=None):
+                               size_override=None, shot_id=None, sr_model=None, sr_batch=4, pbar=None):
     """单条身份轨迹 → (subtracks, crop_parts, n_rows)。
     分工: SeC-4B 身份/mask, YOLO 逐帧实测尺寸; 本函数只做应用层几何:
     DP 分段 (skip 边界) → 逐帧平滑窗口 (S_t 与中心均按整条出现区间计算并时序平滑)
@@ -470,7 +468,7 @@ def _build_subtracks_for_track(boxes_seq, frames, H, W, res, expand_f, scale_spl
                     r = (j - p) / float(n - p)
                     filled[j] = [x + (y - x) * r for x, y in zip(boxes_seq[p], boxes_seq[n])]
                 elif p is not None:
-                    filled[j] = list(boxes_seq[p])   # 切点同侧无后邻 → 定格前一帧
+                    filled[j] = list(boxes_seq[p])  
                 elif n is not None:
                     filled[j] = list(boxes_seq[n])
 
@@ -485,8 +483,6 @@ def _build_subtracks_for_track(boxes_seq, frames, H, W, res, expand_f, scale_spl
 
     pieces = []
     for a, b, _dets in intervals:
-        # 按镜头边界预切: 窗口平滑/DP 分段不跨切点 (防窗口几何跳变);
-        # 跨镜头合并仅用于填洞记账 (漏检帧由前后检出框插值)。
         seg_starts = [a]
         for i in range(a + 1, b):
             if shot_id is not None and int(shot_id[i]) != int(shot_id[i - 1]):
@@ -505,8 +501,6 @@ def _build_subtracks_for_track(boxes_seq, frames, H, W, res, expand_f, scale_spl
     if not pieces:
         return subtracks, crop_parts, 0
 
-
-
     for si, (pa, pb, S_seq, boxes) in enumerate(pieces):
         idxs = list(range(pa, pb))
         med = float(np.median([_fs(j) for j in idxs]))
@@ -521,6 +515,8 @@ def _build_subtracks_for_track(boxes_seq, frames, H, W, res, expand_f, scale_spl
             subtracks.append({"track_id": tid, "f0": f0_all, "f1": f1_all, "S": 0,
                               "face_med": round(med, 1), "skip": True,
                               "centers": [], "crop_off": None})
+            if pbar is not None:
+                pbar.update(len(idxs))
             continue
 
         centers = _window_centers(boxes, S_seq, W, H)
@@ -533,24 +529,51 @@ def _build_subtracks_for_track(boxes_seq, frames, H, W, res, expand_f, scale_spl
                     win_masks[i] = win_masks[min(have, key=lambda k: abs(k - i))]
 
         proc = [None] * len(crops)
-        k = 0
-        while k < len(crops):
-            k2 = k
-            while k2 < len(crops) and tuple(crops[k2].shape) == tuple(crops[k].shape):
-                k2 += 1
-            grp = torch.stack(crops[k:k2], dim=0)              
-            grp = grp.permute(0, 2, 3, 1) / 255.0              
-            if (int(grp.shape[1]), int(grp.shape[2])) != (res, res):
-                if sr_model is not None:
-                    grp = _sr_to_res(sr_model, grp, res, tag=f"id{tid} sub{si+1} ")
-                else:
-                    grp = comfy.utils.common_upscale(
-                        grp.movedim(-1, 1).contiguous(), res, res,
+        if sr_model is not None:
+            TOL = max(8, int(_SR_BUCKET))
+            buckets = {}
+            for _ci, _c in enumerate(crops):
+                _K = -(-int(_c.shape[1]) // TOL) * TOL
+                buckets.setdefault(_K, []).append(_ci)
+            h3ff.vlog(f"[H3-FaceCut] id{tid} sub{si+1}: SR buckets={len(buckets)} "
+                      f"(TOL={TOL}px), batch<={int(sr_batch)}")
+            for _K in sorted(buckets):
+                _idxs_g = buckets[_K]
+                frames_p = []
+                for _i in _idxs_g:
+                    c_ = crops[_i]
+                    p = _K - int(c_.shape[1])
+                    frames_p.append(
+                        torch.nn.functional.pad(c_, (0, p, 0, p), mode="replicate")
+                        if p > 0 else c_)
+                x = torch.stack(frames_p, dim=0).permute(0, 2, 3, 1) / 255.0
+                n_pass = 0
+                while int(x.shape[1]) < res and n_pass < 2:
+                    x = _sr_pass(sr_model, x, batch_size=sr_batch)
+                    n_pass += 1
+                ratio = float(int(x.shape[1])) / float(_K)
+                for _j, _i in enumerate(_idxs_g):
+                    S_i = int(crops[_i].shape[1])
+                    S2 = int(round(S_i * ratio))
+                    f_i = x[_j, :S2, :S2].contiguous()
+                    if (int(f_i.shape[0]), int(f_i.shape[1])) != (res, res):
+                        f_i = comfy.utils.common_upscale(
+                            f_i.unsqueeze(0).movedim(-1, 1).contiguous(), res, res,
+                            "lanczos", "disabled").movedim(1, -1)[0]
+                    proc[_i] = f_i
+                if pbar is not None:
+                    pbar.update(len(_idxs_g))
+        else:
+            for _ci, _c in enumerate(crops):
+                g = _c.unsqueeze(0).permute(0, 2, 3, 1) / 255.0
+                if (int(g.shape[1]), int(g.shape[2])) != (res, res):
+                    g = comfy.utils.common_upscale(
+                        g.movedim(-1, 1).contiguous(), res, res,
                         "lanczos", "disabled").movedim(1, -1)
-   
-            for i in range(grp.shape[0]):
-                proc[k + i] = grp[i]
-            k = k2
+                proc[_ci] = g[0]
+                if pbar is not None:
+                    pbar.update(1)
+
         crop_t = torch.stack(proc, dim=0).contiguous()        
 
         entry = {"track_id": tid, "f0": int(idxs[0]), "f1": int(idxs[-1]) + 1,
@@ -592,8 +615,6 @@ def _build_subtracks_for_track(boxes_seq, frames, H, W, res, expand_f, scale_spl
                   f"{', mask: 开' if have else ''}")
     return subtracks, crop_parts, n_rows
 
-
-
 def _fill_mask_rows(subtracks, cursor, res):
     """按子轨账目把 pack 内置 masks 铺成端口行张量 (缓存命中/未命中共用)。"""
     mask_rows = torch.zeros(max(1, int(cursor)), res, res, dtype=torch.float32)
@@ -619,12 +640,10 @@ def _fill_mask_rows(subtracks, cursor, res):
         mask_rows = mask_rows[:1]
     return mask_rows
 
-
 def _build_pack(a_lat, subtracks, cursor, multi_track_flag, meta, fps_eff):
     return {"version": 7, "multi_track": bool(multi_track_flag), "a_lat": a_lat,
             "subtracks": subtracks, "fps_eff": float(fps_eff),
             "n_crop_rows": int(cursor), "meta": meta}
-
 
 class H3FaceCut(io.ComfyNode):
     @classmethod
@@ -655,6 +674,13 @@ class H3FaceCut(io.ComfyNode):
                                "可选外部检测画面: 连接后 分镜检测/检测/SeC/裁剪 直接作用于这些帧 "),
                 io.Vae.Input("vae", tooltip="Video VAE (latent mode only; ignored in images mode)\n视频 VAE (仅 latent 模式使用, images 模式忽略)"),
                 io.Float.Input("yolo_threshold", default=0.3, min=0.05, max=0.9, step=0.05, tooltip="YOLO detection confidence threshold\nYOLO 检测置信度阈值"),
+
+                io.Int.Input("yolo_batch", default=16, min=1, max=128, step=1,
+                             tooltip="YOLO detection batch size (frames per forward pass). Use 4~8 on low-VRAM GPUs to avoid OOM; "
+                                     "raise to 32~64 on high-VRAM GPUs for speed. Results are identical regardless of batch size\n"
+                                     "YOLO 检测批大小 (每次前向的帧数)。低显存卡 (8~12GB) 建议降到 4~8 防 OOM；"
+                                     "高显存卡可升到 32~64 提速。批大小不影响检测结果"),
+
                 io.Float.Input("shot_threshold", default=40.0, min=5.0, max=100.0, step=0.5, tooltip="PySceneDetect ContentDetector threshold (higher = fewer cuts).\n"
                                "PySceneDetect ContentDetector 阈值 (越高切点越少)。"),
                 io.Combo.Input("upscale_model", options=(["None"] + _list_upscale_models()), default="None",
@@ -671,7 +697,17 @@ class H3FaceCut(io.ComfyNode):
                 io.Float.Input("sec_threshold", default=0.3, min=0.1, max=0.8, step=0.05, tooltip="IoU/overlap threshold to claim a YOLO box to an identity (multi_sec only)\n"
                                "检测框认领给某身份的重叠率阈值 (仅 multi_sec 模式)"),
                 io.Int.Input("max_identities", default=6, min=1, max=12, tooltip="Max tracked identities per shot unit\n每个镜头单元最多追踪身份个数"),
-                io.Boolean.Input("sec_auto_unload", default=True, tooltip="Unload SeC-4B after tracking to free VRAM\n追踪完成后卸载 SeC-4B 释放显存"),
+
+                io.Boolean.Input("unload_main_models", default=True, tooltip="Unload H3/VAE/CLIP from VRAM after detection & SeC tracking, before the crop/SR stage "
+                               "(recommended on 12~16GB cards \n"
+                               "检测与 SeC 追踪完成后、裁剪/SR 放大前，把 H3 主模型/VAE/CLIP 移出显存 "
+                               "(12~16GB 显存建议开启；SR 模型经 spandrel 直进显存、不受 ComfyUI 模型管理调度"),
+                io.Int.Input("sr_batch", default=4, min=1, max=16, step=1, tooltip="Frames per SR forward pass for crop upscale. Peak VRAM scales with this; "
+                               "4 on 16GB, 8~16 on 24GB+. Does not affect results, only speed/VRAM\n"
+                               "裁剪放大阶段每次 SR 前向的帧数。显存峰值随此值增大；16GB 用 4，24GB+ 可 8~16。"
+                               "不影响结果，只影响速度与显存"),
+                               
+
                 io.Boolean.Input("enable_cache", default=True, tooltip="Clear manually after changing model/VAE/SeC weights or CODE (use clear_cache)\n"
                                  "更换模型/VAE/SeC 权重或修改代码后请勾 clear_cache"),
                 io.Boolean.Input("clear_cache", default=False, tooltip="Delete this node's cache directory before running\n运行前删除本节点的缓存目录"),
@@ -689,10 +725,10 @@ class H3FaceCut(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, latent=None, vae=None, face_model="", yolo_threshold=0.3,
+    def execute(cls, latent=None, vae=None, face_model="", yolo_threshold=0.3, yolo_batch=16,
                 shot_threshold=40.0, upscale_model="None", res=512, expand=20, skip_ratio=_SKIP_RATIO,
                 sec_model="None", sec_threshold=0.3, max_identities=6,
-                sec_auto_unload=True, enable_cache=True, clear_cache=False,
+                unload_main_models=True, sr_batch=4, enable_cache=True, clear_cache=False,
                 images=None, info=None) -> io.NodeOutput:
         shot_detect = True   
         shot_active = shot_detect and _has_scenedetect()
@@ -827,7 +863,7 @@ class H3FaceCut(io.ComfyNode):
                 h3ff.warn(f"[H3-FaceCut] cache load failed ({e}), recomputing\n[H3-FaceCut] 缓存载入失败 ({e})，重新计算")
 
         per_frame = [None] * F_expect
-        opt = {"conf": float(yolo_threshold), "model": model_path}
+        opt = {"conf": float(yolo_threshold), "model": model_path, "batch_size": int(yolo_batch)}
         if use_images:
             frames = np.clip(imgs.detach().cpu().numpy() * 255.0, 0.0, 255.0).astype(np.uint8)
             per_frame = h3ff.detect_faces(frames, opt)
@@ -839,6 +875,7 @@ class H3FaceCut(io.ComfyNode):
         else:
             frames = np.empty((F_expect, H, W, 3), dtype=np.uint8)
             for bi, (dk0, dk1, kp0, kp1) in enumerate(blocks):
+                comfy.model_management.throw_exception_if_processing_interrupted()
                 blk = h3ff.decode_probe_frames(vae, v_lat, range(dk0, dk1))
                 off = kp0 - h3ff._pixels_for_tokens(dk0)
                 if int(blk.shape[0]) < off + (kp1 - kp0):
@@ -877,6 +914,14 @@ class H3FaceCut(io.ComfyNode):
             shot_id[_s:_e] = _si
 
         tracks = None
+        
+        if unload_main_models:
+            try:
+                comfy.model_management.unload_all_models()
+            except Exception:
+                pass
+            comfy.model_management.soft_empty_cache()
+        
         if face_tracking == "multi_sec" and any(per_frame):
             sec_handle = h3ff.load_sec_model(model_file=str(sec_model), device="auto",
                                              use_flash_attn=use_flash_attn, allow_mask_overlap=True)
@@ -938,8 +983,7 @@ class H3FaceCut(io.ComfyNode):
                              "[H3-FaceCut] SeC 未产出身份, 回退单脸路径")
                     tracks = None
             finally:
-                if sec_auto_unload:
-                    h3ff.unload_sec_model()
+                h3ff.unload_sec_model()
         elif face_tracking == "multi_sec":
             h3ff.log("[H3-FaceCut] multi_sec requested but no detections, falling back to single-face\n"
                      "[H3-FaceCut] multi_sec 模式但无任何检测框, 回退单脸路径")
@@ -972,12 +1016,14 @@ class H3FaceCut(io.ComfyNode):
 
         subtracks, crop_parts = [], []
         cursor = 0
+        crop_pbar = comfy.utils.ProgressBar(F_expect) if h3ff._HAS_COMFY else None
         for tid, boxes_seq, masks_full, sz_override in src_tracks:
             sts, cps, n_rows = _build_subtracks_for_track(
                 boxes_seq, frames, H, W, res, expand_f, float(scale_split), float(skip_ratio),
                 int(gap_tol), tid, masks_full=masks_full,
                 size_override=(sz_override if face_tracking == "multi_sec" else None),
-                shot_id=shot_id, sr_model=sr_model)
+                shot_id=shot_id, sr_model=sr_model, sr_batch=sr_batch, pbar=crop_pbar)
+
             for st in sts:
                 if not st["skip"]:
                     st["crop_off"] = cursor + int(st["crop_off"])  
