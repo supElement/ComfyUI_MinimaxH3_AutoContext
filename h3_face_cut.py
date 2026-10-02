@@ -157,6 +157,13 @@ def _yolo_size_track(sec_boxes, per_frame, iou_thr=0.35):
                 best_r, best = r, d
         if best is not None:
             out[i] = max(best[2] - best[0], best[3] - best[1])
+    
+    
+    _valid = [i for i, b in enumerate(sec_boxes) if b is not None]
+    if _valid:
+        _lo, _hi = _valid[0], _valid[-1]
+        out = [v if _lo <= i <= _hi else None for i, v in enumerate(out)]
+    
     return out
 
 
@@ -1004,11 +1011,20 @@ class H3FaceCut(io.ComfyNode):
             for t in tracks:
                 sz = _yolo_size_track(t["boxes"], per_frame) if per_frame is not None else None
                 src_tracks.append((t["id"], t["boxes"], t.get("masks"), sz))
-            n_meas = sum(1 for _i, _b, _m, sz in src_tracks for v in (sz or []) if v is not None)
-            n_all = sum(sum(1 for b in _b if b is not None) for _i, _b, _m, sz in src_tracks if sz)
+            
+            _measured, _span = set(), set()
+            for _i, _b, _m, _sz in src_tracks:
+                _valid = [k for k, b in enumerate(_b) if b is not None]
+                if not _valid:
+                    continue
+                _span.update(range(_valid[0], _valid[-1] + 1))
+                if _sz is not None:
+                    _measured.update(k for k, v in enumerate(_sz) if v is not None)
+            n_meas, n_all = len(_measured), len(_span)
             h3ff.log(f"[H3-FaceCut] size signal: YOLO measured {n_meas}/{n_all} frames "
                      f"(SeC box fallback on the rest)\n"
                      f"[H3-FaceCut] 尺寸信号: {n_meas}/{n_all} 帧用 YOLO 实测 (其余回退 SeC 框)")
+
         else:
             filled_single = [list(max(per_frame[j], key=lambda x: x[4])[:4]) if per_frame[j] else None
                              for j in range(F_expect)]
