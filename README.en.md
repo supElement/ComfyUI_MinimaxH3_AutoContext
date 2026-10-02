@@ -7,59 +7,64 @@
 
 # ComfyUI_MinimaxH3_AutoContext
 
-One-click MiniMax H3 long video automated generation node: **segmented reasoning + inter-segment anchoring + prompt timeline slicing + secondary sampling (2-sampling) + seam correction + face repair (test branch)**. Under limited GPU memory, long videos are split into multiple independent reasoning segments, achieving seamless inter-segment concatenation through overlay enhancement methods, while automatically slicing prompts along the timeline to align each segment's generated content with the prompt rhythm; similarly slice and align audio-video references; only the referenced references in the current segment participate in reasoning.  
-H3's GPU memory requirements grow exponentially with resolution, duration (each +5s doubles), and precision (fp8→bf16), so limited GPU memory is relative—32GB GPU memory will overflow and slow down when generating 15s 1080p with bf16, and while segmentation increases the overhead of anchoring frames, the peak GPU memory only depends on the length of a single segment, unrelated to the target total length, making actual reasoning time actually faster than generating a long video in one go.  
+One-click MiniMax H3 long video auto-generation node: **segmented reasoning + inter-segment anchoring + prompt timeline slicing + secondary sampling (2-samp) + seam correction + face repair (test branch)**. In limited GPU memory, long videos are split into multiple independent segments for reasoning, achieving seamless inter-segment concatenation through overlay enhancement methods, while automatically slicing prompts along the timeline to align each segment's generated content with the prompt rhythm; audio-video references are similarly sliced and aligned; only the referenced references in the current segment participate in reasoning.  
+H3's GPU memory requirements increase exponentially with resolution, duration (each +5s doubles), and precision (fp8→bf16), so limited GPU memory is relative—32GB GPU memory will overflow and slow down when generating 15s 1080p with bf16, segmentation increases anchoring frame overhead, but peak GPU memory depends only on the length of a single segment, unrelated to the target total length, and actual reasoning time is actually faster than generating a long video once.  
 Supports secondary sampling. Video continuation, video forward, dual video concatenation.  
-Supports latent cache read/write, making it convenient to quickly skip already reasoned segments if reasoning is interrupted for some reason, with cache files stored per segment. Under unchanged upstream parameters of the sampling node, existing latent cache files can be read.  
+Supports latent cache storage and retrieval, making it convenient to quickly skip already reasoned segments if reasoning is interrupted for some reason, cache files are stored per segment, and when upstream parameters of the sampling node remain unchanged, existing latent cache files can be read.  
 
-⚠️Note: Changing the model, including LoRA, SageAttention, and other acceleration nodes, will not detect the change in latent, so latent cache must be deleted. There are two ways to delete the latent cache:  
-- Enable the clear_cache parameter on the Minimax_H3_AutoContext_Sampler node, which will force the creation of this node's cache file when sampling starts.  
-- Manually delete the corresponding folder in the cache directory (\ComfyUI\output\cache), with the folder name being "node_" + "node ID".
+⚠️Note: Changing the model, including LoRA, SageAttention, and other acceleration nodes, will not detect changes in latent, so latent cache must be deleted. There are two ways to delete the latent cache:  
+- Enable the clear_cache parameter on the Minimax_H3_AutoContext_Sampler node, which will force the re-establishment of this node's cache file when sampling starts.  
+- Manually delete the corresponding folder in the cache directory (\ComfyUI\output\cache), with the folder name being "node_" + "node ID".  
 
 <img width="2230" height="976" alt="image" src="https://github.com/user-attachments/assets/5634914a-6f98-4d4f-b573-2c8b41e0c57e" />
 
 
 <img width="2209" height="1030" alt="image" src="https://github.com/user-attachments/assets/9bbdda2a-d4ce-4836-b108-e359e72e31de" />
 
-## BUG Fixes and Optimizations
+## BUG Fixes, Optimizations, and New Features
 
-v0.8.5 
+### test branch
 
-> **New node in `test` branch**
->
-> First installation (to test branch):  
->   `git clone -b test https://github.com/supElement/ComfyUI_MinimaxH3_AutoContext.git`  
-> Already installed, switching from main to test:  
->   `git fetch origin` → `git checkout test` → `git pull`  
-> Manager users: Switch the branch to `test` in the Manager, then click Update.
+First installation (for test branch):
+
+      git clone -b test https://github.com/supElement/ComfyUI_MinimaxH3_AutoContext.git
+Already installed, switching from main to test:
+
+      git fetch origin  → git checkout test  → git pull
+Manager users: Switch the branch to `test` in Manager, then click Update.
+
+### V0.9.0 (test branch)
+
+- Integrated semantic bridge capabilities from the project MiniMax-H3-Semantic-Bridge: Mix the ~11MB student adapter distilled from SenseNova U1.5 teacher bridge into H3 conditioning to enhance prompt adherence (spatial relationships/counting/materials/reflections, etc.), no SenseNova participation required during reasoning. The semantic bridge is not a universal method and may degrade performance in some cases, so do not enable it unless necessary.
+- `Minimax_H3_AutoContext_parameter` node adds 4 parameters: `semantic_bridge` (toggle), `semantic_bridge_adapter` (adapter file), `semantic_bridge_alpha` (fusion strength, default 0.10, official A/B examples use 0.15), `semantic_bridge_magnitude` (amplitude alignment method, default per_token).
+- Only changes the conditioning tensor, without modifying H3 DiT weights; inter-segment anchoring and reference material channels are unaffected and can be enabled or disabled at any time.
+- ⚠️ Upstream v1 only verified FL2VA/text path; Ref2VA reference path (ref_video / ref_audio, including lip sync) not verified, may degrade lip sync and singing performance when used; please use A/B comparison to enable/disable before use.
+- Note: Face repair chain (Face_Cut / Face_Resample / Face_Blend) is not yet applied to the semantic bridge.
+
+Optimizations:
+- Optimized face repair node processing logic; optimized memory and GPU memory usage; SR amplification can optionally unload the main model/VAE/CLIP before.
+- When fixing prompts, no longer reload the text encoder for each block, and in this case, strengthen fingerprint verification (pixel content fingerprint) to avoid false hits when changing images.
+- Added sr_batch (default 4, range 1~16) SR frames per forward; only affects speed and peak GPU memory, does not affect results.
+- Removed sec_auto_unload, SeC-4B tracking now always automatically unloads, no need to toggle.
+
+### v0.8.5 (test branch)
 
 <img width="2156" height="629" alt="image" src="https://github.com/user-attachments/assets/b0b9373a-258b-485e-b5e8-0b3778f744e3" />  <br>
   
-Added Minimax_H3_TST_AttentionPatch attention correction node; H3 TST attention correction — spectral tension diagnosis + video line query adaptive scaling, suppressing temporal flicker/smashed face. tau intensity (0.2), needs to be placed downstream of other attention patches.  
+Added Minimax_H3_TST_AttentionPatch attention correction node; H3 TST attention correction — score tension diagnosis + video line query adaptive scaling to suppress temporal flicker/small face collapse. tau intensity (0.2), needs to be placed downstream of other attention patches.  
 
-Added and optimized the face repair node. Detailed instructions: [Chinese](https://github.com/supElement/ComfyUI_MinimaxH3_AutoContext/blob/test/h3_fix_zh.md) | [English](https://github.com/supElement/ComfyUI_MinimaxH3_AutoContext/blob/test/h3_fix_en.md)</sub>
+Added and optimized face repair node. Detailed description: [Chinese](https://github.com/supElement/ComfyUI_MinimaxH3_AutoContext/blob/test/h3_fix_zh.md) | [English](https://github.com/supElement/ComfyUI_MinimaxH3_AutoContext/blob/test/h3_fix_en.md)</sub>
 - Minimax_H3_Face_Cut: Detection and cropping, storyboard + YOLO detection + optional SeC-4B tracking.
-- Minimax_H3_Face_Resample: Refinement, uses the same sampling model for block-level img2img resampling (block structure mirrors the main sampling segmentation + block-to-block anchoring) .
-- Minimax_H3_Face_Blend: Reintegration, refined faces are pasted back into the original scene according to geometric accounting and mask per-pixel.
+- Minimax_H3_Face_Resample: Refinement, uses the same model as the main sampling for block-level img2img resampling (block structure mirrors main sampling segments + block anchoring between blocks).
+- Minimax_H3_Face_Blend: Reattachment, refined faces are reattached to the original image pixel by pixel according to geometric accounting and mask.
 
-V0.7.2
-
-- Fixed a bug where H3Parameter parameter node inputs (total_frames / chunk_frames / context_frames) connected to similar Math Expression nodes would cause the expected segment requests to enter an infinite loop, freezing ComfyUI's web interface.
-
-V0.7.1
-
-- Added video_guide parameter, used to optimize video continuation, video forward, and dual video concatenation (generating intermediate segments), supporting segmentation. Note: When non-none, the reference at the corresponding reference port of the sampling node will be forcibly cropped to the value set in the context_frames parameter. Reference logic is the same as normal references (only if declared in the prompt will it be referenced).
-
-V0.6.5
-
-- Optimized latent cache handling logic, removing manual cache directory specification,Change to automatically assigning a unique cache directory to each node ("node + node ID"), preventing cache logic overlap due to accidental operations.
-- Established cache and validation logic in a segmented manner. If the upstream node only adds prompts or increases segmentation without changing other prompts submitted to sampling, and the parameters associated with the sampling node remain unchanged, then the existing corresponding cache is still considered valid and called, and new segments will automatically establish latent cache. Downstream sampling nodes (2-sampling) will also retain existing latent cache and call it, only creating new segment caches for added segments.  
-- The position of prompt changes determines which latent caches can be reused. Segments after prompts that are changed will be forcibly rebuilt, and downstream nodes adopt the same processing logic.  
-- ignore_latent_hash, ignores the hash value check of the input port input_latent. Practical scenario: Some latent processing nodes change latent judgment information (e.g., Minimax H3 Latent Upscaler (3D) node), making minor latent changes cause latent cache to be invalid and waste reasoning time. In such cases, it is recommended to set it to true. I only tested the Minimax_H3-LatentUpscaler_Adv node in my other repository github.com/supElement/ComfyUI_Element_easy extension, similar nodes were not tested. When using latent processing nodes that do not change latent noise characteristics, the ignore_latent_hash parameter can be set to false.
-
-V0.5.8
-- Improved hash value detection parameter to resolve tensor mismatch errors caused by parameter changes in upstream nodes of the sampler.  
-- Minimax_H3_Seam_Correction node, removed the shot detection model, as the detection model would cause the sampler preview to show a "white screen". Replaced with PySceneDetect method (pure CPU, no potential contamination).
+### Stability Updates Summary (V0.5.8–V0.7.2)
+- Parameter node compatibility fixes: Fixed issues where H3Parameter's total_frames / chunk_frames / context_frames connected to Math Expression nodes caused dead loops in segmented estimation requests and ComfyUI page freezes.
+- Added video_guide parameter: Optimizes video continuation, video forward, and dual video intermediate concatenation, supporting segmentation. When non-none, the reference port of the sampling node will be strictly trimmed according to context_frames; reference rules are the same as normal references and must be declared in the prompt.
+- Latent cache restructuring: Removed manual cache directory,Change to automatically generate unique directories based on "node + node ID" to avoid cache overlap. Caches are established and verified per segment; old caches are reused when prompts and related parameters for corresponding segments remain unchanged, new segments automatically establish caches; downstream 2-samp also retains and reuses old caches. After prompt changes, the current segment and subsequent segments are forced to rebuild, downstream nodes are similarly handled.
+- Added ignore_latent_hash: Can ignore input_latent hash verification, avoiding latent judgment information changes in nodes that cause cache misfailure. Nodes that do not change latent noise characteristics can be set to false, [Minimax_H3-LatentUpscaler_Adv node](https://github.com/supElement/ComfyUI_Element_easy) has been tested.
+- Hash detection enhancement: Improved hash detection parameters, fixed tensor mismatch caused by parameter changes upstream of the sampler.
+- Seam correction optimization: Minimax_H3_Seam_Correction removed the shot detection model, using PySceneDetect (pure CPU, no potential contamination), avoiding white screen in sampler preview
 ## 📖 Table of Contents
 
 - [Node List](#nodes)
@@ -87,7 +92,7 @@ V0.5.8
 ### 🧩 Split Inference
 
 - Splits into multiple segments based on `total_frames` / `chunk_frames` (frame units), frame count recommended: 5, 22, 39, 56, 73, 90…
-- Automatically pads the last segment to avoid excessively short tail segments
+- Automatically pads the final segment to avoid excessively short tail segments
 - `fps` is only used for audio synchronization and prompt second conversion
 
 ### 🔗 Inter-Segment Continuation
@@ -95,20 +100,20 @@ V0.5.8
 - **Overlay Enhancement**: Non-first segments automatically "take over" the ending frame of the previous segment, with new content naturally continuing from where the previous segment ended, eliminating pauses or position jumps at the seams
 - The ending frame of the previous segment is used as a motion reference for the current segment, helping to maintain motion direction and speed
 - The audio of the previous segment is also passed as "previous content" to help the sound flow naturally
-- Inter-segment audio fades smoothly and aligns with the video frame count
+- Inter-segment audio fades smoothly, aligned with the video frame count
 
-> Frame count rules: `total_frames` / `chunk_frames` / `context_frames` all take 5, 22, 39, 56, 73, 90… (17n+5), the node automatically aligns, generally no need for manual calculation.
+> Frame count rules: `total_frames` / `chunk_frames` / `context_frames` all take 5, 22, 39, 56, 73, 90… (17n+5), the node aligns automatically, generally no need for manual calculation.
 
 ### ⏱️ Prompt Timeline
 
 | Mode | Description |
 |------|------|
 | **Clip_Tag** | Splits prompts based on user-defined tags (e.g., `段1`/`段2`), each tag corresponds to an independent video segment; segment duration is determined by the prompt content (tag duration > segment time markers > `total_frames/fps` fallback). |
-| **timeline** | Splits prompts based on explicit time markers (e.g., `0-2s`/`2-6s`), each time interval corresponds to a video segment; segment duration = interval length × `fps` and automatically snaps to legal grids; **ignores `total_frames` and `chunk_frames`**, entirely determined by the prompt. Global segments (`【全局】`) remain in their original positions and are not extracted together. |
+| **timeline** | Splits prompts based on explicit time markers (e.g., `0-2s`/`2-6s`), each time interval corresponds to a video segment; segment duration = interval length × `fps` and automatically snaps to a legal grid; **ignores `total_frames` and `chunk_frames`**, completely determined by the prompt. Global segments (`【全局】`) remain in their original positions and are not extracted together. |
 | **sequential** | Distributes the prompt in sentence order evenly across the entire video timeline without splitting the prompt itself; video segmentation still follows `chunk_frames`. | 
 | **global** | The entire prompt is used for all video segments (`【全局】` tags stripped), video segmentation follows `chunk_frames`. |
 
-> In `Clip_Tag` and `timeline` modes, `total_frames` and `chunk_frames` parameters are ignored (segment length determined by the prompt), only fallback to these values when the mode degrades (e.g., no tags/time markers detected).
+> In `Clip_Tag` and `timeline` modes, `total_frames` and `chunk_frames` parameters are ignored (segment length determined by the prompt), only used when the mode degrades (e.g., no tags/time markers detected) and falls back to these values.
 
 ### 🏷️ Clip_Tag Tag Splitting Mode
 
@@ -120,16 +125,16 @@ V0.5.8
 - Segment time markers are **relative time** (starting from 0 for each segment), not global absolute time
 - Overlapping frames are automatically generated for non-first segments to ensure smooth transitions, and are cropped after generation
 - Total duration automatically aligns to the target total frame count, as close as possible to the expected duration
-- During inference, tags themselves are removed, and the remaining prompt content is output based on `prompt_format`
+- During inference, tags themselves are removed, and the rest of the prompt content is output based on `prompt_format`
 
 ### 🎯 Reference Intelligent Filtering (Image / Video / Audio)
 
 - Automatically identifies reference images/videos/audios used in each segment of the prompt, only passing the referenced materials to that segment
-- Video and its paired audio track are bound together to avoid cross-talk between visuals and sound
+- Video and its paired audio track are bound together to avoid visual/audio cross-talk
 
 ### 🖌️ Two-Stage Sampling (Two-Stage)
 
-- Main node `latent_input` receives one-stage latent (or latent amplified node) to enter two-stage mode
+- Main node `latent_input` inputs one-stage latent (or via latent amplification node) to enter two-stage mode
 - Two-stage resolution **takes input latent as the reference** (ignores width/height), achieving low-quality one-stage → high-quality two-stage
 - `denoise` controls redraw intensity; `sigmas` supports custom sigma sequences (same as `SamplerCustomAdvanced`)
 - `lock_audio`: Two-stage only redraws video, reuses one-stage audio
@@ -137,20 +142,20 @@ V0.5.8
 ### 🎵 Audio-Driven (Audio Drive)
 
 - `drive_audio` (AUDIO, optional) + `audio_drive` switch
-- Enabled, video is generated following this audio, output audio = source audio itself (lip sync/rhythm driven by it)
+- Enabled, video follows this audio to generate, output audio = source audio itself (lip sync/rhythm driven by it)
 
 ## <a id="install"></a> 📦 Installation
 
-### Method 1: Manual Installation
+### Method 1: Manual Installation (Manual Installation)
 
 ```bash
 cd ./ComfyUI/custom_nodes
 git clone https://github.com/supElement/ComfyUI_MinimaxH3_AutoContext.git
 ```
 
-### Method 2: Install via Manager
+### Method 2: Install via Manager (Install using Manager)
 
-Search for `ComfyUI_MinimaxH3_AutoContext` in the ComfyUI Manager and click Install.
+Search for `ComfyUI_MinimaxH3_AutoContext` in ComfyUI Manager and click Install.
 
 ## <a id="params"></a> ⚙️ Node Parameters
 
@@ -167,11 +172,11 @@ Search for `ComfyUI_MinimaxH3_AutoContext` in the ComfyUI Manager and click Inst
 | width × height | 960×544 | One-stage resolution (latent_input overrides when two-stage) |
 | total_frames | 362 | Total frames to generate (17n+5); only serves as a fallback in `Clip_Tag`/`timeline` modes (when no tags/time markers), ultimately covered by the sum of each segment |
 | fps | 24 | Frame rate, used for audio synchronization and prompt second conversion |
-| chunk_frames | 90 | Frames per segment generation (17n+5), only effective in `sequential` / `global` modes |
+| chunk_frames | 90 | Frames generated per segment (17n+5), only effective in `sequential` / `global` modes |
 | context_frames | 22 | Inter-segment continuation frames (17n+5: 5/22/39/56…), recommended 22 or higher |
 | lock_audio | `true` | Lock audio region during two-stage (noise_mask audio=0): resamples video only, keeps one-stage audio unchanged |
-| audio_drive | `false` | Audio drive switch, enables video to be generated following drive_audio |
-| video_guide | `none` | Video extension parameter, supports per-segment. none: disabled (does not modify video reference logic); pre_guide: video continuation (ref_video_0 or + ref_video_audio_0 port on sampling node); post_guide: video pre-push (ref_video_0 or + ref_video_audio_0 port on sampling node); pre_post_guide: dual-video middle connection (ref_video_0 or + ref_video_audio_0 port on sampling node, ref_video_1 or + ref_video_audio_1 port on sampling node). Anchor frame count determined by context_frames. Note: Non-none values force-sample node reference ports to be cropped to the value set in the context_frames parameter. Reference logic is the same as normal references (only referenced if declared in the prompt) |
+| audio_drive | `false` | Audio drive switch, enables video to follow drive_audio generation |
+| video_guide | `none` | Video extension parameter, supports per-segment. none: disabled (does not modify video reference logic); pre_guide: video continuation (sampling node ref_video_0 or + ref_video_audio_0 port); post_guide: video pre-push (sampling node ref_video_0 or + ref_video_audio_0 port); pre_post_guide: dual-video middle connection (sampling node ref_video_0 or + ref_video_audio_0 port, ref_video_1 or + ref_video_audio_1 port). Anchor frame count determined by context_frames. Note: Non-none values force the corresponding reference port of the sampling node to be forcibly cropped to the value set in the context_frames parameter. Reference logic is the same as normal references (only referenced if declared in the prompt) |
 
 > The node displays "Estimated Splits" preview in real-time (calculated by frontend JS, does not participate in inference).
 
@@ -186,69 +191,69 @@ Search for `ComfyUI_MinimaxH3_AutoContext` in the ComfyUI Manager and click Inst
 | latent_input | Optional | Two-stage input latent (enables two-stage upon connection) |
 | info | Optional | Parameter inheritance input (multi-stage chaining, ensures segment consistency) |
 | first_frame / last_frame | Optional | First/last frame anchoring (FL2VA) |
-| video_context_denoise | 0.0 | Inter-segment continuation strength (only non-first segments): 0=exact continuation of previous segment ending, 1=regenerate, intermediate values=soft blend. When connected to SplitSigmas in two-stage, set to 1 to avoid screen artifacts |
+| video_context_denoise | 0.0 | Inter-segment continuation strength (only non-first segments): 0=exact continuation of previous segment ending, 1=regenerate, intermediate values=soft blend. When connected to SplitSigmas in two-stage, it is recommended to set to 1 to avoid screen artifacts |
 | seed | 0 | Random seed (control_after_generate) |
 | steps / cfg | 30 / 1.0 | Sampling steps / CFG |
 | sampler_name / scheduler | euler / simple | Built-in sampler / scheduler |
 | denoise | 1.0 | Redraw strength (1=full resampling, smaller value retains more original structure) |
-| enable_cache | true | Store/read latent cache, automatically creates folders named "node+nodeID" in "\ComfyUI\output\cache" directory, latent cache files are overwritten when upstream nodes or parameters change |
-| clear_cache | false | Force rebuild latent cache files |
-| ignore_latent_hash | false | Ignore hash validation for input port input_latent. Use case: Some latent processing nodes alter latent judgment information, causing minor latent changes to result in cache incompatibility and wasted inference time, in which case it is recommended to set to true |
+| enable_cache | true | Store/read latent cache, automatically creates a folder named "node+nodeID" in "\ComfyUI\output\cache" directory, latent cache files are overwritten when upstream nodes or parameters change |
+| clear_cache | false | Forcefully rebuild latent cache files |
+| ignore_latent_hash | false | Ignore hash validation of input port input_latent. Practical scenario: Some latent processing nodes alter latent judgment information, causing minor latent changes to result in cache incompatibility and waste inference time, in which case it is recommended to set to true |
 | ref_image_N / ref_video_N / ref_video_audio_N / ref_audio_N | Optional | Reference materials (Autogrow dynamic ports) |
 | drive_audio | Optional | Audio drive source |
 ## <a id="output"></a> 📤 Output
 
 | Output | Description |
 |------|------|
-| **latent** | Merged audio-video latent, connected to VAE Decode, or upscaled then connected to binary sampling |
+| **latent** | Merged audio-video latent, connected to VAE Decode, or upscaled then followed by binary sampling |
 | **denoised_latent** | Clean latent output, used for binary sampling continuation / preview |
 | **info** | Segment parameters (Dict), passed to the next main node's info input, ensuring consistent multi-sampling segmentation |
 
 
 
-## <a id="second-pass"></a> 🔄 Binary Sampling and SplitSigmas High/Low Frequencies
+## <a id="second-pass"></a> 🔄 Binary Sampling and SplitSigmas High/Low Frequency
 
-### Basic Binary Sampling (Low-Resolution Single Sampling → High-Resolution Binary Sampling)
+### Basic Binary Sampling (Low-Resolution First Sample → High-Resolution Second Sample)
 
 ```text
-parameter node ──parameter──> Main node (Single Sampling, 864×480)
-    └─ latent / denoised_latent ──> [Separate AV] ──> video_latent ──> latent upscaled ──> [Merge AV] ──> Main node (Binary Sampling).latent_input
-Binary Sampling node: parameter shared (or info inherited), optional denoise 0.4~0.6
+parameter node ──parameter──> Main node (first sample, 864×480)
+    └─ latent / denoised_latent ──> [Separate AV] ──> video_latent ──> latent upscaled ──> [Merge AV] ──> Main node(second sample).latent_input
+Binary sampling node: parameter shared (or info inherited), optional denoise 0.4~0.6
 ```
 
 - Binary sampling resolution is based on `latent_input`, ignores parameter's width/height
 
-### SplitSigmas High/Low Frequencies (Save Time, Enhance Clarity)
+### SplitSigmas High/Low Frequency (Save Time, Enhance Clarity)
 
-> ⚠️ **Audio Constraint**: High/Low frequencies only take effect on video (audio segment interconnections require complete sampling), audio should remain complete sampling.
+> ⚠️ **Audio Constraint**: High/Low frequency **only affects video** (audio segments need complete sampling), audio should maintain complete sampling.
 
 ```text
-Single Sampling node: Complete sampling (no connection to high_sigmas, audio complete denoising)
-          → denoised_latent → Separate amplify video (audio unchanged) → Merge → Binary Sampling.latent_input
-Binary Sampling node: sigmas ← low_sigmas (only run low sigma segments to enhance details)
-          lock_audio = True (reuse single sampling complete audio)
-          video_context_denoise = 1.0 (continuation area redraws together with new area, avoids screen tearing)
+First sample node: Complete sampling (not connected to high_sigmas, audio complete denoising)
+          → denoised_latent → Separate amplify video (audio unchanged) → Merge → second sample.latent_input
+Second sample node: sigmas ← low_sigmas (only run low sigma segments to enhance details)
+          lock_audio = True (reuse first sample complete audio)
+          video_context_denoise = 1.0 (continuation area redraws together with new area, avoids flickering)
 ```
 
-> 💡 **Binary Sampling `video_context_denoise`**: When connected to SplitSigmas, setting 0 (precise continuation) may cause screen tearing at the boundary between continuation area and newly redrawn area; setting 1.0 synchronizes the continuation area redraw to avoid it. If the seam is slightly discontinuous, it can be reduced to 0.3~0.5 for a compromise. Single sampling remains default 0.
+> 💡 **Second sample `video_context_denoise`**: When connected to SplitSigmas, setting 0 (precise continuation) may cause flickering at the boundary between continuation area and newly redrawn area; setting 1.0 makes the continuation area redraw synchronously to avoid it. If the seam is slightly discontinuous, it can be reduced to 0.3~0.5 for a compromise. First sample remains default 0.
 
 ## <a id="seam"></a> 🧵 Seam Correction Node (Minimax_H3_Seam_Correction)
 
 | Parameter | Default Value | Description |
 |------|--------|------|
-| `fix_color_preset` | `"medium"` | **Color/Exposure Processing Level**<br>`off`: No processing; <br>`low`: Per-channel brightness gain, correction amount halved, most conservative, no color bias; <br>`medium`: Per-channel brightness gain, only corrects seam level jumps (recommended); <br>`high`: MKL linear color migration, longer statistical window, more stable during large motion; <br>`max`: Per-frame brightness normalization across the entire clip, eliminates intra-segment gradient drift, but will flatten the actual brightness variation in the frame itself (e.g., sky darkening/entering a tunnel), invalid for near-black frames (reported in logs). |
-| `fix_motion_preset` | `"off"` | **Seam Continuity (Optical Flow Alignment+Blending) Level**<br>`off`: No processing (recommended to first observe the effect with color level); <br>`low/medium/high/max`: The higher the level, the more frames and stronger intensity participate in blending, but it may introduce slight blurring or breathing effects. |
+| `fix_color_preset` | `"medium"` | **Color/Exposure Processing Level**<br>`off`: No processing; <br>`low`: Per-channel brightness gain, correction amount halved, most conservative, no color bias; <br>`medium`: Per-channel brightness gain, only corrects seam level jumps (recommended); <br>`high`: MKL linear color migration, longer statistical window, more stable during large motion; <br>`max`: Frame-by-frame brightness normalization across the entire clip, eliminates intra-segment gradient drift, but will flatten the actual brightness variation in the frame (e.g., sky darkening/entering a tunnel), invalid for near-black frames (reported in logs). |
+| `fix_motion_preset` | `"off"` | **Seam Continuity (Optical Flow Alignment+Blending) Level**<br>`off`: No processing (recommended to first observe the effect with color level); <br>`low/medium/high/max`: The higher the level, the more frames and intensity participate in blending, but it may introduce slight blurring or breathing effect. |
 | `fix_flash` | `false` | **Flash Frame Processing** (instantaneous brightness jumps at boundaries). Independent switch, uses temporal fusion logic. If the scene has reasonable rapid brightness changes like lightning, explosions, etc., suppression will flatten these effects. Still effective independently even when `fix_motion_preset=off` is active. |
 | `flash_threshold` | `0.30` | Transient correction selection threshold (percentage of anomalous pixels), smaller value is more aggressive (corrects more frames), recommended `0.20` ~ `0.40`. |
 | `cut_threshold` | `15.0` | PySceneDetect's sensitivity threshold (range `5.0` ~ `50.0`), smaller value is more sensitive, recommended `10` ~ `20`. |
-| `blend_frames` | `2` | Seam level gradient window (frames, 0~8): After exposure alignment, smooth the brightness transition of `blend_frames` frames before and after the boundary as a smooth ramp; larger value results in smoother, more natural transitions, but may cause slight blurring/breathing effects during large motion scenes; `0` means disabled. |
+| `blend_frames` | `2` | Seam level transition window (frames, 0~8): After exposure alignment, smooth the brightness transition of `blend_frames` frames before and after the boundary as a smooth ramp; larger value results in smoother transition, more natural, but large motion scenes may cause slight blurring/breathing effect; `0` means disabled. |
 | `use_gpu` | `true` | Use CUDA GPU for statistics, color transformation, and optical flow calculation (automatically fallback to CPU if unavailable). |
 
 ⚠️ Removed the scene detection model, using PySceneDetect (pure CPU, no potential contamination).
 
 > Usage: `VAE Decode → H3_Seam_Correction → Save/Video`.
 
-> ⚠️ Note: This node only performs visual seam correction, cannot fix artifacts generated by upstream binary sampling.
+> ⚠️ Note: This node only does seam correction for the visual, cannot fix artifacts generated by the upstream binary sampling.
 
 ## <a id="prompt-examples"></a> ✍️ Prompt Writing Examples
 
@@ -264,7 +269,7 @@ integrated_multimodal_description
 overall_soundscape
 ```
 
-> Paragraphs marked with `0-5s` are split by time, unmarked paragraphs (styles/effects/prohibitions) are automatically combined into each window.
+> Paragraphs with `0-5s` markers are split by time, unmarked paragraphs (styles/effects/prohibitions) are automatically combined into each window.
 
 ### Global Mode (global)
 
@@ -272,23 +277,23 @@ overall_soundscape
 
 ### Clip_Tag Mode (Segment by Tags)
 
-> `clip_mode` set to `Clip_Tag`, `clip_tag` filled with tag template (must end with a numeric sequence number).
+> `clip_mode` set to `Clip_Tag`, `clip_tag` filled with tag template (must end with a numeric sequence).
 
 **Tag Template Examples**
 
 | Template | Match |
 |------|------|
-| `段1` | `段1` / `段2` / `段3` (prefix "Segment" + number) |
-| `A01` | `A01` / `A02` / `A03` (prefix "A" + number) |
-| `[片段001]` | `[片段001]` / `[片段002]` (prefix "[Clip" + number + suffix "]") |
+| `段1` | `段1` / `段2` / `段3` (prefix "Segment"+number) |
+| `A01` | `A01` / `A02` / `A03` (prefix "A"+number) |
+| `[片段001]` | `[片段001]` / `[片段002]` (prefix "[Clip"+number+suffix"]") |
 
-**Tag Writing**: Tags occupy a line as a separator, recommended to add a newline after the tag. Without a newline, it can also be processed (separator is skipped to extract segment content):
+**Tag Writing**: Tags occupy a line as a separator, recommended to newline after the tag. Without newline, it can also be processed (skips separator to take segment content):
 
 ```text
 Segment 1:3s
 Video:
 ...
-Audio Design:
+Audio design:
 ...
 
 
@@ -298,21 +303,21 @@ Video:
 ...
 2-5 seconds:
 ...
-Audio Design:
+Audio design:
 0-5 seconds:...
 ```
 
-**Segment Duration Rules** (three priority levels):
+**Segment Duration Rules** (three levels of priority):
 
-1. Duration immediately following the tag line: `段1:0-5秒` → 5 seconds; `段1:3-8秒` → 5 seconds (duration markers are removed from the prompt)
+1. Duration immediately following the tag line: `段1:0-5秒` → 5 seconds; `段1:3-8秒` → 5 seconds (duration markers will be removed from the prompt)
 2. In-segment time markers 0-based: `【0-2秒】`+`【2-5秒】` → 5 seconds
-3. None → `chunk_frames / fps` as fallback
+3. None → `chunk_frames / fps` fallback
 
 **prompt_format Selection**
 
 - `official` / `legacy`: In-segment time markers automatically converted to relative coordinates within the segment for rendering
 - `raw`: Output as is after removing tags, time markers remain unchanged (suitable for structured prompts generated by large models)
-## <a id="limitations"></a> 📝 Prompt Considerations (Limitations of Nodes)
+## <a id="limitations"></a> 📝 Prompt Considerations (Node Limitations)
 
 > The following considerations **do not apply** to simple, always-effective prompt scenarios (i.e., all segments share the same prompt, global mode),
 > such as: voice-over digital humans (of course, lines need to be segmented), camera/composition changes are minimal in videos, or video character replacement, etc., common prompt scenarios.
@@ -322,10 +327,10 @@ Audio Design:
 > When using segmented reasoning (Chunks), please strictly adhere to the **temporal exclusivity** principle—each segment's prompt can only describe the **new changes** that are "happening" in that segment relative to the end of the previous segment.
 
 - **Segments as "Relays"**: When generating the Nth segment, its starting frame state (position, action posture, camera position) is completely implicitly provided by the "anchored frames (Context Frames)" at the end of the previous segment. You don't need to repeat this starting state in the prompt.
-- **Prohibited "Retrospection" and "Overlap"**: The prompt for the Nth segment absolutely cannot repeat actions or camera movements already completed in the N-1th segment. If repeated, the model will receive conflicting instructions with the anchored frame's visuals (instruction conflict), leading to jerky generation, illogical motion, or repeated actions.
+- **Prohibited "Retrospection" and "Overlap"**: The prompt for the Nth segment absolutely cannot repeat actions or camera movements already completed in the N-1th segment. If repeated, the model will receive conflicting instructions with the anchored frame's visuals, leading to jerky generation, illogical motion, or repeated actions.
 - **Zeroing at Boundaries**: When switching segments, zero out the "ongoing actions" of the previous segment. The new segment's prompt should act like a "new instruction after taking a snapshot," targeting only the displacement, actions, or new elements that appear within the current new time segment.
 
-**❌ Incorrect Usage (Conflicting Overlap)**
+**❌ Incorrect Usage (Conflict Overlap)**
 
 ```text
 Segment 1: 3s
@@ -340,21 +345,21 @@ Segment 2: 3-6s
 
 ```text
 Segment 1: 3s
-"Object A moves to position B and finally stops at position B" (emphasizing action closure)
+"Object A moves to position B and stops finally at position B" (emphasizing action closure)
 Segment 2: 3-6s
 "Stand still, then Object A slowly turns direction" (directly describe the new action after the end of the previous segment)
 ```
 
 > Correct Logic: The 2nd segment completely discards the description of the "movement process," assuming "stopped at B point" is a given fact, and only describes the subsequent "turning" new action, allowing the model to perfectly continue using the anchored frame.
 
-> 🚀 **In a nutshell**: The end of the previous segment is the "result," and the beginning of the next segment is the "new action after the result." Don't put the "process that led to the result" into the next segment.
+> 🚀 **In a nutshell**: The end of the previous segment is the "result," the beginning of the next segment is the "new action after the result," don't put the "process that led to the result" into the next segment.
 
 ### 2️⃣ Core Principle: Per-Segment Reference Declaration
 
 > When using segmented reasoning with reference images/videos (image1, video1, etc.), please strictly adhere to the **per-segment reference declaration** principle—each segment's prompt must independently and completely declare all reference materials required for that segment, references are not "memorized" or "inherited" to the next segment (only the referenced references participate in reasoning for the current segment).
 
-- **No Global Memory**: The node parses the reference labels explicitly mentioned within the current segment's prompt to accurately determine which materials are needed for that segment. Writing image1 in the 1st segment only means it was used in the 1st segment; the next segment will re-scan.
-- **No Write, No Transfer**: If the Nth segment doesn't write image1 again, that reference image won't be passed in, causing inconsistencies in characters/objects.
+- **No Global Memory**: The node parses the reference labels explicitly mentioned in the current segment's prompt to accurately determine which materials are needed for that segment. Writing image1 in the 1st segment only means it was used in the 1st segment; the next segment will re-scan.
+- **No Write, No Transfer**: If the Nth segment doesn't write image1 again, that reference image won't be passed in, causing inconsistency in characters/objects.
 
 **❌ Incorrect Usage (Implicit Inheritance)**
 
