@@ -15,7 +15,7 @@ H3 的显存需求随分辨率、时长（每 +5s 翻倍）、精度（fp8→bf1
 
 ⚠️注意：更改模型,包括lora、sageattention等加速节点时，latent检测不会发现更改，所以必须删除latent缓存，两种删除latent缓存的方法：  
 - 开启Minimax_H3_AutoContext_Sampler节点上的 clear_cache 参数，这会在采样开始时，强制重新建立本节点缓存文件。
-- 手动删除缓存目录中的对应文件夹（\ComfyUI\output\cache），文件夹名为“node_” + “节点ID”。
+- 手动删除缓存目录中的对应文件夹（\ComfyUI\output\cache），文件夹名为“node_” + “节点ID”。  
 
 <img width="2230" height="976" alt="image" src="https://github.com/user-attachments/assets/5634914a-6f98-4d4f-b573-2c8b41e0c57e" />
 
