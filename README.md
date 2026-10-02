@@ -23,7 +23,18 @@ H3 的显存需求随分辨率、时长（每 +5s 翻倍）、精度（fp8→bf1
 <img width="2209" height="1030" alt="image" src="https://github.com/user-attachments/assets/9bbdda2a-d4ce-4836-b108-e359e72e31de" />
 
 ## BUG修复、优化和新功能
-V0.9.0
+
+### test分支
+
+首次安装（要 test 分支）：
+
+      git clone -b test https://github.com/supElement/ComfyUI_MinimaxH3_AutoContext.git
+已安装，从 main 切到 test：
+
+      git fetch origin  → git checkout test  → git pull
+Manager 用户：在 Manager 里把分支切到 `test`，再点 Update。
+
+### V0.9.0 （test分支）
 
 - 集成项目MiniMax-H3-Semantic-Bridge的语义桥能力：将 SenseNova U1.5 教师桥蒸馏出的 ~11MB 学生适配器混合进 H3 条件，增强提示词遵循度（空间关系/计数/材质/反射等），推理时无需 SenseNova 参与。语义桥并非通用方法，部分情况会产生劣化，所以非必要不要开启。
 - `Minimax_H3_AutoContext_parameter` 节点新增 4 个参数：`semantic_bridge`（开关）、`semantic_bridge_adapter`（适配器文件）、`semantic_bridge_alpha`（融合强度，默认 0.10，官方 A/B 示例用 0.15）、`semantic_bridge_magnitude`（幅度对齐方式，默认 per_token）。
@@ -31,40 +42,30 @@ V0.9.0
 - ⚠️ 上游 v1 仅验证 FL2VA/文本路径；Ref2VA 参考路径（ref_video / ref_audio，含口型同步）未验证，实测可能劣化口型与演唱表现，使用前请自行开/关 A/B 对比。
 - 注：修脸链路（Face_Cut / Face_Resample / Face_Blend）暂不应用语义桥。
 
+优化：
 - 优化面部修复节点处理逻辑；优化内存和显存占用；SR 放大前可选卸载主模型/VAE/CLIP。
 - 固定提示词时，不再每块重载文本编码器，并在此情况下，加强指纹校验(像素内容指纹)，避免换图假命中。
 - 新增	sr_batch（默认 4，范围 1~16）	SR 每次前向的帧数；只影响速度与显存峰值，不影响结果。
 - 移除	sec_auto_unload，SeC-4B追踪结束后现在始终自动卸载，无需开关。
 
-v0.8.5
+### v0.8.5 （test分支）
 
-<img width="2156" height="629" alt="image" src="https://github.com/user-attachments/assets/b0b9373a-258b-485e-b5e8-0b3778f744e3" />  <br>  
-
- 增加Minimax_H3_TST_AttentionPatch 注意力校正节点；H3 TST 注意力校正 — 谱张力诊断 + 视频行 query 自适应缩放，抑制时序闪烁/小脸崩坏。tau 强度（0.2），需放在其它 attention patch 下游。
+<img width="2156" height="629" alt="image" src="https://github.com/user-attachments/assets/b0b9373a-258b-485e-b5e8-0b3778f744e3" />  <br>
   
- 增加并优化面部修复节点。详细说明：[中文](h3_fix_zh.md) | [English](h3_fix_en.md)</sub>
-- Minimax_H3_Face_Cut：检测与裁剪，分镜 + YOLO 检测 + 可选 SeC-4B 追踪。
-- Minimax_H3_Face_Resample：精修，主采样同款模型做段级重采样 (段结构镜像主采样分段 + 段间锚定) 。
-- Minimax_H3_Face_Blend：贴回，精修脸按几何账本与 mask 逐像素贴回原画面。
+增加Minimax_H3_TST_AttentionPatch 注意力校正节点；H3 TST 注意力校正 — 谱张力诊断 + 视频行 query 自适应缩放，抑制时序闪烁/小脸崩坏。tau 强度（0.2），需放在其它 attention patch 下游。  
 
-V0.7.2
+增加并优化面部修复节点。详细说明：[中文](https://github.com/supElement/ComfyUI_MinimaxH3_AutoContext/blob/test/h3_fix_zh.md) | [English](https://github.com/supElement/ComfyUI_MinimaxH3_AutoContext/blob/test/h3_fix_en.md)</sub>
+- Minimax_H3_Face_Cut： 检测与裁剪，分镜 + YOLO 检测 + 可选 SeC-4B 追踪。
+- Minimax_H3_Face_Resample： 精修，主采样同款模型做块级 img2img 重采样 (块结构镜像主采样分段 + 块间锚定) 。
+- Minimax_H3_Face_Blend： 贴回，精修脸按几何账本与 mask 逐像素贴回原画面。
 
-- 修复当 H3Parameter 参数节点的输入端点（total_frames / chunk_frames / context_frames）连接类似 Math Expression 节点后，预计分段的请求会陷入死循环，ComfyUI 网页卡死的 bug。
-
-V0.7.1
-
-- 添加video_guide参数，用于优化视频续写、视频前推、双视频衔接（生成中间片段），支持分段。注意：非none时，采样节点的对应参考端口的参考会被强行剪切为context_frames参数中设置的数值。参考引用逻辑与普通参考相同（提示词中声明了，才会引用）。
-
-V0.6.5
-
-- 优化latent缓存处理逻辑，去除手动指定缓存目录，更改为自动为每个节点指定唯一缓存目录（“node + 节点ID”），防止因误操作导致采样节点的latent缓存逻辑互相覆盖。
-- 以分段方式建立缓存与校验逻辑，若上游节点只添加了提示词，或增加了分段，没有改变提交到采样的其它分段提示词，同时与采样节点关联的其它参数没有改变，则已有的对应缓存依然视为有效被调用，新加分段也会自动建立latent缓存。下游采样节点（二采）也会保留原有latent缓存并调用，只新建增加的分段缓存。
-- 提示词的改变位置决定哪些latent缓存可以复用，被改变提示词的分段之后的分段将强行重建，下游节点采用同样的处理逻辑。
-- ignore_latent_hash，忽略输入端口input_latent 的哈希值校验。实用场景：有些latent处理节点会改变latent判断信息（比如：Minimax H3 Latent Upscaler (3D)节点），使latent的微小变化导致latent缓存不可用，浪费推理时间，此时建议设置为true。我只测试了我的另一个仓库 github.com/supElement/ComfyUI_Element_easy 扩展中的 Minimax_H3-LatentUpscaler_Adv节点，类似节点没有测试，在使用不改变latent噪声特征的latent处理节点时，可以将ignore_latent_hash参数设置为false。
-
-V0.5.8
-- 完善哈希值检测参数，解决采样器上游节点parameter参数改变时导致的张量不匹配的错误。
-- Minimax_H3_Seam_Correction节点，去除镜头检测模型，检测模型会导致采样节点预览“白屏”，替换为 PySceneDetect 方法（纯 CPU，无潜在污染）。
+### 稳定更新汇总（V0.5.8–V0.7.2）
+- 参数节点兼容性修复：修复 H3Parameter 的 total_frames / chunk_frames / context_frames 连接 Math Expression 等节点后，分段预估请求死循环、ComfyUI 页面卡死的问题。
+- 新增 video_guide 参数：优化视频续写、视频前推、双视频中间衔接，支持分段。非 none 时，采样节点对应参考端口会按 context_frames 强制裁剪；引用规则同普通参考，需在提示词中声明。
+- Latent 缓存重构：取消手动缓存目录，改为按“node + 节点 ID”自动生成唯一目录，避免缓存互相覆盖。缓存按分段建立与校验；未改变对应分段提示词及相关参数时复用旧缓存，新增分段自动建立缓存；下游二采同样保留并复用旧缓存。提示词变更后，该分段及后续分段强制重建，下游节点同样处理。
+- 新增 ignore_latent_hash：可忽略 input_latent 哈希校验，避免会改变 latent 判断信息的节点导致缓存误失效。不改变 latent 噪声特征的节点可设为 false, 已测试 [Minimax_H3-LatentUpscaler_Adv节点](https://github.com/supElement/ComfyUI_Element_easy) 。
+- 哈希检测增强：完善哈希检测参数，修复采样器上游 parameter 改变导致的张量不匹配。
+- 接缝校正优化：Minimax_H3_Seam_Correction 移除镜头检测模型，改用 PySceneDetect（纯 CPU，无潜在污染），避免采样节点预览白屏
 
 ## 📖 目录
 
