@@ -32,7 +32,6 @@ H3 的显存需求随分辨率、时长（每 +5s 翻倍）、精度（fp8→bf1
 已安装，从 main 切到 test：
 
       git fetch origin  → git checkout test  → git pull
-Manager 用户：在 Manager 里把分支切到 `test`，再点 Update。
 
 ### V0.9.0 （test分支）
 
