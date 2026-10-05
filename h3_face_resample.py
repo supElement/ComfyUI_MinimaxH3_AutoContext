@@ -1,4 +1,20 @@
-"""h3_face_resample.py — 修脸第 2 步: 画布重采样 (v19.3, 全帧保留 + 编码期网格补齐 + 日志收编)
+"""h3_face_resample.py — 修脸第 2 步: 画布重采样 (v19.4, 全帧保留 + 编码期网格补齐 + 日志收编)
+
+v19.4 变更 (通用性/速度/显存, 常规路径输出不变):
+- C1: 缓存键补齐 模型/VAE/CLIP 权重指纹 (model_fp/vae_fp/clip_fp) — 换 checkpoint、
+  换 4步/8步加速 LoRA、改精度/函数级补丁时旧缓存自动失效 (旧版完全没有模型指纹,
+  是"换加速档位对比效果却命中旧缓存"这类静默错误的总根源)。
+- P1: 噪声种子按身份固定 (不再逐块 +bi); noise_v=2 入键, 旧画布缓存一次性失效。
+- v4: auto_sigma/sigma_boost 已移除 (实测无效, 见节点历史);
+  σ 由用户直接在调度器上设定 (H3 修脸实测起点 >= 0.6)。
+- S1: rows_hash 由全量 fp16 字节 md5 (GB 级, 每次运行同步阻塞数秒) 改为
+  等距采样签名 (≤64K 元素), 单帧改动仍然覆盖。
+- S5: 逐块 soft_empty_cache 移除 (同身份块形状相同, 块间清空纯为分配器预热开销)。
+- V2: 画布行 fp16 驻留内存 (RAM 减半; 相对误差远低于 8bit 量化台阶)。
+- V3: VAE 解码 OOM 回退: 清缓存重试 → tiled 解码 (慢但优于崩溃), 常规路径不变。
+- C2: sampler_tag 的自定义采样器对象以 类名:采样函数名 入指纹 (旧版只记 "custom")。
+- 注: 曾计划的"跳过 ctx 头编码"优化经代码级分析放弃 — 17n+5 网格在时间上不可加,
+  分块编码的边界 token 依赖 ctx 帧的 VAE 感受野, 跳过会产生错误对齐。
 
 v19.3 — 日志收编: 常规运行只保留 入口摘要/出口摘要/警告/缓存命中; 逐身份/逐块/逐子轨
 细节走 h3ff.vlog (h3_facefix.py 顶部 _VERBOSE=True 打开)。结构逻辑与 v19.2 完全一致 —
@@ -19,6 +35,7 @@ import comfy.samplers
 import comfy.model_management
 import comfy.nested_tensor
 import os
+import re
 import hashlib
 import folder_paths
 
@@ -173,6 +190,54 @@ def _text_cond_fingerprint(prompt, ri, rv, ra):
             h.update(p.detach().reshape(-1)[:: max(1, p.numel() // 2048)][:2048].float().cpu().numpy().tobytes())
     h.update(f"a:{len(ra or [])}".encode())
     return h.hexdigest()
+
+
+# ---- 修脸提示词组合 + 自动身份锚 ----
+_REF_TAG_RE = re.compile(r"<(?:Picture|Video|Audio)\s+\d+>", re.IGNORECASE)
+
+
+def _pick_sharpest_row(rows, max_n=32):
+    """从裁剪行中挑最清晰一帧 (拉普拉斯方差最大, 抽样上限 max_n) → (index, frame) 或 None。"""
+    try:
+        K = int(rows.shape[0])
+        if K <= 0:
+            return None
+        n_s = min(K, max_n)
+        idxs = sorted(set(int(round(i * (K - 1) / max(1, n_s - 1))) for i in range(n_s)))
+        g = rows[idxs].float().mean(dim=-1)
+        lap = (g[..., :-2, :-2] + g[..., :-2, 2:] + g[..., 2:, :-2] + g[..., 2:, 2:]
+               - 4.0 * g[..., 1:-1, 1:-1])
+        lv = lap.var(dim=(1, 2))
+        best = int(torch.argmax(lv).item())
+        gi = idxs[best]
+        return gi, rows[gi]
+    except Exception:
+        return None
+
+
+def _compose_face_prompt(orig_prompt, face_prompt, mode, id_tag=None):
+    """修脸提示词组合器。
+    - prepend: face_prompt + 原提示词 (环境上下文与参考声明全保留)
+    - replace_text: face_prompt + 原提示词中的参考声明 (丢弃场景文本)
+    - replace_all: 仅 face_prompt
+    身份锚标签 (<Picture N>) 始终附加 (若原文本未含), 保证 identity_ref 注入的参考被
+    声明-过滤管线识别并传递。face_prompt 与 id_tag 均空 → 原样返回 (旧行为)。"""
+    fp = (face_prompt or "").strip()
+    orig = orig_prompt or ""
+    if not fp and id_tag is None:
+        return orig
+    if mode == "replace_all":
+        text = fp if fp else orig
+    elif mode == "replace_text":
+        tags = list(dict.fromkeys(_REF_TAG_RE.findall(orig)))
+        text = fp if fp else ""
+        if tags:
+            text = (text + "\n" if text else "") + " ".join(tags)
+    else:  # prepend
+        text = (fp + "\n" + orig) if fp else orig
+    if id_tag and id_tag not in text:
+        text = text + f"\n{id_tag}: identity reference of the person in this video"
+    return text
 
 
 # ================= 独立模式支持 (修复普通视频, 不经过主采样节点) =================
@@ -348,17 +413,55 @@ class H3FaceResample(io.ComfyNode):
                                          "only: refs are passed to a block only if its prompt mentions them)\n"
                                          "参考图 (提示词中用 <Picture N> 引用 — 声明才引用: 仅当块提示词提到时才传递)"),
                     prefix="ref_image_", min=0, max=9)),
-                io.Boolean.Input("enable_cache", default=True, tooltip="Cache per-subtrack canvas rows (keyed by crop-rows hash + block seeds + "
-                                 "sigmas + prompts + refs + sampler + fps + lock_audio). Identical reruns skip "
-                                 "sampling. Clear manually after changing model/VAE weights\n"
-                                 "按子轨缓存画布行 (键: 裁剪行指纹+块种子+σ+提示词+参考素材+采样器+fps+lock_audio)。"
-                                 "一致的重复运行将跳过采样。更换模型/VAE 权重后请手动 clear_cache"),
-                io.Boolean.Input("clear_cache", default=False, tooltip="Delete this node's cache directory before running\n运行前删除本节点的缓存目录"),
+                io.String.Input(
+                    "face_prompt",
+                    multiline=True,
+                    default=(
+                        "clear and well-defined facial structure: sharp but natural eye contours, distinct iris and pupil, "
+                        "defined eyelid crease, clear lip shape, natural eyebrow structure; "
+                        "skin retains visible pores and natural highlight rolloff; "
+                        "no blur, no smearing, no distortion, no melting or twisted features; "
+                        "not smoothed into a plastic or mask-like appearance"
+                    ),
+                    tooltip="Face-repair prompt, composed with the original per-segment prompt according to "
+                            "prompt_mode. Scene prompts from the parameter node are written for whole-shot "
+                            "generation and often say nothing useful about faces — at high sigma they actively "
+                            "mislead the redraw. Ref declarations (<Picture N> etc.) are always preserved per "
+                            "prompt_mode\n"
+                            "修脸专用提示词, 按 prompt_mode 与原分段提示词组合。parameter 的场景提示词是为整镜头"
+                            "生成写的, 往往没有面部描述 — 高 σ 重绘时甚至会误导结果。参考声明 "
+                            "(<Picture N> 等) 按 prompt_mode 规则保留"
+                ),
+                io.Combo.Input("prompt_mode", options=["prepend", "replace_text", "replace_all"], default="prepend",
+                               tooltip="How face_prompt combines with the original block prompt:\n"
+                                       "- prepend: face_prompt + original (keeps environment context & refs)\n"
+                                       "- replace_text: face_prompt + ONLY the ref tags of the original (drops scene "
+                                       "text; best for high-sigma structural repair)\n"
+                                       "- replace_all: face_prompt alone (refs dropped unless you declare them)\n"
+                                       "face_prompt 与原分段提示词的组合方式:\n"
+                                       "- prepend: 修脸词 + 原提示词 (保留环境上下文与参考声明)\n"
+                                       "- replace_text: 修脸词 + 仅保留原提示词中的参考声明 (丢弃场景文本, "
+                                       "高 σ 结构修复首选)\n"
+                                       "- replace_all: 仅修脸词 (参考素材不再传递, 除非自行声明)"),
+                io.Boolean.Input("identity_ref", default=True,
+                                 tooltip="Auto identity anchor: picks the sharpest crop row of each identity and passes "
+                                 "it as a <Picture N> reference for that identity's redraw — keeps identity and "
+                                 "appearance consistent across frames/blocks at high sigma (the main anti-jitter "
+                                 "lever, together with face_prompt and the fixed per-identity noise seed)\n"
+                                 "自动身份锚: 为每条身份挑选最清晰的一帧裁剪, 以 <Picture N> 参考图形式注入该身份的"
+                                 "重采样 — 高 σ 下保持跨帧/跨块的身份与外观一致 (与修脸提示词、身份固定噪声种子"
+                                 "共同构成抗抖三件套)"),
                 io.Boolean.Input("color_match", default=True, tooltip="Reinhard-style color match of each resampled subtrack to its source crop rows "
-                                 "diffusion so the blended face matches its surroundings. Applied AFTER cache load — "
+                                 "so the blended face matches its surroundings. Applied AFTER cache load — "
                                  "toggling does NOT invalidate cache\n"
                                  "将每条重采样子轨与对应裁剪行做 Reinhard 式色彩匹配 (逐通道均值/方差, 按子轨统计)。"
                                  "在缓存加载之后执行 — 切换开关不会使缓存失效"),
+                io.Boolean.Input("enable_cache", default=True, tooltip="Cache per-subtrack canvas rows (keyed by crop-rows hash + block seeds + "
+                                 "sigmas + prompts + refs + sampler + fps + lock_audio + model/VAE/CLIP "
+                                 "fingerprints). Identical reruns skip sampling\n"
+                                 "按子轨缓存画布行 (键: 裁剪行指纹+块种子+σ+提示词+参考素材+采样器+fps+lock_audio"
+                                 "+模型/VAE/CLIP 指纹)。一致的重复运行将跳过采样"),
+                io.Boolean.Input("clear_cache", default=False, tooltip="Delete this node's cache directory before running\n运行前删除本节点的缓存目录"),
             ],
             outputs=[
                 io.Image.Output(display_name="images"),
@@ -371,7 +474,9 @@ class H3FaceResample(io.ComfyNode):
     def execute(cls, crop_images, face_pack, sigmas, seed=0, info=None, enable_cache=True,
                 clear_cache=False, color_match=True, audio=None, parameter=None,
                 model=None, vae=None, audio_vae=None, clip=None, sampler_name="euler",
-                scheduler="simple", sampler=None, ref_images=None) -> io.NodeOutput:
+                scheduler="simple", sampler=None, ref_images=None,
+                face_prompt="", prompt_mode="prepend",
+                identity_ref=True) -> io.NodeOutput:
         h3_patches.apply_patches()  
         pack = face_pack or {}
         if int(pack.get("version") or 0) not in (5, 6, 7):
@@ -385,6 +490,10 @@ class H3FaceResample(io.ComfyNode):
             rt_info = info["h3_runtime"]
         rt = _merge_runtime(rt_info, parameter, model, vae, audio_vae, clip,
                             sampler_name, scheduler, sampler, seed, ref_images)
+                            
+        if not rt.get("ref_images") and ref_images:
+            rt["ref_images"] = _autogrow_to_list(ref_images, "ref_image_", 10)
+            
         if rt_info:
             h3ff.log("\033[33m[H3-FaceResample] integrated mode: local model/vae/clip/prompt/fps/"
                      "parameter ignored (exception: parameter.shot_prompts), h3_runtime from info\n"
@@ -522,8 +631,16 @@ class H3FaceResample(io.ComfyNode):
             if _a.get("latent") is not None:
                 _cm.update(_a["latent"].detach().float().cpu().numpy().tobytes())
         conditions_hash = _cm.hexdigest()
-        sampler_tag = (f"{'custom' if rt.get('sampler_obj') is not None else 'builtin'}|"
-                       f"{rt.get('sampler_name', 'euler')}|{rt.get('scheduler', 'simple')}|cfg={CFG}")
+        _so = rt.get("sampler_obj")
+        if _so is not None:
+            _sfn = getattr(_so, "sampler_function", None)
+            _sdesc = f"custom:{type(_so).__name__}:{getattr(_sfn, '__name__', 'anon')}"
+        else:
+            _sdesc = "builtin"
+        sampler_tag = (f"{_sdesc}|{rt.get('sampler_name', 'euler')}|{rt.get('scheduler', 'simple')}|cfg={CFG}")
+        model_fp = latent_cache.model_fingerprint(model)
+        vae_fp = latent_cache.vae_fingerprint(vae)
+        clip_fp = latent_cache.clip_fingerprint(clip)
         segmented_active = (ref_sync == "segmented") and bool(rv or ra) and n_frames_total > 0
         if (ref_sync == "segmented") and (rv or ra) and not segmented_active:
             h3ff.vlog("[H3-FaceResample] ref_sync=segmented but total frame count unknown, "
@@ -650,7 +767,6 @@ class H3FaceResample(io.ComfyNode):
 
         _face_tracking = str((pack.get("meta") or {}).get("face_tracking") or "single")
 
-        # 避免"每个采样块重载一次 TE" 。
         text_cond_cache = {}
         text_cond_hits = 0
 
@@ -661,29 +777,61 @@ class H3FaceResample(io.ComfyNode):
             f0_first = int(group[0]["f0"])
             for gst in group:
                 gst["canvas_off"] = int(gst["crop_off"]) 
-            rows_in = crop_images[off:off + K].float()
-            block_seeds = [int(seed) + 1 + gi_base + bi for bi in range(len(blocks))]
+            rows_in = crop_images[off:off + K].to(torch.float16).float()
+            block_seeds = [int(seed) + 1 + gi_base for _ in range(len(blocks))]
+
+            # ---- 自动身份锚: 该身份最清晰一帧 → <Picture N> 参考图 (软失败可跳过) ----
+            ri_eff = list(ri)
+            id_tag = None
+            if identity_ref:
+                _pick = _pick_sharpest_row(rows_in)
+                if _pick is not None:
+                    _gi, _frame = _pick
+                    try:
+                        _entry = (h3_sampler._prepare_ref_images(
+                                      [_frame.unsqueeze(0).float()], vae, device, res, res, crop_mode)
+                                  or [None])[0]
+                        if _entry and _entry.get("pixel") is not None:
+                            ri_eff.append(_entry)
+                            id_tag = f"<Picture {len(ri_eff)}>"
+                            h3ff.log(f"[H3-FaceResample] identity_ref: id{tid} anchor = row {_gi} "
+                                     f"(sharpest of {K}) → {id_tag}\n"
+                                     f"[H3-FaceResample] 身份锚: 身份{tid} 锚定帧 = 第 {_gi} 行 "
+                                     f"(共 {K} 行中最清晰) → {id_tag}")
+                    except Exception as _e:
+                        h3ff.warn(f"[H3-FaceResample] identity_ref build failed ({_e}) — "
+                                  f"continuing without anchor\n"
+                                  f"[H3-FaceResample] 身份锚构建失败 ({_e}) — 不使用锚定继续")
+
+            fix_sig_id = fix_sig
 
             block_meta = []
             hash_lines = []
             for bi, (b0, b1, _ctx) in enumerate(blocks):
                 g0, g1 = f0_first + b0, f0_first + b1
                 prompt_b, src_name = _prompt_lookup(g0, g1)
+                prompt_b = _compose_face_prompt(prompt_b, face_prompt, prompt_mode, id_tag)
                 s_r = (g0 / n_frames_total) if segmented_active else 0.0
                 e_r = (g1 / n_frames_total) if segmented_active else 0.0
-                hash_lines.append(prompt_b + "\x00" + f"{s_r:.6f}->{e_r:.6f}" + f"|{len(ri)},{len(rv)},{len(ra)}")
+                hash_lines.append(prompt_b + "\x00" + f"{s_r:.6f}->{e_r:.6f}" + f"|{len(ri_eff)},{len(rv)},{len(ra)}")
                 block_meta.append({"prompt": prompt_b, "src": src_name, "s_r": s_r, "e_r": e_r})
 
-            rmeta = {"rows_hash": _md5_bytes(rows_in.contiguous().to(torch.float16).numpy().tobytes()),
+            rmeta = {"rows_hash": latent_cache.tensor_sig(rows_in.contiguous(), 65536),
                      "seg_frames": int(K), "latent_w": int(res), "latent_h": int(res),
                      "a_lat_hash": _md5_bytes(a_lat.detach().float().cpu().numpy().tobytes()),
                      "ref_fps": int(ref_fps), "lock_audio": bool(lock_a),
                      "seed": _md5_bytes(str(block_seeds).encode()),
-                     "sigmas_hash": _md5_bytes(fix_sig.cpu().numpy().tobytes()),
+                     "sigmas_hash": _md5_bytes(fix_sig_id.detach().cpu().numpy().tobytes()),
+                     "sigma_scale": "1.0000",
+                     "noise_v": 2,
+                     "prompt_v": 2,
+                     "identity_ref_fp": (latent_cache.tensor_sig(ri_eff[-1]["pixel"], 4096)
+                                         if id_tag is not None else None),
                      "window_prompt_hash": _md5_bytes("\n".join(hash_lines).encode("utf-8")),
                      "conditions_hash": conditions_hash, "sampler_tag": sampler_tag,
                      "plan_hash": _md5_bytes(str(blocks).encode()),
-                     "chunk_frames": int(chunk_budget), "context_frames": int(ctx_budget)}
+                     "chunk_frames": int(chunk_budget), "context_frames": int(ctx_budget),
+                     "model_fp": model_fp, "vae_fp": vae_fp, "clip_fp": clip_fp}
             cname = f"resample_grp{pi:03d}.pt"
             rows = None
             if cache_dir:
@@ -724,7 +872,7 @@ class H3FaceResample(io.ComfyNode):
                     enc0 = f0_first + b0 - ctx
                     prompt_b = block_meta[bi]["prompt"]
                     src_name = block_meta[bi]["src"]
-                    blk_ri, blk_rv, blk_ra = ri, rv, ra
+                    blk_ri, blk_rv, blk_ra = ri_eff, rv, ra
                     if segmented_active:
                         try:
                             blk_rv = h3_sampler._slice_ref_videos_for_segment(
@@ -831,15 +979,15 @@ class H3FaceResample(io.ComfyNode):
 
 
                     payload = h3_conditioning.build_conditioning_payload(
-                        seed=int(rt.get("seed", 0)) + 1 + gi_base + bi,
+                        seed=int(rt.get("seed", 0)) + 1 + gi_base,
                         frame_count=b1 - b0,
                         ref_img_data=blk_ri,
                         ref_vid_data=blk_rv,
                         ref_aud_latents=[a["latent"] for a in blk_ra if a.get("latent") is not None],
                         fps=ref_fps)
-                    
-                    # ---- 文本条件缓存: 同 prompt + 同参考素材跳过 Qwen3-VL 编码 ----
-                    _cond_key = _text_cond_fingerprint(prompt_b, blk_ri, blk_rv, blk_ra)
+
+                    # ---- 文本条件缓存: 同 prompt + 同参考素材 + 同 CLIP 权重跳过 Qwen3-VL 编码 ----
+                    _cond_key = _text_cond_fingerprint(prompt_b, blk_ri, blk_rv, blk_ra) + "|" + str(clip_fp)
                     _cond_hit = text_cond_cache.get(_cond_key)
                     if _cond_hit is not None:
                         positive = _cond_hit
@@ -860,7 +1008,7 @@ class H3FaceResample(io.ComfyNode):
                     try:
                         if rt.get("sampler_obj") is not None:
                             out_s = comfy.sample.sample_custom(
-                                model, noise, CFG, rt["sampler_obj"], fix_sig, positive, [], latent_i,
+                                model, noise, CFG, rt["sampler_obj"], fix_sig_id, positive, [], latent_i,
                                 noise_mask=mask, disable_pbar=False, seed=s)
                         else:
                             ks = comfy.samplers.KSampler(
@@ -869,7 +1017,7 @@ class H3FaceResample(io.ComfyNode):
                                 scheduler=rt.get("scheduler", "simple"),
                                 denoise=1.0, model_options=model.model_options)
                             out_s = ks.sample(noise, positive, [], cfg=CFG, latent_image=latent_i,
-                                              denoise_mask=mask, sigmas=fix_sig, callback=None,
+                                              denoise_mask=mask, sigmas=fix_sig_id, callback=None,
                                               disable_pbar=False, seed=s, force_full_denoise=True)
                         v_i, _ = h3_conditioning.unpack_nested_latent({"samples": out_s})
                     except Exception as e:
@@ -882,9 +1030,29 @@ class H3FaceResample(io.ComfyNode):
                                            f"{None if v_i is None else tuple(v_i.shape)}"
                                            f"\n[H3-FaceResample] 输出形状异常: "
                                            f"{None if v_i is None else tuple(v_i.shape)}")
-                    prev_v = v_i.detach()      
-                    _prev_enc_real = enc_real  
-                    px_i = vae.decode(v_i)
+                    prev_v = v_i.detach()
+                    _prev_enc_real = enc_real
+                    try:
+                        px_i = vae.decode(v_i)
+                    except Exception as _oom:
+                        if not isinstance(_oom, comfy.model_management.OOM_EXCEPTION):
+                            raise
+                        h3ff.warn(f"[H3-FaceResample] VAE decode OOM (identity {tid} block {bi + 1}) — "
+                                  f"flushing cache and retrying\n"
+                                  f"[H3-FaceResample] VAE 解码 OOM (身份 {tid} 块 {bi + 1}) — "
+                                  f"清空缓存后重试")
+                        comfy.model_management.soft_empty_cache()
+                        try:
+                            px_i = vae.decode(v_i)
+                        except Exception as _oom2:
+                            if not isinstance(_oom2, comfy.model_management.OOM_EXCEPTION):
+                                raise
+                            if hasattr(vae, "decode_tiled"):
+                                h3ff.warn("[H3-FaceResample] retrying with tiled decode (slower, tile seams possible)\n"
+                                          "[H3-FaceResample] 改用分块解码重试 (较慢, 可能有拼接缝)")
+                                px_i = vae.decode_tiled(v_i)
+                            else:
+                                raise
                     if px_i.dim() == 4:
                         px_i = px_i.unsqueeze(1)
 
@@ -897,7 +1065,6 @@ class H3FaceResample(io.ComfyNode):
                               f"补{pad}帧→{enc_legal} (17n+5, 上下文 {ctx}) 保留 {int(px_i.shape[0])}, "
                               f"参考({len(blk_ri)}图/{len(blk_rv)}视频/{len(blk_ra)}音频), 提示词: {src_name}")
                     del base_lat, audio_blk, latent_i, noise, out_s, v_i, px_i
-                    comfy.model_management.soft_empty_cache()
                 rows = torch.cat(blk_parts, dim=0).contiguous()
                 if int(rows.shape[0]) != K:
                     raise RuntimeError(f"[H3-FaceResample] identity {tid} row accounting mismatch: "
@@ -917,14 +1084,14 @@ class H3FaceResample(io.ComfyNode):
                 sub_rows = rows[_cur:_cur + gk]
                 if color_match:
                     goff = int(gst["crop_off"])
-                    ref_rows = crop_images[goff:goff + gk].float()
+                    ref_rows = crop_images[goff:goff + gk].to(torch.float16).float()
                     shift = float((sub_rows.mean(dim=(0, 1, 2)) - ref_rows.mean(dim=(0, 1, 2))).abs().max())
                     sub_rows = _color_match_rows(sub_rows, ref_rows)
                     h3ff.vlog(f"[H3-FaceResample] identity {gst.get('track_id', 0)} sub [{gst['f0']},{gst['f1']}) color match: "
                               f"max mean drift {shift * 100:.2f}% corrected\n"
                               f"[H3-FaceResample] 身份 {gst.get('track_id', 0)} 子轨 [{gst['f0']},{gst['f1']}) 色彩匹配: "
                               f"已修正最大通道均值漂移 {shift * 100:.2f}%")
-                canvas_rows.append(sub_rows.contiguous())
+                canvas_rows.append(sub_rows.contiguous().to(torch.float16))
                 _cur += gk
             comfy.model_management.soft_empty_cache()
 
@@ -932,8 +1099,9 @@ class H3FaceResample(io.ComfyNode):
         if int(px.shape[0]) != int(pack.get("n_crop_rows") or 0):
             raise RuntimeError("[H3-FaceResample] canvas row accounting mismatch\n[H3-FaceResample] 画布行数账目不符")
         h3ff.log(f"[H3-FaceResample] done: canvas {tuple(px.shape)} ({int(px.shape[0])} rows, "
-                 f"same row structure as crop_images)\n"
-                 f"[H3-FaceResample] 完成: 画布 {tuple(px.shape)} ({int(px.shape[0])} 行, 与 crop_images 行结构一致)")
+                 f"same row structure as crop_images, fp16 resident)\n"
+                 f"[H3-FaceResample] 完成: 画布 {tuple(px.shape)} ({int(px.shape[0])} 行, "
+                 f"与 crop_images 行结构一致, fp16 驻留)")
         if text_cond_hits:
             h3ff.log(f"[H3-FaceResample] text-cond cache: {len(text_cond_cache)} unique combo(s), "
                      f"{text_cond_hits} block(s) reused, Qwen3-VL encoded once\n"

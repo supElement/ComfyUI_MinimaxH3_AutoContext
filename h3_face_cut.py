@@ -184,7 +184,7 @@ def _fps_eff(a_lat, F_expect, seg):
     rt = seg.get("h3_runtime") if isinstance(seg.get("h3_runtime"), dict) else {}
     return max(1.0, float(rt.get("fps") or seg.get("fps") or 24.0))
 
-# ---- 裁剪窗口放大: 可选放大模型 (upscale_models), 默认 lanczos ----
+# ---- 裁剪窗口放大: 可选放大模型 (upscale_models), 默认 bicubic ----
 def _list_upscale_models():
     try:
         return folder_paths.get_filename_list("upscale_models") or []
@@ -194,7 +194,7 @@ def _list_upscale_models():
 
 def _load_sr_model(rel):
     """加载放大模型: 直接走 spandrel (ComfyUI 官方 UpscaleModelLoader 的实际加载器,
-    requirements 自带依赖)。仅接受图像超分模型, 视频/插帧类模型报错回退 lanczos。"""
+    requirements 自带依赖)。仅接受图像超分模型, 视频/插帧类模型报错回退 bicubic。"""
     try:
         import spandrel
         from spandrel import ImageModelDescriptor
@@ -365,30 +365,118 @@ def _window_centers(boxes, S_seq, W, H):
         py.append(float(min(max(cy, lo_y), hi_y)))
     return [[a, b] for a, b in zip(px, py)]
 
-def _sample_windows(frames, masks_full, use, centers, S_seq):
-    """以逐帧窗口中心/边长提取 S_t×S_t 裁剪与窗口 mask (同窗同变换 → 对齐不变)。
-    grid_sample 双线性; 帧 padding replicate, mask 补 0。S_seq 逐帧 (平滑后)。"""
+def _blur_chw(x, sigma):
+    """[C,H,W] float 高斯模糊 (σ, px)。σ<=0 直通; kernel=2*ceil(3σ)+1, replicate padding。"""
+    s = float(sigma)
+    if s <= 0.0:
+        return x
+    r = max(1, int(round(3.0 * s)))
+    k = torch.arange(-r, r + 1, dtype=x.dtype, device=x.device)
+    k = torch.exp(-(k * k) / (2.0 * s * s))
+    k = k / k.sum()
+    C = int(x.shape[0])
+    kw = k.view(1, 1, -1, 1).expand(C, 1, -1, 1)
+    kh = k.view(1, 1, 1, -1).expand(C, 1, 1, -1)
+    xp = torch.nn.functional.pad(x[None], (r, r, 0, 0), mode="replicate")
+    xp = torch.nn.functional.conv2d(xp, kw, groups=C)
+    xp = torch.nn.functional.pad(xp, (0, 0, r, r), mode="replicate")
+    return torch.nn.functional.conv2d(xp, kh, groups=C)[0]
+
+def _blur_batch(crops, sigma, batch=32):
+    if float(sigma) <= 0.0 or not len(crops):
+        return crops
+    dev = comfy.model_management.get_torch_device()
+    s, r = float(sigma), max(1, int(round(3.0 * float(sigma))))
+    k = torch.exp(-(torch.arange(-r, r + 1, dtype=torch.float32, device=dev) ** 2) / (2.0 * s * s))
+    k = k / k.sum()
+    out = [None] * len(crops)
+    groups = {}
+    for i, c in enumerate(crops):
+        groups.setdefault(int(c.shape[1]), []).append(i)
+    for _S, idxs in groups.items():
+        i0, bs = 0, max(1, int(batch))
+        while i0 < len(idxs):
+            try:
+                sel = idxs[i0:i0 + bs]
+                x = torch.stack([crops[j] for j in sel]).to(dev)
+                B, C = int(x.shape[0]), int(x.shape[1])
+                kw = k.view(1, 1, -1, 1).expand(C, 1, -1, 1)
+                kh = k.view(1, 1, 1, -1).expand(C, 1, 1, -1)
+                xp = torch.nn.functional.pad(x, (r, r, 0, 0), mode="replicate")
+                xp = torch.nn.functional.conv2d(xp, kw, groups=C)
+                xp = torch.nn.functional.pad(xp, (0, 0, r, r), mode="replicate")
+                x = torch.nn.functional.conv2d(xp, kh, groups=C).cpu()
+
+                for jj, j in enumerate(sel):
+                    out[j] = x[jj]
+                i0 += len(sel)
+                del x
+            except comfy.model_management.OOM_EXCEPTION:
+                if bs <= 1:
+                    raise
+                bs = max(1, bs // 2)
+                comfy.model_management.soft_empty_cache()
+    return out
+
+
+
+def _sample_windows(frames, masks_full, use, centers, S_seq, dev=None):
+    """GPU 批量版: 按 S 分组, 帧以 uint8 上卡、卡上转 float, 整批 grid_sample。
+    mask 轻量, 保留 CPU 单帧路径。接口与 CPU 版完全一致。"""
+    if dev is None:
+        dev = comfy.model_management.get_torch_device()
     H, W = int(frames.shape[1]), int(frames.shape[2])
-    crops, win_masks = [], []
-    for k, j in enumerate(use):
-        S = int(S_seq[k])
-        cx, cy = float(centers[k][0]), float(centers[k][1])
-        ax = torch.arange(S, dtype=torch.float32)
-        xs = ((cx - S * 0.5 + 0.5 + ax) / W) * 2.0 - 1.0
-        ys = ((cy - S * 0.5 + 0.5 + ax) / H) * 2.0 - 1.0
-        grid = torch.stack([xs[None, :].expand(S, S), ys[:, None].expand(S, S)],
-                           dim=-1).unsqueeze(0)  # [1,S,S,2]
-        fr = torch.from_numpy(frames[j]).permute(2, 0, 1).float().unsqueeze(0)
-        crops.append(torch.nn.functional.grid_sample(
-            fr, grid, mode="bilinear", padding_mode="border", align_corners=False)[0])  # [3,S,S]
+    crops = [None] * len(use)
+    win_masks = [None] * len(use)
+    groups = {}
+    for k in range(len(use)):
+        groups.setdefault(int(S_seq[k]), []).append(k)
+    ax_cache = {}
+    for S, ks in groups.items():
+        i0, bs = 0, max(1, min(16, len(ks)))
+        while i0 < len(ks):
+            try:
+                sub = ks[i0:i0 + bs]
+                grids = []
+                for k in sub:
+                    if S not in ax_cache:
+                        ax_cache[S] = torch.arange(S, dtype=torch.float32)
+                    ax = ax_cache[S]
+                    cx, cy = float(centers[k][0]), float(centers[k][1])
+                    xs = ((cx - S * 0.5 + 0.5 + ax) / W) * 2.0 - 1.0
+                    ys = ((cy - S * 0.5 + 0.5 + ax) / H) * 2.0 - 1.0
+                    grids.append(torch.stack([xs[None, :].expand(S, S),
+                                              ys[:, None].expand(S, S)], dim=-1))
+                g = torch.stack(grids, dim=0).to(dev)                     # [B,S,S,2]
+                fr = torch.from_numpy(
+                    frames[[use[k] for k in sub]]                         # numpy 花式索引取 B 帧
+                ).to(dev).permute(0, 3, 1, 2).float()                     # [B,3,H,W]
+                c = torch.nn.functional.grid_sample(
+                    fr, g, mode="bilinear", padding_mode="border",
+                    align_corners=False).cpu()                            # [B,3,S,S]
+                for jj, k in enumerate(sub):
+                    crops[k] = c[jj]
+                i0 += len(sub)
+                del fr, c
+            except comfy.model_management.OOM_EXCEPTION:
+                if bs <= 1:
+                    raise
+                bs = max(1, bs // 2)
+                comfy.model_management.soft_empty_cache()
+    for k, j in enumerate(use):                                           # masks: CPU, 轻量
         m = masks_full[j] if (masks_full is not None and j < len(masks_full)) else None
         if m is not None:
-            mt = torch.from_numpy(m).float().unsqueeze(0).unsqueeze(0)  # [1,1,H,W]
-            win_masks.append(torch.nn.functional.grid_sample(
-                mt, grid, mode="bilinear", padding_mode="zeros", align_corners=False)[0])  # [1,S,S]
-        else:
-            win_masks.append(None)
+            S = int(S_seq[k]); cx, cy = float(centers[k][0]), float(centers[k][1])
+            ax = torch.arange(S, dtype=torch.float32)
+            xs = ((cx - S * 0.5 + 0.5 + ax) / W) * 2.0 - 1.0
+            ys = ((cy - S * 0.5 + 0.5 + ax) / H) * 2.0 - 1.0
+            grid = torch.stack([xs[None, :].expand(S, S),
+                                ys[:, None].expand(S, S)], dim=-1).unsqueeze(0)
+            mt = torch.from_numpy(m).float().unsqueeze(0).unsqueeze(0)
+            win_masks[k] = torch.nn.functional.grid_sample(
+                mt, grid, mode="bilinear", padding_mode="zeros", align_corners=False)[0]
     return crops, win_masks
+
 
 def _partition_appearance(sm_sz, S_seq, res, scale_split, skip_thr):
     """一次出现内的最优分段 (DP)。v20.2: gsum 改前缀和 O(1) 取段代价 + 段长上限 _SEG_MAX,
@@ -434,7 +522,7 @@ def _partition_appearance(sm_sz, S_seq, res, scale_split, skip_thr):
 
 def _build_subtracks_for_track(boxes_seq, frames, H, W, res, expand_f, scale_split,
                                skip_ratio, gap_tol, tid, masks_full=None,
-                               size_override=None, shot_id=None, sr_model=None, sr_batch=4, pbar=None):
+                               size_override=None, shot_id=None, sr_model=None, sr_batch=4, pre_blur=0.0, pbar=None):
     """单条身份轨迹 → (subtracks, crop_parts, n_rows)。
     分工: SeC-4B 身份/mask, YOLO 逐帧实测尺寸; 本函数只做应用层几何:
     DP 分段 (skip 边界) → 逐帧平滑窗口 (S_t 与中心均按整条出现区间计算并时序平滑)
@@ -535,6 +623,11 @@ def _build_subtracks_for_track(boxes_seq, frames, H, W, res, expand_f, scale_spl
                 if win_masks[i] is None:
                     win_masks[i] = win_masks[min(have, key=lambda k: abs(k - i))]
 
+        # crops, win_masks = _sample_windows(frames, masks_full, idxs, centers, S_seq)
+        if float(pre_blur) > 0.0:
+            crops = _blur_batch(crops, float(pre_blur))
+        have = [i for i, m in enumerate(win_masks) if m is not None]
+
         proc = [None] * len(crops)
         if sr_model is not None:
             TOL = max(8, int(_SR_BUCKET))
@@ -559,27 +652,24 @@ def _build_subtracks_for_track(boxes_seq, frames, H, W, res, expand_f, scale_spl
                     x = _sr_pass(sr_model, x, batch_size=sr_batch)
                     n_pass += 1
                 ratio = float(int(x.shape[1])) / float(_K)
+                _dev = comfy.model_management.get_torch_device()
                 for _j, _i in enumerate(_idxs_g):
                     S_i = int(crops[_i].shape[1])
                     S2 = int(round(S_i * ratio))
-                    f_i = x[_j, :S2, :S2].contiguous()
+                    f_i = x[_j, :S2, :S2].contiguous()          # [S2,S2,3] HWC, CPU
                     if (int(f_i.shape[0]), int(f_i.shape[1])) != (res, res):
-                        f_i = comfy.utils.common_upscale(
-                            f_i.unsqueeze(0).movedim(-1, 1).contiguous(), res, res,
-                            "lanczos", "disabled").movedim(1, -1)[0]
+                        ft = f_i.permute(2, 0, 1).unsqueeze(0).to(_dev)   # [1,3,S2,S2]
+                        ft = torch.nn.functional.interpolate(
+                            ft, size=(res, res), mode="bicubic", antialias=True)
+                        f_i = ft.clamp(0.0, 1.0)[0].permute(1, 2, 0).cpu()
                     proc[_i] = f_i
+
                 if pbar is not None:
                     pbar.update(len(_idxs_g))
         else:
-            for _ci, _c in enumerate(crops):
-                g = _c.unsqueeze(0).permute(0, 2, 3, 1) / 255.0
-                if (int(g.shape[1]), int(g.shape[2])) != (res, res):
-                    g = comfy.utils.common_upscale(
-                        g.movedim(-1, 1).contiguous(), res, res,
-                        "lanczos", "disabled").movedim(1, -1)
-                proc[_ci] = g[0]
-                if pbar is not None:
-                    pbar.update(1)
+            proc = _gpu_resize_batch(crops, res)
+            if pbar is not None:
+                pbar.update(len(crops))
 
         crop_t = torch.stack(proc, dim=0).contiguous()        
 
@@ -589,12 +679,13 @@ def _build_subtracks_for_track(boxes_seq, frames, H, W, res, expand_f, scale_spl
                  "face_med": round(med, 1), "skip": False,
                  "centers": centers, "crop_off": n_rows}
         if have:
-            mts = []
-            for m in win_masks:
-                mt = torch.nn.functional.interpolate(
-                    m.unsqueeze(0), size=(res, res), mode="bilinear", align_corners=False)[0]
-                mts.append(mt)
-            m_t = torch.stack(mts, dim=0)  # [K,1,res,res]
+            m_t = torch.stack([
+                torch.nn.functional.interpolate(
+                    m[None], size=(res, res), mode="bilinear", align_corners=False)[0]
+                for m in win_masks
+            ], dim=0)  # [K,1,res,res]
+
+
             raw_max = float(max(float(m.max()) for m in win_masks))
             entry["masks"] = m_t[:, 0].clamp(0.0, 1.0).mul(255.0).to(torch.uint8).contiguous()
             if int(entry["masks"].max()) == 0:
@@ -647,6 +738,53 @@ def _fill_mask_rows(subtracks, cursor, res):
         mask_rows = mask_rows[:1]
     return mask_rows
 
+def _track_work(boxes_seq, gap_tol):
+    """一条身份轨迹的实际处理帧数 (与 _build_subtracks_for_track 的 gap_tol 区间合并
+    逐字一致): 每个出现区间内所有帧 (含插值帧) 恰好计一次进度。"""
+    det_idx = [i for i, b in enumerate(boxes_seq) if b is not None]
+    if not det_idx:
+        return 0
+    total, a, b = 0, det_idx[0], det_idx[0]
+    for i in det_idx[1:]:
+        if i - b - 1 <= int(gap_tol):
+            b = i
+        else:
+            total += b - a + 1
+            a = b = i
+    return total + (b - a + 1)
+
+def _gpu_resize_batch(crops, res, batch=16):
+    """[3,S,S] float 0..255 → [res,res,3] float 0..1。按 S 分组(S_t 逐帧可变),
+    GPU bicubic(antialias) 分批, OOM 减半批, 结果回 CPU。"""
+    if not len(crops):
+        return []
+    dev = comfy.model_management.get_torch_device()
+    out = [None] * len(crops)
+    groups = {}
+    for i, c in enumerate(crops):
+        groups.setdefault(int(c.shape[1]), []).append(i)
+    for _S, idxs in groups.items():
+        i0, bs = 0, max(1, int(batch))
+        while i0 < len(idxs):
+            try:
+                sel = idxs[i0:i0 + bs]
+                x = torch.stack([crops[j] for j in sel]).to(dev) / 255.0
+                x = torch.nn.functional.interpolate(
+                    x, size=(int(res), int(res)),
+                    mode="bicubic", antialias=True).clamp(0.0, 1.0)
+                for jj, j in enumerate(sel):
+                    out[j] = x[jj].permute(1, 2, 0).cpu()
+                i0 += len(sel)
+                del x
+            except comfy.model_management.OOM_EXCEPTION:
+                if bs <= 1:
+                    raise
+                bs = max(1, bs // 2)
+                comfy.model_management.soft_empty_cache()
+    return out
+
+
+
 def _build_pack(a_lat, subtracks, cursor, multi_track_flag, meta, fps_eff):
     return {"version": 7, "multi_track": bool(multi_track_flag), "a_lat": a_lat,
             "subtracks": subtracks, "fps_eff": float(fps_eff),
@@ -691,8 +829,12 @@ class H3FaceCut(io.ComfyNode):
                 io.Float.Input("shot_threshold", default=40.0, min=5.0, max=100.0, step=0.5, tooltip="PySceneDetect ContentDetector threshold (higher = fewer cuts).\n"
                                "PySceneDetect ContentDetector 阈值 (越高切点越少)。"),
                 io.Combo.Input("upscale_model", options=(["None"] + _list_upscale_models()), default="None",
-                               tooltip="Optional upscale model (ComfyUI/models/upscale_models) for face crops. None = lanczos only. \n"
-                                       "可选放大模型 (upscale_models 目录), None = 仅 lanczos (原行为)。"),
+                               tooltip="Optional upscale model (ComfyUI/models/upscale_models) for face crops. None = bicubic only. \n"
+                                       "可选放大模型 (upscale_models 目录), None = 仅 bicubic (原行为)。"),
+                io.Float.Input("pre_blur", default=0.0, min=0.0, max=8.0, step=0.5,
+                    tooltip="Gaussian blur (sigma, source-window px) applied to each crop BEFORE "
+                            "SR/bicubic upscale; 0 = off. Softens source noise & interpolation "
+                            "jaggies\n放大/SR 前对裁剪窗口施加高斯模糊 (σ, 源窗口像素); 0 = 关闭"),
 
                 io.Int.Input("res", default=512, min=256, max=2048, step=32, tooltip="Canvas side length\n画布边长"),
                 io.Int.Input("expand", default=20, min=0, max=100, tooltip="Crop window margin % around the detected face box\n围绕检测面部外框的裁剪窗口余量%"),
@@ -735,7 +877,7 @@ class H3FaceCut(io.ComfyNode):
     def execute(cls, latent=None, vae=None, face_model="", yolo_threshold=0.3, yolo_batch=16,
                 shot_threshold=40.0, upscale_model="None", res=512, expand=20, skip_ratio=_SKIP_RATIO,
                 sec_model="None", sec_threshold=0.3, max_identities=6,
-                unload_main_models=True, sr_batch=4, enable_cache=True, clear_cache=False,
+                unload_main_models=True, pre_blur=0.0, sr_batch=4, enable_cache=True, clear_cache=False,
                 images=None, info=None) -> io.NodeOutput:
         shot_detect = True   
         shot_active = shot_detect and _has_scenedetect()
@@ -825,10 +967,40 @@ class H3FaceCut(io.ComfyNode):
             except Exception:
                 cache_dir = ""
 
+        def _file_stat_sig(p):
+            """同名模型文件被替换 (重新下载/更新) 的廉价检测: 大小+mtime。"""
+            try:
+                if p and os.path.isfile(p):
+                    st = os.stat(p)
+                    return f"{int(st.st_size)}:{int(st.st_mtime)}"
+            except Exception:
+                pass
+            return None
+
+        _sr_fp_path = None
+        try:
+            if upscale_model and str(upscale_model) != "None":
+                _sr_fp_path = folder_paths.get_full_path("upscale_models", str(upscale_model))
+        except Exception:
+            _sr_fp_path = None
+        _sec_fp_path = None
+        if face_tracking == "multi_sec":
+            try:
+                _sec_fp_path, _ = h3ff._resolve_sec_model_path(str(sec_model))
+            except Exception:
+                _sec_fp_path = None
+
+        # v2 指纹补全: VAE 权重 (解码出的裁剪行直接受其影响) + 模型文件实体
+        # (同名换文件不再静默命中) — 新键缺失自动使旧缓存失效一次
         _fp_common = {"win_v": 2,
                       "face_model": model_rel, "yolo_threshold": float(yolo_threshold),
+                      "yolo_file": _file_stat_sig(model_path),
                       "shot_active": bool(shot_active), "shot_threshold": float(shot_threshold),
                       "upscale_model": str(upscale_model or "None"),
+                      "pre_blur": float(pre_blur),
+                      "sr_file": _file_stat_sig(_sr_fp_path),
+                      "sec_file": _file_stat_sig(_sec_fp_path),
+                      "vae_fp": latent_cache.vae_fingerprint(vae) if vae is not None else None,
                       "res": int(res), "expand": int(expand),
                       "gap_tol": int(gap_tol), "scale_split": float(scale_split),
                       "skip_ratio": float(skip_ratio), "face_tracking": str(face_tracking),
@@ -1002,8 +1174,8 @@ class H3FaceCut(io.ComfyNode):
                 h3ff.log(f"[H3-FaceCut] crop upscale: {sr_name} (SR chain -> {res}px, max 2 passes)\n"
                          f"[H3-FaceCut] 裁剪放大: {sr_name} (SR 链 → {res}px, 最多 2 次)")
             except Exception as e:
-                h3ff.warn(f"[H3-FaceCut] upscale model load failed ({e}) — falling back to lanczos\n"
-                          f"[H3-FaceCut] 放大模型加载失败 ({e}) — 回退 lanczos")
+                h3ff.warn(f"[H3-FaceCut] upscale model load failed ({e}) — falling back to bicubic\n"
+                          f"[H3-FaceCut] 放大模型加载失败 ({e}) — 回退 bicubic")
                 sr_model = None
 
         if tracks:
@@ -1032,13 +1204,15 @@ class H3FaceCut(io.ComfyNode):
 
         subtracks, crop_parts = [], []
         cursor = 0
-        crop_pbar = comfy.utils.ProgressBar(F_expect) if h3ff._HAS_COMFY else None
+        _total_work = sum(_track_work(t[1], int(gap_tol)) for t in src_tracks)
+        crop_pbar = comfy.utils.ProgressBar(max(1, _total_work)) if h3ff._HAS_COMFY else None
+
         for tid, boxes_seq, masks_full, sz_override in src_tracks:
             sts, cps, n_rows = _build_subtracks_for_track(
                 boxes_seq, frames, H, W, res, expand_f, float(scale_split), float(skip_ratio),
                 int(gap_tol), tid, masks_full=masks_full,
                 size_override=(sz_override if face_tracking == "multi_sec" else None),
-                shot_id=shot_id, sr_model=sr_model, sr_batch=sr_batch, pbar=crop_pbar)
+                shot_id=shot_id, sr_model=sr_model, sr_batch=sr_batch, pbar=crop_pbar, pre_blur=float(pre_blur))
 
             for st in sts:
                 if not st["skip"]:
@@ -1115,11 +1289,19 @@ class H3FaceCut(io.ComfyNode):
         if face_tracking == "multi_sec" and mz <= 0.0:
             h3ff.warn("[H3-FaceCut] WARNING: masks output all zero — SeC masks missing (check SeC logs above)\n"
                       "[H3-FaceCut] 警告: mask 输出全零 — SeC mask 缺失 (检查上方 SeC 日志)")
+
+        crop_images = crop_images.detach().to(torch.float16).float().contiguous()
+
         if cache_dir:
             latent_cache.save_blob_async(
                 cache_dir, blob,
                 {"crop_images": crop_images.detach().to(torch.float16).cpu().contiguous(),
-                 "subtracks": subtracks, "n_crop_rows": int(cursor),
-                 "multi_track": bool(multi_track_flag), "meta": meta}, fp)
+                 "subtracks": subtracks,
+                 "n_crop_rows": int(cursor),
+                 "multi_track": bool(multi_track_flag),
+                 "meta": meta},
+                fp)
             h3ff.vlog(f"[H3-FaceCut] cache save submitted (async)\n[H3-FaceCut] 缓存保存已提交 (异步)")
+
         return io.NodeOutput(crop_images.contiguous(), pack, mask_rows.contiguous(), shot_info)
+

@@ -1,6 +1,17 @@
 """
 h3_sampler.py — H3 分段推理采样器
 
+v2 优化版变更 (输出不变项 / 行为变化项分开列出):
+- C1 (缓存正确性): 段缓存键补齐 model_fp/vae_fp/clip_fp 权重指纹 —
+  换 checkpoint、换 4/8 步加速 LoRA、改精度/函数级补丁时旧缓存自动失效。
+- C3 (缓存正确性): _compute_conditions_hash / input_slice_hash 由"8x8 角落采样"
+  改为等距采样签名 — 参考素材与二采输入中后段的改动不再漏检。
+- V1 (显存峰值): 段采样结果立即下放 CPU (锚定/解码/拼接消费点全部 .to(device)
+  兼容, 与缓存命中路径既有行为一致) — 长视频所有段 latent 驻留 GPU 是峰值大头。
+- V3 (鲁棒性): 段解码 OOM 回退 — 清缓存重试一次, 仍失败且有 tiled 接口则降级。
+- S6 (速度): 参考音频切片缓存 — segmented 模式下同一参考音频的相同切片
+  不再逐段重过 audio_vae; 键含波形内容签名, 跨运行无误命中。
+
 核心改进：
 1. 运行时自动应用 h3_patches (PackedLayout + extra_conds 补丁)
 2. 使用 h3_conditioning 模块的统一 API (多帧 keyframe, ref/context 分离, encode_from_tokens_scheduled)
@@ -218,8 +229,6 @@ def _filter_refs_official(window_prompt, ref_img_data, ref_vid_data, ref_aud_lat
                   f"[H3-Auto] 警告: <Subject {s}> 未在 subject_definitions 中定义, "
                   f"无法确定对应参考图")
 
-    # if not referenced_pics:
-        # return ref_img_data, ref_vid_data, ref_aud_latents, window_prompt
         
     if not referenced_pics:
         return [], ref_vid_data, ref_aud_latents, window_prompt
@@ -276,9 +285,7 @@ def _filter_pictures_simple(prompt, ref_img_data, fmt):
     """
     all_imgs = ref_img_data or []
     mentions = [m for m in _parse_ref_mentions(prompt) if m[0] == "picture"]
-    # if not mentions:
-        # return all_imgs, prompt
-    
+
     if not mentions:
         return [], prompt
 
@@ -484,6 +491,7 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
                                 enable_cache=True,
                                 ignore_latent_hash=False,
                                 unique_id=None,
+                                graph_prompt=None,
                                 info=None,
                                 video_guide="none",
                                 semantic_bridge=False,
@@ -499,10 +507,7 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
     ctx_frames = context_frames
 
 
-    # ============================================================
-    # 第一阶段：处理视频引导（编码完整视频并裁剪参考，不生成 Keyframes）
-    # ============================================================
-    external_keyframes = []  # 稍后在第二阶段填充
+    external_keyframes = []  
     guide_indices = set()
     extra_ref_audios = []
 
@@ -526,11 +531,9 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
             else:
                 return False
 
-            # 处理音频：提取后置空，防止重复编码
             if vid_entry.get("audio") is not None:
                 vid_entry["audio"] = None
 
-            # 裁剪参考视频（方案B）
             vid_entry["video"] = clip
             return True
 
@@ -547,7 +550,6 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
         if video_guide in ["post_guide", "pre_post_guide"]:
             vid_idx = 1 if video_guide == "pre_post_guide" else 0
             if len(ref_videos) > vid_idx:
-                # 注意：这里不计算 start_idx，只处理视频，稍后在第二阶段生成 Keyframes
                 if process_guide(ref_videos[vid_idx], from_end=False, base_frame_index=0, vid_idx=vid_idx, is_pre=False):
                     guide_indices.add(vid_idx)
                     print(f"[H3-Auto] Post-guide anchor: taking first {ctx_frames} frames of video {vid_idx+1}\n[H3-Auto] 后段锚定: 取video {vid_idx+1}头部 {ctx_frames} 帧")
@@ -756,10 +758,7 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
             is_second_pass = False
             first_pass_segments = None
 
-    # ============================================================
-    # 第二阶段：根据最终确定的 total_frames 生成外部 Keyframes
-    # ============================================================
-    external_keyframes = []  # 始终为空
+    external_keyframes = []  
     if video_guide != "none" and (pre_guide_full_latent is not None or post_guide_full_latent is not None):
         print("[H3-Auto] Using padding latents for head/tail anchoring, no extra Keyframes generated\n[H3-Auto] 使用填充 Latent 进行头尾锚定，不额外生成 Keyframes")
 
@@ -768,6 +767,26 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
     all_x0 = []
     prev_x0 = None
     output_cursor = 0  
+
+    _model_fp_cache = latent_cache.model_fingerprint(model)
+    _vae_fp_cache = latent_cache.vae_fingerprint(vae) if vae is not None else None
+    _clip_fp_cache = latent_cache.clip_fingerprint(clip) if clip is not None else None
+    _graph_fp_cache = None
+    if graph_prompt:
+        try:
+            _graph_fp_cache = latent_cache.graph_weight_fingerprint(graph_prompt, unique_id)
+        except Exception as _e:
+            print(f"[H3-Auto] graph fingerprint failed, fallback to weight-only fp: {_e}\n"
+                  f"[H3-Auto] 图指纹计算失败，回退纯权重指纹: {_e}")
+    print(f"[H3-Auto] cache keys: model_fp={_model_fp_cache[:12]} "
+          f"vae_fp={str(_vae_fp_cache)[:12]} clip_fp={str(_clip_fp_cache)[:12]} "
+          f"graph_fp={(str(_graph_fp_cache)[:12] if _graph_fp_cache else 'none')}\n"
+          f"[H3-Auto] 缓存键: 模型指纹={_model_fp_cache[:12]} "
+          f"(ckpt/dtype/LoRA/采样对象) "
+          f"图指纹={(str(_graph_fp_cache)[:12] if _graph_fp_cache else 'none')} "
+          f"({'用户配置镜像' if _graph_fp_cache else '未获取hidden prompt, 已回退纯权重指纹'})")
+
+    _REF_AUDIO_SLICE_CACHE.clear()
 
     overall_pbar = comfy.utils.ProgressBar(len(chunks) * (2 if decode_output else 1))
     
@@ -826,7 +845,7 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
             last_frame if is_last_chunk else None
         )
     
-        # ----- 新增：筛选属于当前段的外部 Keyframes -----
+        # ----- 筛选属于当前段的外部 Keyframes -----
         seg_external_kfs = None
         if external_keyframes:
             seg_kfs = []
@@ -965,6 +984,10 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
             "semantic_bridge_adapter": semantic_bridge_adapter if semantic_bridge else None,
             "semantic_bridge_alpha": float(semantic_bridge_alpha) if semantic_bridge else None,
             "semantic_bridge_magnitude": semantic_bridge_magnitude if semantic_bridge else None,
+            "model_fp": _model_fp_cache,
+            "vae_fp": _vae_fp_cache,
+            "clip_fp": _clip_fp_cache,
+            "graph_fp": _graph_fp_cache,
 
         }
 
@@ -995,12 +1018,8 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
         if is_second_pass and not ignore_latent_hash:
             v_slice, _ = h3_conditioning.unpack_nested_latent(seg_latent_dict)
             if v_slice is not None:
-                flat = v_slice.flatten()
-                if flat.numel() > 0:
-                    sample = flat[:1024].cpu().numpy().tobytes()
-                    current_meta["input_slice_hash"] = hashlib.md5(sample).hexdigest()
-                else:
-                    current_meta["input_slice_hash"] = None
+                # C3: 等距采样 8192 元素 (旧实现仅前 1024 元素, 二采中后段改动漏检)
+                current_meta["input_slice_hash"] = latent_cache.tensor_sig(v_slice, 8192)
             else:
                 current_meta["input_slice_hash"] = None
     
@@ -1009,43 +1028,6 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
         if enable_cache and cache_dir and not force_regenerate:
             cached_samples, cached_x0 = latent_cache.load_segment_latent(
                 cache_dir, idx, current_meta)
-        
-        # # ===== 调试打印：紧贴推理之前 =====
-        # print(f"[H3-Auto] 段 {idx+1} 最终输入状态:")
-        # print(f"  - video_guide: {video_guide}")
-        # print(f"  - pre_guide_full_latent is None? {pre_guide_full_latent is None}")
-        # print(f"  - post_guide_full_latent is None? {post_guide_full_latent is None}")
-        # print(f"  - 过滤后参考视频数量: {len(seg_ref_vid)}")
-        # print(f"  - 外部 Keyframes: {len(seg_external_kfs) if seg_external_kfs else 0}")
-
-        # print(f"[H3-Auto]  拼接锚定详情:")
-        # if head_overlap_video is not None:
-            # # 计算实际复制的 token 数（与 _make_h3_empty_latent 一致）
-            # head_tokens = video_latent_frames(head_overlap_frames) if head_overlap_frames > 5 else 2
-            # head_tokens = max(2, min(head_tokens, video_latent_frames(seg_frames) - 2))
-            # src_total_tokens = head_overlap_video.shape[2]  # 仅用于显示源总长度
-            # if is_first_chunk and pre_guide_full_latent is not None:
-                # src_type = "pre_guide 外部视频 (开头锚定)"
-            # else:
-                # src_type = "上一段生成结果 (接缝锚定)"
-            # print(f"    - 头部锚定: 来自 {src_type}")
-            # print(f"      源张量总 Token: {src_total_tokens}（仅参考）")
-            # print(f"      实际复制: head_tokens末尾 {head_tokens} 个 Token（对应 {head_overlap_frames} 像素帧 0~{head_overlap_frames-1}）")
-            # print(f"      写入本段开头: 像素帧 0~{head_overlap_frames-1}")
-        # else:
-            # print(f"    - 头部锚定: 无")
-
-        # if tail_overlap_video is not None:
-            # tail_tokens = video_latent_frames(tail_overlap_frames) if tail_overlap_frames > 5 else 2
-            # tail_tokens = max(2, min(tail_tokens, video_latent_frames(seg_frames) - 2))
-            # src_total_tokens = tail_overlap_video.shape[2]
-            # print(f"    - 尾部锚定: 来自 post_guide 外部视频 (结尾锚定)")
-            # print(f"      源张量总 Token: {src_total_tokens}（仅参考）")
-            # print(f"      实际复制: 开头 {tail_tokens} 个 Token（对应 {tail_overlap_frames} 像素帧）")
-            # print(f"      写入本段末尾: 像素帧 {seg_frames - tail_overlap_frames}~{seg_frames-1}")
-        # else:
-            # print(f"    - 尾部锚定: 无")
-        # # ================================   
         
         if cached_samples is not None:
             segment_latent = cached_samples
@@ -1072,8 +1054,8 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
         samples_dict = {"samples": segment_latent["samples"]}
         x0_dict = {"samples": x0} if x0 is not None else samples_dict
         prev_x0 = x0_dict
-        all_segments.append(samples_dict)
-        all_x0.append(x0_dict)
+        all_segments.append(_latent_dict_to_cpu(samples_dict))
+        all_x0.append(_latent_dict_to_cpu(x0_dict))
         output_cursor += effective_new[idx]
         overall_pbar.update(1)
     # ==================== 段循环结束 ====================
@@ -1193,35 +1175,30 @@ def _compute_conditions_hash(ref_img_data, ref_vid_data, first_frame=None, last_
     """
     计算当前段实际使用的所有外部输入条件（像素）的指纹哈希。
     只对当前段真正用到的素材取指纹，避免跨段误判。
+    C3: 由"仅首帧 8x8 角落"改为 等距采样 2048 元素 + 形状 —
+    参考图/首尾帧中部的改动不再漏检。
     """
-    import hashlib
-    import numpy as np
-    
     hasher = hashlib.md5()
-    
+
     if not ref_img_data and not ref_vid_data and first_frame is None and last_frame is None:
         return "no_external_conditions"
-    
+
     if first_frame is not None:
-        sample = first_frame[0, :8, :8, :3].cpu().numpy().tobytes()
-        hasher.update(sample)
-    
+        hasher.update(latent_cache.tensor_sig(first_frame, 2048).encode())
+
     if last_frame is not None:
-        sample = last_frame[0, :8, :8, :3].cpu().numpy().tobytes()
-        hasher.update(sample)
-    
+        hasher.update(latent_cache.tensor_sig(last_frame, 2048).encode())
+
     for img_data in (ref_img_data or []):
         pixel = img_data.get("pixel")
         if pixel is not None and pixel.shape[0] > 0:
-            sample = pixel[0, :8, :8, :3].cpu().numpy().tobytes()
-            hasher.update(sample)
+            hasher.update(latent_cache.tensor_sig(pixel, 2048).encode())
     
     for vid_data in (ref_vid_data or []):
         pixel = vid_data.get("pixel")
         if pixel is not None and pixel.shape[0] > 0:
-            sample = pixel[0, :8, :8, :3].cpu().numpy().tobytes()
-            hasher.update(sample)
-    
+            hasher.update(latent_cache.tensor_sig(pixel, 2048).encode())
+
     return hasher.hexdigest()
 
 def _prepare_ref_videos(ref_videos, vae, audio_vae, device, gen_w, gen_h, fps,
@@ -1450,6 +1427,38 @@ def _encode_drive_audio(audio_vae, drive_waveform, drive_sr, start_sec, end_sec,
     return _encode_audio(audio_vae, {"waveform": wav, "sample_rate": drive_sr}, device)
 
 
+def _to_cpu_nested(t):
+    """递归下放 nested latent 结构到 CPU; 已在 CPU 的张量 detach 原样返回。"""
+    if torch.is_tensor(t):
+        if t.device.type == "cpu":
+            return t.detach()
+        return t.detach().to("cpu")
+    if isinstance(t, (list, tuple)):
+        moved = tuple(_to_cpu_nested(x) for x in t)
+        if hasattr(t, "is_nested"):
+            try:
+                return comfy.nested_tensor.NestedTensor(moved)
+            except Exception:
+                return moved
+        return moved
+    return t
+
+
+def _latent_dict_to_cpu(latent_dict):
+    """V1: 段采样结果立即下放 CPU (新 dict, 原 dict 保持不变供锚定引用)。"""
+    try:
+        if isinstance(latent_dict, dict):
+            s = latent_dict.get("samples")
+            moved = _to_cpu_nested(s)
+            if moved is not s:
+                out = dict(latent_dict)
+                out["samples"] = moved
+                return out
+    except Exception:
+        pass
+    return latent_dict
+
+
 def _decode_segment(vae, audio_vae, seg_latent, device):
     """解码一段 latent 为视频帧 + 音频波形"""
     v_lat, a_lat = h3_conditioning.unpack_nested_latent(seg_latent)
@@ -1461,15 +1470,34 @@ def _decode_segment(vae, audio_vae, seg_latent, device):
         vae_model = vae.first_stage_model
         v_dtype = next(vae_model.parameters()).dtype
         v_lat = v_lat.to(device=device, dtype=v_dtype)
+        # V3: OOM 回退 — 清缓存重试一次, 仍失败且有 tiled 接口则降级 (慢但优于崩溃)
         try:
             pixels = vae_model.decode(v_lat)
+        except comfy.model_management.OOM_EXCEPTION:
+            print("[H3-Auto] Video decode OOM — flushing cache and retrying\n"
+                  "[H3-Auto] 视频解码 OOM — 清空缓存后重试")
+            comfy.model_management.soft_empty_cache()
+            try:
+                pixels = vae_model.decode(v_lat)
+            except comfy.model_management.OOM_EXCEPTION:
+                if hasattr(vae, "decode_tiled"):
+                    print("[H3-Auto] retrying with tiled decode (slower, tile seams possible)\n"
+                          "[H3-Auto] 改用分块解码重试 (较慢, 可能有拼接缝)")
+                    pixels = vae.decode_tiled(v_lat)
+                    if pixels.dim() == 5:
+                        pixels = pixels.permute(0, 2, 3, 4, 1)
+                    if pixels.shape[0] == 1:
+                        pixels = pixels[0]
+                else:
+                    raise
+        except Exception as e:
+            print(f"[H3-Auto] Video decode failed: {e}\n[H3-Auto] 视频解码失败: {e}")
+            pixels = None
+        else:
             if pixels.dim() == 5:
                 pixels = pixels.permute(0, 2, 3, 4, 1)
             if pixels.shape[0] == 1:
                 pixels = pixels[0]
-        except Exception as e:
-            print(f"[H3-Auto] Video decode failed: {e}\n[H3-Auto] 视频解码失败: {e}")
-            pixels = None
 
     waveform = None
     if a_lat is not None and audio_vae is not None:
@@ -1583,7 +1611,6 @@ def _sample_segment(model, positive, latent_dict, steps, cfg, sampler_name, sche
     denoise_mask = latent_dict.get("noise_mask")
 
 
-    # ---- 以下原路径不变 ----
     if sampler_obj is not None:
         if sigmas is None:
             _ks = comfy.samplers.KSampler(
@@ -1893,6 +1920,9 @@ def _slice_ref_videos_for_segment(ref_vid_data, start_ratio, end_ratio, vae, aud
     return result
 
 
+_REF_AUDIO_SLICE_CACHE = {}
+
+
 def _slice_ref_audios_for_segment(ref_aud_data, start_ratio, end_ratio, audio_vae, device):
     """按当前段比例切独立参考音频，重新编码后返回 segmented ref 数据。"""
     result = []
@@ -1906,11 +1936,27 @@ def _slice_ref_audios_for_segment(ref_aud_data, start_ratio, end_ratio, audio_va
         L = wav.shape[-1]
         s = max(0, min(L, int(L * start_ratio)))
         e = max(s, min(L, int(L * end_ratio)))
+        _ck = None
+        try:
+            _ck = (id(audio_vae), id(aud_dict), int(s), int(e),
+                   latent_cache.tensor_sig(wav, 256))
+        except Exception:
+            _ck = None
+        if _ck is not None:
+            _hit = _REF_AUDIO_SLICE_CACHE.get(_ck)
+            if _hit is not None:
+                result.append(_hit)
+                continue
         sliced_aud = {"waveform": wav[..., s:e],
                       "sample_rate": aud_dict.get("sample_rate", AUDIO_SAMPLE_RATE)}
         a_lat = _encode_audio(audio_vae, sliced_aud, device)
         if a_lat is not None:
-            result.append({"latent": a_lat, "audio_dict": aud_dict})
+            _r = {"latent": a_lat, "audio_dict": aud_dict}
+            result.append(_r)
+            if _ck is not None:
+                if len(_REF_AUDIO_SLICE_CACHE) >= 512:
+                    _REF_AUDIO_SLICE_CACHE.clear()
+                _REF_AUDIO_SLICE_CACHE[_ck] = _r
     return result
 
 

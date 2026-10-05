@@ -360,7 +360,7 @@ class H3AutoContextSampler(io.ComfyNode):
                 io.Latent.Output(display_name="denoised_latent"),
                 io.Dict.Output(display_name="info"),
             ], 
-            hidden=[io.Hidden.unique_id],
+            hidden=[io.Hidden.unique_id, io.Hidden.prompt],
         )
 
     @classmethod
@@ -386,6 +386,7 @@ class H3AutoContextSampler(io.ComfyNode):
             unique_id = cls.hidden.unique_id
         except AttributeError:
             unique_id = None
+        prompt_graph = getattr(cls.hidden, "prompt", None)
             
         p = parameter or {}
         video_guide = p.get("video_guide", "none")
@@ -530,6 +531,8 @@ class H3AutoContextSampler(io.ComfyNode):
             semantic_bridge_adapter=semantic_bridge_adapter,
             semantic_bridge_alpha=semantic_bridge_alpha,
             semantic_bridge_magnitude=semantic_bridge_magnitude,
+            unique_id=unique_id,
+            graph_prompt=prompt_graph,
 
         )
         if seam_info:
