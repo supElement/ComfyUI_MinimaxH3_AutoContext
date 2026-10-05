@@ -20,8 +20,8 @@
 
 **两者关系**: 互补而非二选一。降低起始 σ 保留的是**原始裁剪**的身份 (瑕疵与色斑也一并留下); 参考图保留的是**参考图**的身份 (照常精修, 同时把脸往参考拉)。推荐 ref_images 打底 + 适度降低起始 σ 兜底。
 
-> 注: σ 阶梯变化会自动使 Resample 缓存失效, 无需手动 clear_cache。
-
+> 注: σ 阶梯变化会自动使 Resample 缓存失效, 无需手动 clear_cache。  
+      缓存磁盘占用：新增目录级上限，默认 32 GB，超出自动清理最旧文件（可用环境变量 H3_CACHE_MAX_GB 调整，设 0 关闭）
 
 三个节点串联, 对主采样节点 (Minimax_H3_AutoContext_Sampler) 的输出做面部修复:
 
@@ -69,7 +69,8 @@ PySceneDetect 是 Python 依赖而非模型: 缺失时 pip install scenedetect, 
 | images / latent | 二选一。images 模式推荐: 外部画面原生尺寸检测, 完全不碰 latent; latent 模式用 VAE 解码探针帧 |
 | yolo_threshold | 检测置信度 (默认 0.3), 漏检多就调低 |
 | shot_threshold | 分镜阈值, 越高切点越少 (默认 40) |
-| upscale_model | 可选 SR 链: 反复放大至 ≥ 画布边长 (≤2 次) 再 lanczos 到精确尺寸, 修小脸高倍放大的振铃色斑; None = 仅 lanczos |
+| upscale_model | 可选 SR 链: 反复放大至 ≥ 画布边长 (≤2 次) 再 bicubic 到精确尺寸, 修小脸高倍放大的振铃色斑; None = 仅 bicubic |
+| pre_blur | 放大前对裁剪窗口先做轻微高斯模糊，软化源视频噪点和插值锯齿，噪点重的素材建议 0.5~1.5, resampler输出可能会软化甚至模糊|
 | res / expand | 画布边长 (默认 512) / 裁剪窗口余量 % (默认 20) |
 | skip_ratio | 脸 ≥ res×此比例 → 跳过重采样 (默认 0.8) |
 | sec_model / sec_threshold / max_identities | None = 单脸 (每帧最大脸, 无 mask); 选权重 = 多身份追踪 + SeC mask; SeC-4B 追踪结束后始终自动卸载 |
@@ -87,6 +88,9 @@ PySceneDetect 是 Python 依赖而非模型: 缺失时 pip install scenedetect, 
 |---|---|
 | sigmas | 精修 σ 阶梯 (调度器输出); 步数越少修脸越保守 |
 | seed | 块采样种子 (每块自动偏移); 控件 control_after_generate 保持 fixed, 否则行缓存永不命中 |
+| face_prompt | 修脸专用提示词，专门描述想要的五官/皮肤效果。原视频的分段提示词是为整镜头写的，高 σ 重绘时反而会误导面部，用这个端口单独控制修脸方向。部分场景作用有限 |
+| prompt_mode | 修脸词与原分段提示词的组合方式：prepend：修脸词 + 原提示词（保留场景与参考声明）; replace_text：修脸词 + 仅保留参考声明（高 σ 结构修复首选）; replace_all：只用修脸词。需要使用本节点的 ref_image 时，需要引用声明，即：<Picture N>, 否则参考不会生效 |
+| identity_ref | 自动身份锚：自动挑选该人物最清晰的一帧作为参考图注入重采样，高 σ 下保持跨帧/跨块身份与外观一致（抗抖动的关键开关） |
 | color_match | 逐子轨 Reinhard 色彩匹配回源裁剪 (默认开) |
 | ref_images | 参考图; 提示词声明 Picture 标签才传递 |
 
@@ -105,7 +109,8 @@ PySceneDetect 是 Python 依赖而非模型: 缺失时 pip install scenedetect, 
 | masks (可选) | Face_Cut 的 SeC mask 直连, 行 1:1 对齐 |
 | use_sec_mask | **默认 False** (羽化框整窗贴回)。True 时 mask 来源优先级: masks 端口 > pack 内置 > 回退羽化框并警告 |
 | feather_px | 羽化像素 (默认 16, 0–128): 框模式羽化矩形边; mask 模式 = 腐蚀 feather/2 + 高斯模糊 σfeather/2 (小脸被腐蚀掏空时回退原 mask) |
-
+| lowfreq_lock | 金字塔低频锁定：画面结构和颜色锁原帧、只从重采样画布取细节纹理。仅适合低 σ 细节锐化；修崩坏脸请保持关闭，否则会保住原帧的错误五官 |
+| motion_align | 贴回位置修正：自动把重画的脸对齐回原帧面部的真实位置，运动完全跟随原视频，消除贴回后的抖动（尤其高 σ / 分段边界）。估计失败会自动回退普通贴回 |
 
 ## 五、常见问题
 
