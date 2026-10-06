@@ -95,12 +95,15 @@ def _stable_repr(x, depth=0):
 
 def model_fingerprint(model):
     """扩散模型权重指纹 — 缓存键的模型部分。
-    覆盖: checkpoint sha256 / LoRA patch 集合及其内容采样 / 函数级补丁 (object_patches,
-    以 module.qualname 标识 — 覆盖 KJ SageAttention / Sol-Attn / Low VRAM Attention 等
-    attention 补丁节点) / model_options 全量稳定表示 (覆盖 Model Attention Backend 等
-    走 transformer_options/model_options 的节点) / model_sampling 对象 (覆盖
-    ModelSamplingMiniMaxH3 — shift/v-shift 等属性直接入指纹) / 计算精度。
-    换加速 LoRA、换 checkpoint、改挂载补丁 → 指纹变化 → 旧缓存自动失效。
+    覆盖: checkpoint sha256 / LoRA patch 集合及其内容采样 (entry 字符串剥离 0x 内存
+    地址 — 同一工作流跨重启稳定) / model_sampling 对象 (覆盖 ModelSamplingMiniMaxH3
+    — shift/v-shift 等属性直接入指纹) / transformer_options 键名 / 计算精度。
+    注意 (C1-v3): 本函数不再指纹 object_patches / model_options 的运行时状态 —
+    注意力后端类节点 (KJ SageAttention / Model Attention Backend 等) 的配置变化由
+    graph_weight_fingerprint (工作流图级, 经 hidden prompt) 在主采样器段缓存上检出;
+    Face_Resample 独立模式亦以自身图指纹覆盖本地权重链; 集成模式经内容哈希传递性
+    失效 (latent_hash → rows_hash) 兜底。
+    换加速 LoRA、换 checkpoint、改 sigma 映射 → 指纹变化 → 旧缓存自动失效。
     任何一步失败都不抛错 (软失败, 返回尽力而为的指纹)。"""
     parts = []
     try:
@@ -158,13 +161,7 @@ def model_fingerprint(model):
         pass
     return hashlib.md5("|".join(parts).encode("utf-8", "ignore")).hexdigest()
 
-# ================= 图指纹: 用户配置镜像 (C1-v3) =================
-# 数据源: ComfyUI hidden prompt — 整张工作流的 API 序列化 dict:
-#   {node_id: {"class_type": str, "inputs": {端口: 控件值 或 [源node_id, 槽位]}}}
-# 纯 JSON 结构: 无内存地址、无 set 迭代序、不依赖任何节点的内部实现。
-# 哈希内容 = 权重链沿途每个节点的 (class_type + 控件值 + 拓扑); 节点 id 只作
-# 遍历去重, 不入哈希。效果: 用户不动上游控件/连线 → 图指纹不变 → 缓存命中;
-# 补丁节点内部往 model_options 塞什么、对象是否每次新建 → 完全无关。
+# ================= 图指纹 =================
 
 _WEIGHT_PORT_TYPES = {"MODEL", "VAE", "CLIP"}
 _VALUE_PORT_TYPES = {"INT", "FLOAT", "STRING", "BOOLEAN", "COMBO"}
@@ -210,7 +207,11 @@ def graph_weight_fingerprint(prompt, node_id, ports=("model", "vae", "audio_vae"
             for sec in ("required", "optional"):
                 spec = (it.get(sec) or {}).get(port)
                 if spec is not None:
-                    return spec[0] if isinstance(spec, (list, tuple)) and spec else spec
+                    if isinstance(spec, list):
+                        return "COMBO"  
+                    if isinstance(spec, tuple) and spec:
+                        return spec[0]
+                    return spec
         except Exception:
             pass
         return None
@@ -224,7 +225,7 @@ def graph_weight_fingerprint(prompt, node_id, ports=("model", "vae", "audio_vae"
                     out.append(str(oid))
             except Exception:
                 pass
-        return out
+        return sorted(out)  
 
     h = hashlib.md5()
     visited = set()
@@ -236,7 +237,7 @@ def graph_weight_fingerprint(prompt, node_id, ports=("model", "vae", "audio_vae"
             stack.append(str(v[0]))
     while stack:
         if len(visited) >= _GRAPH_MAX_NODES:
-            h.update(b"|truncated")  # 同一工作流同一拓扑 → 遍历顺序确定 → 仍稳定
+            h.update(b"|truncated")  
             break
         nid = stack.pop()
         node = prompt.get(nid)
@@ -246,7 +247,6 @@ def graph_weight_fingerprint(prompt, node_id, ports=("model", "vae", "audio_vae"
         ct = str(node.get("class_type", ""))
         inputs = node.get("inputs") or {}
 
-        # KJNodes GetNode: 无连线, 按 varname 配对跳到 SetNode 继续沿权重链向上
         if ct.lower() == "getnode":
             var = str(inputs.get("varname", ""))
             h.update(b"get\x1f" + var.encode("utf-8", "ignore") + b"\x1e")
@@ -258,10 +258,9 @@ def graph_weight_fingerprint(prompt, node_id, ports=("model", "vae", "audio_vae"
             v = inputs[k]
             if _is_link(v):
                 t = port_type(ct, str(k))
-                # 只沿权重边/控件值边继续向上; 类型查不到的未知节点保守跟进
+
                 if t is None or t in _WEIGHT_PORT_TYPES or t in _VALUE_PORT_TYPES:
                     stack.append(str(v[0]))
-                # IMAGE/LATENT/AUDIO 等数据边不影响权重链, 到此为止
             else:
                 h.update(str(k).encode("utf-8", "ignore") + b"\x1f"
                          + repr(v).encode("utf-8", "ignore") + b"\x1f")
@@ -548,7 +547,7 @@ def enforce_cache_budget(cache_dir):
                     st = os.stat(p)
                 except OSError:
                     continue
-                # 残留 tmp (>24h, 崩溃遗留) 直接清; 新 tmp 跳过 (可能正在写)
+
                 if fn.endswith(".tmp"):
                     if now - st.st_mtime > 86400:
                         try:
@@ -563,7 +562,7 @@ def enforce_cache_budget(cache_dir):
     if total <= budget:
         return
 
-    files.sort()  # mtime 升序 = 最旧优先
+    files.sort()  
     freed = 0
     removed = 0
     for mtime, size, p in files:

@@ -1,4 +1,13 @@
-"""h3_face_resample.py — 修脸第 2 步: 画布重采样 (v19.4, 全帧保留 + 编码期网格补齐 + 日志收编)
+"""h3_face_resample.py — 修脸第 2 步: 画布重采样 (v19.5, 全帧保留 + 编码期网格补齐 + 日志收编)
+
+v19.5 变更 (C1-v3 图指纹体系 + 输入一致性):
+- face_prompt 默认文本更新 (更具体的抗融化/抗塑料质感描述; 已保存的工作流保留
+  其序列化值, 不受影响)。
+- 集成模式运行时缺参考图时回退本节点 ref_image_* 直连输入 (原先被直接忽略)。
+- 输入行/参考行统一 fp16 量化 (.to(fp16).float()): 与 Face_Cut v20.4 输出及缓存
+  路径位精确一致 → rows_hash 不再因缓存命中与否而漂移。
+- C1-v3: 独立模式以自身 hidden prompt 图指纹 (graph_fp) 入键, 覆盖本地权重链上
+  注意力后端等挂载节点的控件变化; 集成模式 rmeta 不变 (内容哈希传递性覆盖)。
 
 v19.4 变更 (通用性/速度/显存, 常规路径输出不变):
 - C1: 缓存键补齐 模型/VAE/CLIP 权重指纹 (model_fp/vae_fp/clip_fp) — 换 checkpoint、
@@ -467,7 +476,7 @@ class H3FaceResample(io.ComfyNode):
                 io.Image.Output(display_name="images"),
                 io.Dict.Output(display_name="bbox"),
             ],
-            hidden=[io.Hidden.unique_id],
+            hidden=[io.Hidden.unique_id, io.Hidden.prompt],
         )
 
     @classmethod
@@ -605,6 +614,17 @@ class H3FaceResample(io.ComfyNode):
             unique_id = cls.hidden.unique_id
         except AttributeError:
             unique_id = None
+        # C1-v3: 独立模式 (无 info.h3_runtime) 时, 本地 model/vae/audio_vae/clip 端口
+        # 的权重链配置以自身图指纹入键 — 否则注意力后端等挂载类节点的控件变化在
+        # 独立模式下不可检出 (model_fingerprint 不再指纹 object_patches/model_options)。
+        _own_graph_fp = None
+        if not rt_info:
+            try:
+                _own_graph_fp = latent_cache.graph_weight_fingerprint(
+                    getattr(cls.hidden, "prompt", None), unique_id,
+                    ports=("model", "vae", "audio_vae", "clip"))
+            except Exception:
+                _own_graph_fp = None
         if clear_cache and unique_id is not None:
             try:
                 target = os.path.join(folder_paths.get_output_directory(), "cache", f"node_{unique_id}")
@@ -832,6 +852,9 @@ class H3FaceResample(io.ComfyNode):
                      "plan_hash": _md5_bytes(str(blocks).encode()),
                      "chunk_frames": int(chunk_budget), "context_frames": int(ctx_budget),
                      "model_fp": model_fp, "vae_fp": vae_fp, "clip_fp": clip_fp}
+            if _own_graph_fp is not None:
+                # 仅独立模式存在 集成模式 rmeta 不变
+                rmeta["graph_fp"] = _own_graph_fp
             cname = f"resample_grp{pi:03d}.pt"
             rows = None
             if cache_dir:

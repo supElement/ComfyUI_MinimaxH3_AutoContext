@@ -1,4 +1,15 @@
-"""h3_face_cut.py — 修脸第 1 步: 分镜优先的检测与稳定裁剪 (v20, 逐帧平滑窗口)
+"""h3_face_cut.py — 修脸第 1 步: 分镜优先的检测与稳定裁剪 (v20.4, 逐帧平滑窗口)
+
+v20.4 变更 (GPU 批量化 + pre_blur, 检测/几何语义不变):
+- 采样/缩放 GPU 批量化: _sample_windows 逐帧 CPU grid_sample → 整批上卡
+  (uint8 上传 + 批量 grid_sample, OOM 自动减半重试); 无 SR 模型路径的
+  common_upscale(lanczos, CPU) → interpolate bicubic+antialias(GPU)。
+  → win_v 2→3: 缩放算法变化使旧缓存值与新产物不一致, 升级后旧缓存失效一次。
+- 输出 crop_images 统一 fp16 量化 (.to(fp16).float()): 新鲜输出与缓存命中输出
+  位精确一致 (缓存本体即 fp16), 下游 rows_hash 不再漂移。
+- 新参数 pre_blur (默认 0=关): 裁剪窗在 SR/bicubic 放大前可选高斯预模糊 —
+  压制源噪声/插值锯齿, 提高小脸 SR 稳定性。已入缓存键。
+- _track_work 精确进度条总量 (原 F_expect 高估, 进度条到不了头)。
 
 v20 变更 (同一身份裁剪平滑化, 远景小脸占比不受影响):
 - 窗口边长 S 从"每个 DP 分段一个常数"改为"逐帧一条平滑序列":
@@ -50,15 +61,14 @@ _MODEL_EXTS = {".pt", ".pth", ".onnx", ".engine", ".torchscript"}
 # 调小 → 远景占比更高 (脸在画布上更大)
 _MIN_WIN = 48
 
-# ---- 可调常量: 窗口边长时序平滑 (v20) ----
+# ---- 可调常量: 窗口边长时序平滑 ----
 # 相邻两帧 S 的最大变化率 (0.20 = 每帧最多 ±20%)。调小 → 更平滑但快速推镜头时
-# 更容易触发"包含性地板"跳变; 调大 → 更贴脸但平滑感弱。0.15~0.25 都合理。
 _S_RATE = 0.20
 
-# ---- 可调常量: SR 放大的尺寸桶宽 (v20.3) ----
+# ---- 可调常量: SR 放大的尺寸桶宽 ----
 _SR_BUCKET = 32
 
-# ---- 可调常量: DP 单段帧数上限 (v20.2) ----
+# ---- 可调常量: DP 单段帧数上限  ----
 # 只用于把 DP 复杂度从 O(n²) 压到 O(n·上限); 切段无几何接缝 (逐帧窗口跨段连续)。
 _SEG_MAX = 240
 
@@ -365,23 +375,6 @@ def _window_centers(boxes, S_seq, W, H):
         py.append(float(min(max(cy, lo_y), hi_y)))
     return [[a, b] for a, b in zip(px, py)]
 
-def _blur_chw(x, sigma):
-    """[C,H,W] float 高斯模糊 (σ, px)。σ<=0 直通; kernel=2*ceil(3σ)+1, replicate padding。"""
-    s = float(sigma)
-    if s <= 0.0:
-        return x
-    r = max(1, int(round(3.0 * s)))
-    k = torch.arange(-r, r + 1, dtype=x.dtype, device=x.device)
-    k = torch.exp(-(k * k) / (2.0 * s * s))
-    k = k / k.sum()
-    C = int(x.shape[0])
-    kw = k.view(1, 1, -1, 1).expand(C, 1, -1, 1)
-    kh = k.view(1, 1, 1, -1).expand(C, 1, 1, -1)
-    xp = torch.nn.functional.pad(x[None], (r, r, 0, 0), mode="replicate")
-    xp = torch.nn.functional.conv2d(xp, kw, groups=C)
-    xp = torch.nn.functional.pad(xp, (0, 0, r, r), mode="replicate")
-    return torch.nn.functional.conv2d(xp, kh, groups=C)[0]
-
 def _blur_batch(crops, sigma, batch=32):
     if float(sigma) <= 0.0 or not len(crops):
         return crops
@@ -400,12 +393,13 @@ def _blur_batch(crops, sigma, batch=32):
                 sel = idxs[i0:i0 + bs]
                 x = torch.stack([crops[j] for j in sel]).to(dev)
                 B, C = int(x.shape[0]), int(x.shape[1])
-                kw = k.view(1, 1, -1, 1).expand(C, 1, -1, 1)
-                kh = k.view(1, 1, 1, -1).expand(C, 1, 1, -1)
+                kw = k.view(1, 1, -1, 1).expand(C, 1, -1, 1)   # (K,1) 垂直核
+                kh = k.view(1, 1, 1, -1).expand(C, 1, 1, -1)   # (1,K) 水平核
+                # pad 维度必须与核方向配对: 先 W-pad + 水平核, 后 H-pad + 垂直核。
                 xp = torch.nn.functional.pad(x, (r, r, 0, 0), mode="replicate")
-                xp = torch.nn.functional.conv2d(xp, kw, groups=C)
+                xp = torch.nn.functional.conv2d(xp, kh, groups=C)
                 xp = torch.nn.functional.pad(xp, (0, 0, r, r), mode="replicate")
-                x = torch.nn.functional.conv2d(xp, kh, groups=C).cpu()
+                x = torch.nn.functional.conv2d(xp, kw, groups=C).cpu()
 
                 for jj, j in enumerate(sel):
                     out[j] = x[jj]
@@ -990,9 +984,8 @@ class H3FaceCut(io.ComfyNode):
             except Exception:
                 _sec_fp_path = None
 
-        # v2 指纹补全: VAE 权重 (解码出的裁剪行直接受其影响) + 模型文件实体
-        # (同名换文件不再静默命中) — 新键缺失自动使旧缓存失效一次
-        _fp_common = {"win_v": 2,
+        # 指纹补全: VAE 权重 (解码出的裁剪行直接受其影响) + 模型文件实体
+        _fp_common = {"win_v": 3,
                       "face_model": model_rel, "yolo_threshold": float(yolo_threshold),
                       "yolo_file": _file_stat_sig(model_path),
                       "shot_active": bool(shot_active), "shot_threshold": float(shot_threshold),

@@ -248,12 +248,10 @@ def upscale_and_encode(vae, frames, out_h, out_w, want_t=None, tag=""):
     return encode_frames_adaptive(vae, up.contiguous(), want_t=want_t, tag=tag)
 
 
-_VAE_LAYOUT_CACHE = {}   # (id(vae), 类型名) -> 首个成功的布局名; 失败自动回退全探测
+_VAE_LAYOUT_CACHE = {}   
 
 
 def encode_frames_adaptive(vae, frames, want_t=None, tag=""):
-    # 布局探测结果按 vae 对象缓存: 同一 VAE 的后续编码直接走已知布局,
-    # 省去每次调用 1~2 次注定失败的异常探测。缓存布局失败时自动回退完整探测。
     _names = ["BHWC5", "BCTHW", "BHWC4"]
     _key = None
     try:
@@ -280,7 +278,7 @@ def encode_frames_adaptive(vae, frames, want_t=None, tag=""):
                 lat = lat.unsqueeze(2)
             if lat.dim() == 5 and (want_t is None or int(lat.shape[2]) == want_t):
                 if _key is not None and _VAE_LAYOUT_CACHE.get(_key) != t_:
-                    if len(_VAE_LAYOUT_CACHE) > 16:   # 防御: 进程内 VAE 对象极少, 封顶
+                    if len(_VAE_LAYOUT_CACHE) > 16:   
                         _VAE_LAYOUT_CACHE.clear()
                     _VAE_LAYOUT_CACHE[_key] = t_
                 vlog(f"[H3-Enc]{tag} layout={t_} → {tuple(lat.shape)} ok\n[H3-Enc]{tag} 布局={t_} → {tuple(lat.shape)} ok")

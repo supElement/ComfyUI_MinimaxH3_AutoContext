@@ -1,6 +1,15 @@
 """
 h3_sampler.py — H3 分段推理采样器
 
+v4.1 变更 (C1-v3 图指纹):
+- 段缓存键新增 graph_fp: 经 hidden prompt 对本节点权重链 (model/vae/audio_vae/
+  clip 沿 MODEL/VAE/CLIP 类型边) 做工作流图级配置指纹 — 哈希沿途节点的
+  (class_type + 控件值 + 拓扑), 含 KJNodes GetNode/SetNode 虚拟连线解析。
+  注意力后端类节点 (KJ SageAttention / Model Attention Backend 等) 的控件变化
+  由此检出 — 取代对 object_patches/model_options 运行时状态的指纹 (后者跨重启
+  不稳定, 依赖节点内部实现)。graph_fp 不可用时软回退纯权重指纹并打印提示。
+- 旧缓存缺 graph_fp 键 → 升级后自动失效一次。
+
 v2 优化版变更 (输出不变项 / 行为变化项分开列出):
 - C1 (缓存正确性): 段缓存键补齐 model_fp/vae_fp/clip_fp 权重指纹 —
   换 checkpoint、换 4/8 步加速 LoRA、改精度/函数级补丁时旧缓存自动失效。

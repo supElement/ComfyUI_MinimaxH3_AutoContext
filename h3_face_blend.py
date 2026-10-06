@@ -115,13 +115,6 @@ def _pyramid_mix(reg, can, sigma, device):
 # 方法: 每帧统一分辨率下做中心模板 NCC (FFT 批量互相关 + 亚像素抛物线),
 # 峰值强度/显著性双门控 (借鉴 Smart_merge_images 的可靠性思想, 但为视频全序列
 # 联合设计而非逐帧独立) + 时间中值平滑 + 失败帧线性插值, 修正量钳制 ±12.5% 窗口。
-# 纯 torch, 无新增依赖。
-#
-# 偏移推导 (符号约定, 与下方网格公式一致):
-#   A = 原帧窗口 (img 整数坐标裁剪); B = 画布行 (FaceCut 亚像素裁剪 + 重采样)。
-#   A 的内容相对 B 系统性偏移 (fx, fy) (亚像素裁剪差), 互相关测得的总偏移
-#   d = fx + 运动偏差。贴回网格采样 canvas[x - d] 恰好同时完成 fx 补偿与
-#   运动修正 — 且时间平滑只作用于 (d - fx) 的运动部分 (fx 已知精确, 不参与平滑)。
 
 _MA_WORK = 192      # 估计分辨率 (所有窗口统一 area 降采样到此尺寸)
 _MA_TMPL = 0.40     # 模板边长占窗口比例 (≈脸区域 — 刻意小于窗口: 画布背景基本
@@ -150,7 +143,6 @@ def _ma_clean(arr, ok, K):
     if int(vi.numel()) == 1:
         return arr[vi].repeat(K)
     o = _ma_interp1d(torch.arange(K, dtype=torch.float32), vi.float(), arr[vi])
-    # Hampel: 孤点 (坏 NCC 锁定) 换中值; 阶跃中心值与窗中值同侧, 不会误杀
     pad = torch.cat([o[:1].repeat(2), o, o[-1:].repeat(2)])
     win = pad.unfold(0, _MA_MED, 1)                     # [K,5]
     med = win.median(dim=1).values
@@ -247,7 +239,7 @@ def _motion_align_track(img, can_rows, geo, f0, sizes, K, dev):
                 sy = y0 + _sub3(nm[max(0, y0 - 1), x0], nm[y0, x0], nm[min(n_s - 1, y0 + 1), x0])
                 sx = x0 + _sub3(nm[y0, max(0, x0 - 1)], nm[y0, x0], nm[y0, min(n_s - 1, x0 + 1)])
                 gi = c0 + m_i
-                meas_x[gi] = (sx - R)          # 峰位 - 搜索中心 = W 坐标总偏移
+                meas_x[gi] = (sx - R)          
                 meas_y[gi] = (sy - R)
                 ok[gi] = True
 
@@ -494,26 +486,19 @@ class H3FaceBlend(io.ComfyNode):
                     kk2 += 1
                 Su = sizes[kk]
                 f_px = max(0, min(int(feather_px), (Su - 2) // 2))
-                # 画布 run → 设备 (fp32 统一)
                 blk = can_rows[kk:kk2].movedim(-1, 1).contiguous().to(dev, torch.float32)
                 if int(blk.shape[-2]) != Su or int(blk.shape[-1]) != Su:
                     blk = comfy.utils.common_upscale(blk, Su, Su, "lanczos", "disabled")
-                # 金字塔锁定 σ: 窗口边长 2.5%, 钳制 [2,5]px — 免调参
                 lock_sigma = float(min(14.0, max(4.0, Su * 0.05))) if lowfreq_lock else 0.0
-                # 显存护栏: 每 chunk ≈ 48MB×4 张中间量
                 chunk = max(1, int(48 * 1024 * 1024) // max(1, 3 * Su * Su * 4))
                 for a in range(kk, kk2, chunk):
                     b = min(a + chunk, kk2)
                     n = b - a
-                    # 原帧区域收集 [n,3,Su,Su]
                     reg = torch.stack([
                         out[f0 + i, geo[i][1]:geo[i][1] + Su, geo[i][0]:geo[i][0] + Su, :]
                         for i in range(a, b)], dim=0).permute(0, 3, 1, 2).to(dev, torch.float32)
                     can_c = blk[a - kk:b - kk]
 
-                    # 位置贴回: 亚像素几何 (fx/fy) 与 motion_align 修正合并为一次重采样。
-                    # 估计值已含 fx/fy 补偿 (见 _motion_align_track 推导), 直接作总偏移;
-                    # 无修正帧位精确直通 (与旧版一致)。
                     if madx is not None:
                         tot_x = [float(madx[a + j]) for j in range(n)]
                         tot_y = [float(mady[a + j]) for j in range(n)]
@@ -537,12 +522,11 @@ class H3FaceBlend(io.ComfyNode):
                         can_c = can_c.clone()
                         can_c[sel] = shifted
 
-                    # 金字塔低频锁定 (P0)
                     if lock_sigma > 0.0:
                         can_c = _pyramid_mix(reg, can_c, lock_sigma, dev)
                         n_locked += n
 
-                    # alpha: rect (run 内常数, 一次生成) / mask (逐帧, CPU scipy 原实现)
+                    # alpha: rect (run 内常数, 一次生成) / mask )
                     if masks_t is not None:
                         alpha = torch.stack(
                             [_mask_alpha_frame(masks_t[a + j], Su, f_px, dev) for j in range(n)],
