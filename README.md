@@ -33,6 +33,12 @@ H3 的显存需求随分辨率、时长（每 +5s 翻倍）、精度（fp8→bf1
 已安装，从 main 切到 test：
 
       git fetch origin  → git checkout test  → git pull
+### V0.9.2 （test分支）
+
+- 优化SR面部放大处理速度，边长小于192px的画面才会使用放大模型先做一次处理。
+- 优化自动提取id参考的选取逻辑。
+- Minimax_H3_Face_Cut 和 Minimax_H3_Face_Resample 节点上增加输出端口 identity_refs ，仅用于校验自动截取的每id参考图像，两个节点的输出相同。
+
 ### V0.9.1 （test分支）
 
 - 支持 checkpoint / 加速 LoRA / 改精度 / 挂函数级补丁后的缓存检测。
