@@ -71,13 +71,23 @@ PySceneDetect is a Python dependency, not a model: if missing, `pip install scen
 | images / latent | Choose one. images mode recommended: detection at the external frames' native size, latent completely untouched; latent mode decodes probe frames via VAE |
 | yolo_threshold | Detection confidence (default 0.3); lower it if detections are missed |
 | shot_threshold | Shot detection threshold; higher = fewer cuts (default 40) |
-| upscale_model | Optional SR chain: repeatedly upscales until ≥ canvas side (≤2 passes) then bicubics to the exact size, fixing ringing artifacts and color blotches on heavily upscaled small faces; None = bicubic only |
+| upscale_model | Optional SR chain: Faces with a side length of less than 192px are first upscaled once using the model and then resized via bicubic interpolation to the exact dimensions; this mitigates ringing artifacts and color blotches associated with high-factor upscaling of small faces; None = bicubic only |
 | pre_blur | Applies a slight Gaussian blur to the crop window before upscaling, softening source video noise and interpolation jaggies; for noisy footage try 0.5–1.5; the Resample output may become softer or even blurry |
 | res / expand | Canvas side length (default 512) / crop window margin % (default 20) |
 | skip_ratio | Face ≥ res × this ratio → skip resampling (default 0.8) |
 | sec_model / sec_threshold / max_identities | None = single face (largest face per frame, no mask); selecting weights = multi-identity tracking + SeC masks; SeC-4B always unloads automatically after tracking finishes |
 | sr_batch | Frames per SR forward pass in the crop upscale stage (default 4, 1–16). Higher = faster but higher VRAM peak; 4 on 16GB, 8–16 on 24GB+. Affects only speed and VRAM, not results |
 | unload_main_models | After detection & SeC tracking and before crop/SR upscaling, moves the H3 main model/VAE/CLIP out of VRAM (default on; recommended on 12–16GB cards). SR models go straight into VRAM via spandrel and bypass ComfyUI's model management — a resident main model pushes VRAM past the physical limit; Windows masks the OOM as "shared GPU memory" overflow, which shows up as a sudden speed drop. Regardless of this switch, SeC-4B always unloads after tracking finishes |
+
+### Outputs
+
+| Port | Type | Description |
+|---|---|---|
+| crop_images | Image | Uniform res² crop rows for all subtracks to be resampled, in subtrack appearance order (= the accounting inside face_pack), **ALL frames kept** (including interpolated frames; NOT trimmed to 17n+5 — the grid constraint is applied during Resample's encoding). skip subtracks (face already ≥ res×skip_ratio) produce no rows. fp16-quantized so fresh output is bit-exact with the cache-hit path |
+| face_pack | Dict | Subtrack geometry ledger (pack v7): per-subtrack `(track_id, f0, f1, S, S_list, centers, crop_off, masks, ref_row, ref_image, ...)`, plus `a_lat` (audio ledger in latent mode; None in images mode), `multi_track` flag, `meta` (shot map / sizes / detection stats), `n_crop_rows`. **Consumed by Face_Resample and Face_Blend** — do NOT substitute with shot_info |
+| masks | Mask | SeC mask port, `[rows, res, res]`, rows **1:1 aligned** with crop_images (same crop_off ledger). 1 = face. Populated only in multi_sec mode (sec_model ≠ None); always zero in single-face mode. **Wire straight to Face_Blend.masks**, bypassing Resample |
+| shot_info | Dict | Shot map: `{shots: [[s,e],...], shot_cuts: [c,...], n_shots, fps}`. **Feed the parameter node only** for per-shot prompt assignment; it is not a geometry pack — do NOT connect to Face_Blend.bbox or Face_Resample.info |
+| identity_refs | Image | One identity-verified anchor crop per identity: `[n_id, res, res, 3]`, row order = ascending identity id. Prefers the **source-frame original** resampled through the anchor window (no pre_blur/SR); falls back to a processed crop row with a warning when no clean ref exists. **Eyeball this port BEFORE running Face_Resample** — wrong ref = wrong identity repair |
 
 ## 3. Face_Resample — Canvas Refinement
 
@@ -94,6 +104,14 @@ Crop rows serve as the canvas; block-level img2img refinement; the block structu
 | identity_ref | Automatic identity anchor: automatically picks the sharpest frame of that person and injects it as a reference into the resampling, keeping identity and appearance consistent across frames/blocks at high σ (the key anti-jitter switch) , For each ID, the clearest facial frame (with the largest visible area) is extracted to serve as the reference image, defaulting to <Picture 1>. If reference images are connected and declared, the reference index for the automatically anchored frame shifts to "number of reference images + 1" (e.g., if two reference images are connected, the auto-anchored frame serves as <Picture 3>). If this negatively impacts the generated results, simply disable the `identity_ref` parameter.|
 | color_match | Per-subtrack Reinhard color match back to the source crops (default on) |
 | ref_images | Reference images; passed only when declared with a Picture tag in the prompt |
+
+### Outputs
+
+| Port | Type | Description |
+|---|---|---|
+| images | Image | Refined canvas, `[N, res, res, 3]` — **row structure exactly matches crop_images** (same count, order, crop_off ledger), so the downstream paste-back uses the same accounting. fp16-resident. Rows corresponding to non-resampled subtracks (skip / no detection) are passed through from the input crop_images untouched |
+| bbox | Dict | Updated face_pack (pack v7): repackaged `subtracks / a_lat / meta / n_crop_rows` on top of the incoming face_pack, for Face_Blend to paste back pixel-by-pixel via crop_off and the geometry ledger. **Wire to Face_Blend.bbox** — do NOT connect shot_info here |
+| identity_refs | Image | Preview of the identity anchors actually used for this run's refinement: `[n_id, res, res, 3]`, row order = ascending identity id. Use it to verify identity_ref picked the right frame — it maps one-to-one with the `<Picture N>` entries consumed inside Resample as `ri_eff` |
 
 Block-level principle: subtracks of the same identity and contiguous in time are merged into one sequence → split into blocks along the main sampler's real segment boundaries (prompts map to segments precisely by block midpoint) → each block's encoding is padded to the 17n+5 grid (last frame repeated, trimmed after decode) → at boundaries with large window jumps, anchoring is anchored or disabled depending on the tracking mode.
 

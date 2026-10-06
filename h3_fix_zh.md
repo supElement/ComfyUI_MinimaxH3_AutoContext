@@ -69,7 +69,7 @@ PySceneDetect 是 Python 依赖而非模型: 缺失时 pip install scenedetect, 
 | images / latent | 二选一。images 模式推荐: 外部画面原生尺寸检测, 完全不碰 latent; latent 模式用 VAE 解码探针帧 |
 | yolo_threshold | 检测置信度 (默认 0.3), 漏检多就调低 |
 | shot_threshold | 分镜阈值, 越高切点越少 (默认 40) |
-| upscale_model | 可选 SR 链: 反复放大至 ≥ 画布边长 (≤2 次) 再 bicubic 到精确尺寸, 修小脸高倍放大的振铃色斑; None = 仅 bicubic |
+| upscale_model | 可选 SR 链: 边长低于192px的面部会使用模型放大一次，再 bicubic 到精确尺寸, 修小脸高倍放大的振铃色斑; None = 仅 bicubic |
 | pre_blur | 放大前对裁剪窗口先做轻微高斯模糊，软化源视频噪点和插值锯齿，噪点重的素材建议 0.5~1.5, resampler输出可能会软化甚至模糊|
 | res / expand | 画布边长 (默认 512) / 裁剪窗口余量 % (默认 20) |
 | skip_ratio | 脸 ≥ res×此比例 → 跳过重采样 (默认 0.8) |
@@ -77,6 +77,15 @@ PySceneDetect 是 Python 依赖而非模型: 缺失时 pip install scenedetect, 
 | sr_batch | 裁剪放大阶段每次 SR 前向的帧数 (默认 4, 1–16)。越大越快但显存峰值越高; 16GB 用 4, 24GB+ 可 8~16。只影响速度与显存, 不影响结果 |
 | unload_main_models | 检测与 SeC 追踪完成后、裁剪/SR 放大前, 把 H3 主模型/VAE/CLIP 移出显存 (默认开; 12~16GB 显存建议开启)。SR 模型经 spandrel 直进显存、不受 ComfyUI 模型管理调度, 主模型驻留会把显存挤过物理上限; Windows 会以"共享 GPU 内存"溢出掩盖 OOM, 表现为速度骤降。无论此项开关, SeC-4B 追踪结束后始终卸载 |
 
+### 输出端口
+
+| 端口 | 类型 | 说明 |
+|---|---|---|
+| crop_images | Image | 所有待重采样子轨的统一 res² 裁剪行, 行序 = 子轨出现顺序 (= face_pack 内部账目), **全帧保留** (含插值帧, 不按 17n+5 掐尾 — 网格约束在 Resample 编码期补齐)。skip 子轨 (脸已 ≥ res×skip_ratio) 不产生行。fp16 量化, 与缓存命中位精确一致 |
+| face_pack | Dict | 子轨几何账本 (pack v7): 每条子轨的 `(track_id, f0, f1, S, S_list, centers, crop_off, masks, ref_row, ref_image, ...)`, 加 `a_lat` (latent 模式的音频账本; images 模式为 None)、`multi_track` 标记、`meta` (镜头表/尺寸/检测统计)、`n_crop_rows`。**Face_Resample 与 Face_Blend 消费此端口** — 不要用 shot_info 代替 |
+| masks | Mask | SeC mask 端口, `[rows, res, res]`, 行与 crop_images **1:1 对齐** (同一 crop_off 账目)。1 = 人脸。仅 multi_sec 模式 (sec_model ≠ None) 有内容; 单脸模式恒为零。**直连 Face_Blend.masks**, 不经过 Resample |
+| shot_info | Dict | 镜头表: `{shots: [[s,e],...], shot_cuts: [c,...], n_shots, fps}`。**只喂 parameter 节点** 用于按镜头分配分段提示词; 不是几何包, 不要接到 Face_Blend.bbox 或 Face_Resample.info |
+| identity_refs | Image | 每个身份一张已验证锚定参考: `[n_id, res, res, 3]`, 行序 = 身份 id 升序。优先取 **源帧按锚定窗口重采样的原画面** (未经 pre_blur/SR); 无干净参考时回退加工后的裁剪行并警告。**运行 Face_Resample 前先目检此端口** — 参考错 = 修脸身份错 |
 
 ## 三、Face_Resample — 画布精修
 
@@ -94,6 +103,13 @@ PySceneDetect 是 Python 依赖而非模型: 缺失时 pip install scenedetect, 
 | color_match | 逐子轨 Reinhard 色彩匹配回源裁剪 (默认开) |
 | ref_images | 参考图; 提示词声明 Picture 标签才传递 |
 
+### 输出端口
+
+| 端口 | 类型 | 说明 |
+|---|---|---|
+| images | Image | 精修后的画布, `[N, res, res, 3]` — **与 crop_images 行结构完全一致** (行数、行序、crop_off 全部相同), 便于下游按同一账目贴回。fp16 驻留内存。未重采样的子轨 (skip/无检测) 对应的行原样保留 (从 crop_images 传入) |
+| bbox | Dict | 更新后的 face_pack (pack v7): 在入参 face_pack 基础上重新组装 `subtracks / a_lat / meta / n_crop_rows`, 供 Face_Blend 按 crop_off 与几何账目逐像素贴回。**接 Face_Blend.bbox** — 不要接 shot_info |
+| identity_refs | Image | 本次实际用于精修的身份锚定参考图预览: `[n_id, res, res, 3]`, 行序 = 身份 id 升序。用于核对 identity_ref 是否挑对了帧 — 与 Resample 内部 `ri_eff` 消费的 `<Picture N>` 条目一一对应 |
 
 块级原理: 同身份且时间连续的子轨合并为一条序列 → 按主采样真实段边界切块 (提示词按块中点精确映射到段) → 每块编码补齐 17n+5 网格 (重复末帧, 解码后裁掉) → 边界窗口大跳变时按追踪模式决定锚定或禁用。
 
