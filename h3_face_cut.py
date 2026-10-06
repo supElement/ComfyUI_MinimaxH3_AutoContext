@@ -39,7 +39,7 @@ import folder_paths
 import comfy.utils
 import hashlib
 import comfy.model_management
-
+import time
 
 try:
     from . import latent_cache
@@ -56,22 +56,28 @@ except ImportError:
 MODEL_DIR = os.path.join(folder_paths.models_dir, "elementEasy")
 _MODEL_EXTS = {".pt", ".pth", ".onnx", ".engine", ".torchscript"}
 
-# ---- 可调常量: 窗口下限 (px) ----
+# ---- 窗口下限 (px) ----
 # 裁剪窗口 S 的最小值 (自动 16 对齐)。远景小脸时 S 会被钳在此地板上 —
 # 调小 → 远景占比更高 (脸在画布上更大)
 _MIN_WIN = 48
 
-# ---- 可调常量: 窗口边长时序平滑 ----
+# ---- 窗口边长时序平滑 ----
 # 相邻两帧 S 的最大变化率 (0.20 = 每帧最多 ±20%)。调小 → 更平滑但快速推镜头时
 _S_RATE = 0.20
 
-# ---- 可调常量: SR 放大的尺寸桶宽 ----
-_SR_BUCKET = 32
+# ---- SR 放大的尺寸桶宽 ----
+_SR_BUCKET = 16
 
-# ---- 可调常量: DP 单段帧数上限  ----
+# ---- DP 单段帧数上限  ----
 # 只用于把 DP 复杂度从 O(n²) 压到 O(n·上限); 切段无几何接缝 (逐帧窗口跨段连续)。
 _SEG_MAX = 240
 
+# ---- SR 最大遍数 (1 = 单次) ----
+_SR_MAX_PASSES = 1
+
+# ---- 裁剪窗口边长 >= 此值时跳过 SR, 直接 bicubic 到 res (px) ----
+# 设为 0 = 关闭 (所有窗口都走 SR)
+_SR_SKIP_WIN = 192
 
 def _win_floor():
     """窗口下限 (16 对齐后的 _MIN_WIN) — 唯一来源, 供窗口规划与 DP 估计共用。"""
@@ -226,10 +232,9 @@ def _load_sr_model(rel):
         raise ValueError(f"{rel}: not an image upscale model ({type(desc).__name__})")
     return desc.eval()
 
-def _sr_pass(sr_model, x, batch_size=4):
+def _sr_pass(sr_model, x, batch_size=4, pbar=None):
     """单次放大: [N,H,W,3] float 0..1 → [N,H*s,W*s,3]。分批执行, OOM 自动减半批。
-    batch_size: 每次前向帧数上限 — SR 走 spandrel 直进显存、不经 ComfyUI 模型管理,
-    峰值显存 ≈ batch × 窗口² 特征图; 16GB 卡建议 2~4, 24GB+ 可 8~16。"""
+    pbar: 外层共享进度条, 每完成一批推进实际帧数 (不再自建任何条/打印)。"""
     dev = comfy.model_management.get_torch_device()
     sr_model.to(dev)
     out, n, bs, i = [], int(x.shape[0]), max(1, min(int(batch_size), int(x.shape[0]))), 0
@@ -239,14 +244,18 @@ def _sr_pass(sr_model, x, batch_size=4):
             with torch.no_grad():
                 o = sr_model(b)
             out.append(o.movedim(1, -1).clamp(0.0, 1.0).cpu())
-            i += bs
+            step = int(b.shape[0])          
+            i += step
             del b, o
+            if pbar is not None:
+                pbar.update(step)
         except comfy.model_management.OOM_EXCEPTION:
             if bs <= 1:
                 raise
             bs = max(1, bs // 2)
             comfy.model_management.soft_empty_cache()
     return torch.cat(out, dim=0)
+
 
 # ================= 分镜检测 (先分镜, 后面部 — 官方 PySceneDetect 管线) =================
 def _detect_shot_cuts_official_file(frames_rgb, threshold, fps_hint):
@@ -625,41 +634,47 @@ def _build_subtracks_for_track(boxes_seq, frames, H, W, res, expand_f, scale_spl
         proc = [None] * len(crops)
         if sr_model is not None:
             TOL = max(8, int(_SR_BUCKET))
+            sc = max(1, int(getattr(sr_model, "scale", 4) or 4))   # SR 模型放大倍数
             buckets = {}
             for _ci, _c in enumerate(crops):
                 _K = -(-int(_c.shape[1]) // TOL) * TOL
                 buckets.setdefault(_K, []).append(_ci)
             h3ff.vlog(f"[H3-FaceCut] id{tid} sub{si+1}: SR buckets={len(buckets)} "
-                      f"(TOL={TOL}px), batch<={int(sr_batch)}")
+                      f"(TOL={TOL}px, scale={sc}, skip_win={_SR_SKIP_WIN}, batch<={int(sr_batch)})")
             for _K in sorted(buckets):
                 _idxs_g = buckets[_K]
+                if _SR_SKIP_WIN > 0 and _K >= _SR_SKIP_WIN:
+                    # 窗口 >= _SR_SKIP_WIN: bicubic 一步到 res, 不做 SR
+                    _resized = _gpu_resize_batch([crops[_i] for _i in _idxs_g], res)
+                    for _j, _i in enumerate(_idxs_g):
+                        proc[_i] = _resized[_j]
+                    if pbar is not None:
+                        pbar.update(len(_idxs_g))
+                    continue
                 frames_p = []
                 for _i in _idxs_g:
                     c_ = crops[_i]
                     p = _K - int(c_.shape[1])
                     frames_p.append(
-                        torch.nn.functional.pad(c_, (0, p, 0, p), mode="replicate")
-                        if p > 0 else c_)
+                        torch.nn.functional.pad(c_, (0, p, 0, p), mode="replicate") if p > 0 else c_)
                 x = torch.stack(frames_p, dim=0).permute(0, 2, 3, 1) / 255.0
                 n_pass = 0
-                while int(x.shape[1]) < res and n_pass < 2:
-                    x = _sr_pass(sr_model, x, batch_size=sr_batch)
+                while int(x.shape[1]) < res and n_pass < _SR_MAX_PASSES:
+                    x = _sr_pass(sr_model, x, batch_size=sr_batch, pbar=pbar)
                     n_pass += 1
                 ratio = float(int(x.shape[1])) / float(_K)
                 _dev = comfy.model_management.get_torch_device()
                 for _j, _i in enumerate(_idxs_g):
                     S_i = int(crops[_i].shape[1])
                     S2 = int(round(S_i * ratio))
-                    f_i = x[_j, :S2, :S2].contiguous()          # [S2,S2,3] HWC, CPU
+                    f_i = x[_j, :S2, :S2].contiguous()
                     if (int(f_i.shape[0]), int(f_i.shape[1])) != (res, res):
-                        ft = f_i.permute(2, 0, 1).unsqueeze(0).to(_dev)   # [1,3,S2,S2]
+                        ft = f_i.permute(2, 0, 1).unsqueeze(0).to(_dev)
                         ft = torch.nn.functional.interpolate(
                             ft, size=(res, res), mode="bicubic", antialias=True)
                         f_i = ft.clamp(0.0, 1.0)[0].permute(1, 2, 0).cpu()
                     proc[_i] = f_i
 
-                if pbar is not None:
-                    pbar.update(len(_idxs_g))
         else:
             proc = _gpu_resize_batch(crops, res)
             if pbar is not None:
@@ -732,6 +747,34 @@ def _fill_mask_rows(subtracks, cursor, res):
         mask_rows = mask_rows[:1]
     return mask_rows
 
+class _DualPbar:
+    """同一份进度, 两处显示: 节点上的 ComfyUI 进度条 + 后台控制台 tqdm 条。
+    接口只有 update(n) — _build_subtracks_for_track 无需感知。"""
+    def __init__(self, total, desc="FaceCut crop"):
+        self._tq = None
+        self._cp = None
+        try:
+            from tqdm import tqdm
+            self._tq = tqdm(total=int(total), desc=desc, unit="f", dynamic_ncols=True)
+        except Exception:
+            pass
+        if h3ff._HAS_COMFY:
+            try:
+                self._cp = comfy.utils.ProgressBar(int(total))
+            except Exception:
+                pass
+
+    def update(self, n):
+        n = int(n)
+        if self._tq is not None:
+            self._tq.update(n)
+        if self._cp is not None:
+            self._cp.update(n)
+
+    def close(self):
+        if self._tq is not None:
+            self._tq.close()
+
 def _track_work(boxes_seq, gap_tol):
     """一条身份轨迹的实际处理帧数 (与 _build_subtracks_for_track 的 gap_tol 区间合并
     逐字一致): 每个出现区间内所有帧 (含插值帧) 恰好计一次进度。"""
@@ -777,6 +820,149 @@ def _gpu_resize_batch(crops, res, batch=16):
                 comfy.model_management.soft_empty_cache()
     return out
 
+# ==================================================================
+# ====== 身份锚定帧定案 (FaceCut 侧, 经 face_pack 传给 Resample) ======
+# ==================================================================
+
+_ANCHOR_TOPK = 48          # 候选抽样帧数上限 (等距覆盖整条子轨)
+_ANCHOR_DET_IOU = 0.45     # SeC框 ↔ YOLO检出框 认定同一张脸的重叠率 (交集/较小面积)
+_ANCHOR_XCL_IOU = 0.30     # 身份互斥阈值: 与其他身份框重叠低于此值 → 确为分开的两人
+_ANCHOR_CROSS_IOU = 0.50   # 与其他身份框重叠高于此值 → 交叉换位嫌疑 (强惩罚)
+_ANCHOR_COVER_LO = 0.04    # SeC mask 前景占比合理下限 (窗口里确实有脸)
+_ANCHOR_COVER_HI = 0.90    # 上限 (mask 糊满整个窗口 = 追踪发散, 不可信)
+_ANCHOR_CTR_TOL = 0.20     # mask 质心偏离窗口中心的比例容限
+
+def _laplacian_sharpness(rows, work=256):
+    """[N,H,W,3] float 0..1 → [N] 清晰度 (灰度拉普拉斯方差; 统一 area 降采样到 work² 保证成本有界)。"""
+    g = rows.float().mean(dim=-1)
+    if max(int(g.shape[-2]), int(g.shape[-1])) > int(work):
+        g = torch.nn.functional.interpolate(
+            g.unsqueeze(1), size=(int(work), int(work)), mode="area").squeeze(1)
+    lap = (g[..., :-2, :-2] + g[..., :-2, 2:] + g[..., 2:, :-2] + g[..., 2:, 2:]
+           - 4.0 * g[..., 1:-1, 1:-1])
+    return lap.var(dim=(1, 2))
+
+def _pick_identity_anchor(rows, f0, my_idx, all_tracks_boxes, per_frame, masks=None, ref_res=512):
+    """为一条非 skip 子轨挑选"身份可信 + 清晰"的锚定行 → (子轨内局部行号, 旗标 dict)。
+
+    rows:             [K,res,res,3] 本子轨裁剪行 (float 0..1)
+    f0:               子轨起始全局帧号 (boxes/per_frame 按全局帧对齐)
+    my_idx:           本身份在 all_tracks_boxes 中的下标
+    all_tracks_boxes: 全部身份的每帧 SeC 框 ([F] bbox|None 的列表的列表)
+    per_frame:        YOLO 每帧检出
+    masks:            [K,res,res] SeC mask (float 0..1) 或 None
+    """
+    K = int(rows.shape[0])
+    flags = {"score": 0.0, "sharp": 0.0, "n_cross": 0, "all_cross": False}
+    if K <= 0:
+        return None, flags
+    my_boxes = (all_tracks_boxes[my_idx]
+                if (all_tracks_boxes is not None and 0 <= int(my_idx) < len(all_tracks_boxes)) else None)
+    n_s = min(K, int(_ANCHOR_TOPK))
+    idxs = sorted(set(int(round(i * (K - 1) / max(1, n_s - 1))) for i in range(n_s)))
+    sharp = _laplacian_sharpness(rows[idxs])
+    sharp_n = (sharp - sharp.min()) / (sharp.max() - sharp.min() + 1e-8)
+    score = torch.zeros(len(idxs))
+    n_det_frames = 0
+    for ii, lf in enumerate(idxs):
+        f = int(f0) + lf
+        b = my_boxes[f] if (my_boxes is not None and 0 <= f < len(my_boxes)) else None
+        dets = per_frame[f] if (per_frame is not None and 0 <= f < len(per_frame)) else []
+        if b is None:
+            score[ii] -= 1.0          
+            if not dets:
+                score[ii] -= 1.0
+            continue
+        n_det_frames += 1
+        score[ii] += 2.0              
+        if any(h3ff._overlap_ratio(b[:4], d[:4]) >= _ANCHOR_DET_IOU for d in dets):
+            score[ii] += 1.5          
+        else:
+            score[ii] -= 0.5
+        _fsz = max(float(b[2]) - float(b[0]), float(b[3]) - float(b[1]))
+        score[ii] += 0.5 * min(1.0, _fsz / max(1.0, 0.8 * float(ref_res)))
+        if not dets:
+            score[ii] -= 1.0
+
+        others = []
+        for ti, tb in enumerate(all_tracks_boxes or []):
+            if ti == int(my_idx) or tb is None:
+                continue
+            ob = tb[f] if 0 <= f < len(tb) else None
+            if ob is not None:
+                others.append(h3ff._overlap_ratio(b[:4], ob[:4]))
+        if others:
+            if len(dets) >= 2 and all(r < _ANCHOR_XCL_IOU for r in others):
+                score[ii] += 1.0      
+            if any(r >= _ANCHOR_CROSS_IOU for r in others):
+                score[ii] -= 2.0     
+                flags["n_cross"] += 1
+        if masks is not None and lf < int(masks.shape[0]):
+            m = masks[lf].float()
+            cov = float(m.mean())
+            if _ANCHOR_COVER_LO <= cov <= _ANCHOR_COVER_HI:
+                score[ii] += 0.5
+                nz = torch.nonzero(m > 0.5)
+                if int(nz.shape[0]):
+                    cy_ = float(nz[:, 0].float().mean()) / max(1, int(m.shape[0])) - 0.5
+                    cx_ = float(nz[:, 1].float().mean()) / max(1, int(m.shape[1])) - 0.5
+                    if (cx_ * cx_ + cy_ * cy_) ** 0.5 < float(_ANCHOR_CTR_TOL):
+                        score[ii] += 0.25   
+    if n_det_frames and flags["n_cross"] >= n_det_frames:
+        flags["all_cross"] = True   
+    top = float(score.max())
+    cand = [i for i in range(len(idxs)) if float(score[i]) >= top - 0.01]
+    best = max(cand, key=lambda i: float(sharp_n[i]))   
+    flags["score"] = top
+    flags["sharp"] = float(sharp_n[best])     
+    flags["sharp_raw"] = float(sharp[best])   
+    return int(idxs[best]), flags
+
+def _build_identity_refs(subtracks, crop_images, res):
+    """逐身份汇总锚定参考 → 预览张量 [n_id, res, res, 3] (行序=身份id 升序)。
+    优先 subtrack['ref_image'] (仅逐身份赢家子轨携带: 源帧重采样原画面, 未经 pre_blur/SR);
+    无 ref_image 时回退 crop_images[ref_row] (加工后的行); 无 ref_row (旧缓存) 才回退纯清晰度。
+    选择键 (ref_score, ref_sharp) 字典序取最大, 与 Resample 消费逻辑一致 — 预览即所得。
+    返回 (tensor | None, fell_back): fell_back=True 表示至少一个身份最终用的是加工行/纯清晰度。
+    """
+    best = {}
+    n_rows = int(crop_images.shape[0])
+    for st in subtracks:
+        if st.get("skip") or st.get("crop_off") is None:
+            continue
+        tid = int(st.get("track_id", 0))
+        rr = st.get("ref_row")
+        if rr is not None:
+            rr = int(rr)
+            if not (0 <= rr < n_rows):
+                continue
+            _sh = st.get("ref_sharp")
+            if _sh is None:
+                _sh = float(_laplacian_sharpness(crop_images[rr:rr + 1].float())[0])
+            key = (float(st.get("ref_score", 0.0)), float(_sh))
+            img = st.get("ref_image")
+            clean = img is not None
+            if not clean:
+                img = crop_images[rr].float()
+        else:
+            off, K = int(st["crop_off"]), int(st["f1"]) - int(st["f0"])
+            rows = crop_images[off:off + K].float()
+            n_s = min(K, int(_ANCHOR_TOPK))
+            idxs = sorted(set(int(round(i * (K - 1) / max(1, n_s - 1))) for i in range(n_s)))
+            sharp = _laplacian_sharpness(rows[idxs])
+            bi = int(torch.argmax(sharp).item())
+            rr = off + int(idxs[bi])
+            img = crop_images[rr].float()
+            key = (-1.0, float(sharp[bi]))
+            clean = False
+        cur = best.get(tid)
+        if cur is None or key > cur[0]:
+            best[tid] = (key, rr, img, clean)
+    if not best:
+        return None, False
+    ordered = [best[tid] for tid in sorted(best)]
+    fell_back = any(not t[3] for t in ordered)
+    return torch.stack([t[2] for t in ordered], dim=0).contiguous(), fell_back
 
 
 def _build_pack(a_lat, subtracks, cursor, multi_track_flag, meta, fps_eff):
@@ -863,6 +1049,10 @@ class H3FaceCut(io.ComfyNode):
                                "SeC mask [行数,res,res], 行与 crop_images/画布 1:1 对齐, 1=人脸"),
                 io.Dict.Output(display_name="shot_info", tooltip="Shot map for Minimax_H3_AutoContext_parameter: shots/cuts/fps\n"
                                "供 parameter 节点分配分段提示词的镜头表 (shots/cuts/fps)"),
+                               
+                io.Image.Output(display_name="identity_refs", tooltip="One identity-verified anchor crop per track (row order = track id). "
+                     "PRE-CHECK this BEFORE running Face_Resample — wrong ref = wrong identity repair\n"
+                     "每个身份一张已验证锚定参考 (行序=身份id)。请在运行 Face_Resample 之前用它预检 — 参考错 = 修脸身份错"),
             ],
             hidden=[io.Hidden.unique_id],
         )
@@ -1026,11 +1216,22 @@ class H3FaceCut(io.ComfyNode):
                              "n_shots": int(_cmeta.get("n_shots") or len(_cmeta.get("shots") or [])) or 1,
                              "fps": float(fps_eff)}
                 mz = float(mask_rows.max()) if mask_rows.numel() else 0.0
+                _ir, _ir_fb = _build_identity_refs(subtracks, crop_images, res)
+                if _ir is None:
+                    _ir = torch.zeros(1, res, res, 3)
+                if _ir_fb:
+                    h3ff.warn("[H3-FaceCut] some identity refs fell back to PROCESSED crop rows "
+                              "(old cache without ref_row/ref_image, or clean-ref build failed) — "
+                              "rerun Face_Cut once with clear_cache for original-frame refs\n"
+                              "[H3-FaceCut] 部分身份参考回退为加工后的裁剪行 (旧缓存无 ref_row/ref_image, "
+                              "或干净参考构建失败) — 勾选一次 clear_cache 重跑 Face_Cut 可获得原画面参考")
+                
                 print("\033[33m" + f"[H3-FaceCut] cache hit: {len(subtracks)} subtracks, "
                       f"crop {tuple(crop_images.shape)}, masks_max={mz:.2f} — shot/decode/detect/SeC skipped\n"
                       f"[H3-FaceCut] 缓存命中: {len(subtracks)} 条子轨, 裁剪 {tuple(crop_images.shape)}, "
                       f"mask最大值={mz:.2f} — 已跳过 分镜/解码/检测/SeC" + "\033[0m")
-                return io.NodeOutput(crop_images.contiguous(), pack, mask_rows.contiguous(), shot_info)
+                return io.NodeOutput(crop_images.contiguous(), pack, mask_rows.contiguous(), shot_info, _ir.contiguous())
+
             except Exception as e:
                 h3ff.warn(f"[H3-FaceCut] cache load failed ({e}), recomputing\n[H3-FaceCut] 缓存载入失败 ({e})，重新计算")
 
@@ -1164,8 +1365,10 @@ class H3FaceCut(io.ComfyNode):
         if sr_name != "None":
             try:
                 sr_model = _load_sr_model(sr_name)
-                h3ff.log(f"[H3-FaceCut] crop upscale: {sr_name} (SR chain -> {res}px, max 2 passes)\n"
-                         f"[H3-FaceCut] 裁剪放大: {sr_name} (SR 链 → {res}px, 最多 2 次)")
+                _pt = "single pass" if _SR_MAX_PASSES == 1 else f"max {_SR_MAX_PASSES} pass(es)"
+                _pt_cn = "单次 SR" if _SR_MAX_PASSES == 1 else f"最多 {_SR_MAX_PASSES} 次 SR"
+                h3ff.log(f"[H3-FaceCut] crop upscale: {sr_name} (SR {_pt} -> {res}px)\n"
+                         f"[H3-FaceCut] 裁剪放大: {sr_name} ({_pt_cn} → {res}px)")
             except Exception as e:
                 h3ff.warn(f"[H3-FaceCut] upscale model load failed ({e}) — falling back to bicubic\n"
                           f"[H3-FaceCut] 放大模型加载失败 ({e}) — 回退 bicubic")
@@ -1198,7 +1401,7 @@ class H3FaceCut(io.ComfyNode):
         subtracks, crop_parts = [], []
         cursor = 0
         _total_work = sum(_track_work(t[1], int(gap_tol)) for t in src_tracks)
-        crop_pbar = comfy.utils.ProgressBar(max(1, _total_work)) if h3ff._HAS_COMFY else None
+        crop_pbar = _DualPbar(max(1, _total_work), "FaceCut crop")
 
         for tid, boxes_seq, masks_full, sz_override in src_tracks:
             sts, cps, n_rows = _build_subtracks_for_track(
@@ -1206,13 +1409,14 @@ class H3FaceCut(io.ComfyNode):
                 int(gap_tol), tid, masks_full=masks_full,
                 size_override=(sz_override if face_tracking == "multi_sec" else None),
                 shot_id=shot_id, sr_model=sr_model, sr_batch=sr_batch, pbar=crop_pbar, pre_blur=float(pre_blur))
-
+                
             for st in sts:
                 if not st["skip"]:
                     st["crop_off"] = cursor + int(st["crop_off"])  
             subtracks.extend(sts)
             crop_parts.extend(cps)
             cursor += n_rows
+        crop_pbar.close()
 
         if sr_model is not None:
             try:
@@ -1228,8 +1432,84 @@ class H3FaceCut(io.ComfyNode):
         else:
             crop_images = torch.zeros(1, res, res, 3)
         n_sampled = sum(1 for st in subtracks if not st["skip"])
+        # ---- 身份锚定帧定案 (v21.1): 逐子轨评分走 vlog; 逐身份取 (score, 原始清晰度) 全局最优 ----
+        _boxes_by_id = {int(t[0]): i for i, t in enumerate(src_tracks or [])}
+        _track_boxes_list = [t[1] for t in (src_tracks or [])]
+        for st in subtracks:
+            if st.get("skip") or st.get("crop_off") is None:
+                continue
+            _off, _K = int(st["crop_off"]), int(st["f1"]) - int(st["f0"])
+            _tid = int(st.get("track_id", 0))
+            _masks = st.get("masks")
+            if _masks is not None:
+                _masks = _masks.to(torch.float32).mul(1.0 / 255.0)
+            _lf, _fl = _pick_identity_anchor(
+                crop_images[_off:_off + _K], int(st["f0"]),
+                _boxes_by_id.get(_tid, -1), _track_boxes_list, per_frame,
+                masks=_masks, ref_res=res)
+            if _lf is None:
+                continue
+            st["ref_row"] = int(_off + _lf)
+            st["ref_local"] = int(_lf)
+            st["ref_score"] = float(_fl.get("score", 0.0))
+            st["ref_sharp"] = float(_fl.get("sharp_raw", 0.0))
+            st["ref_sharp_n"] = float(_fl.get("sharp", 0.0))   
+            h3ff.vlog(f"[H3-FaceCut] anchor cand: id{_tid} sub[{st['f0']},{st['f1']}) → "
+                      f"row {_off + _lf} (local {_lf}) score={_fl.get('score', 0.0):.1f} "
+                      f"sharp={_fl.get('sharp_raw', 0.0):.4f}\n"
+                      f"[H3-FaceCut] 锚定候选: 身份{_tid} 子轨[{st['f0']},{st['f1']}) → "
+                      f"全局第 {_off + _lf} 行 得分={_fl.get('score', 0.0):.1f} "
+                      f"清晰度={_fl.get('sharp_raw', 0.0):.4f}")
 
+            if _fl.get("all_cross"):
+                h3ff.warn(f"[H3-FaceCut] anchor id{_tid} [{st['f0']},{st['f1']}): EVERY sampled "
+                          f"detection frame overlaps another identity — SeC tracking likely "
+                          f"swapped identities; anchor is least-bad, check sec_threshold/YOLO\n"
+                          f"[H3-FaceCut] 身份{_tid} [{st['f0']},{st['f1']}): 所有抽样检测帧均与其他"
+                          f"身份高重叠 — SeC 追踪疑似身份互换, 锚定仅为最优可用帧, "
+                          f"请检查 sec_threshold/YOLO 检测")
+        # 逐身份汇总 (每身份仅 1 行日志): 同分不再"先到先得", 用原始清晰度跨子轨裁决
+        _best_by_track = {}
+        for st in subtracks:
+            if st.get("skip") or st.get("ref_row") is None:
+                continue
+            _tid = int(st.get("track_id", 0))
+            _key = (float(st.get("ref_score", 0.0)), float(st.get("ref_sharp", 0.0)))
+            _cur = _best_by_track.get(_tid)
+            if _cur is None or _key > _cur[0]:
+                _best_by_track[_tid] = (_key, st)
+        for _tid, (_k, _st) in sorted(_best_by_track.items()):
+            h3ff.log(f"[H3-FaceCut] anchor id{_tid}: global row {_st['ref_row']} "
+                     f"(sub[{_st['f0']},{_st['f1']}) local {_st['ref_local']}) "
+                     f"score={_k[0]:.1f} sharp={_k[1]:.4f} (norm {_st.get('ref_sharp_n', 0.0):.2f})\n"
+                     f"[H3-FaceCut] 身份锚: 身份{_tid} → 全局第 {_st['ref_row']} 行 "
+                     f"(子轨[{_st['f0']},{_st['f1']}) 内第 {_st['ref_local']} 行) "
+                     f"得分={_k[0]:.1f} 清晰度={_k[1]:.4f} (子轨内相对 {(_st.get('ref_sharp_n', 0.0)) * 100:.0f}%)")
+
+        # ---- 干净参考帧 (仅逐身份赢家, 每身份 1 张): 源帧重采样原画面, 未经 pre_blur/SR ----
+        for _tid, (_k, _st) in sorted(_best_by_track.items()):
+            try:
+                _lf = int(_st["ref_local"])
+                _gf = int(_st["f0"]) + _lf
+                _centers_l = _st.get("centers") or []
+                _slist_l = _st.get("S_list") or []
+                if _gf < int(frames.shape[0]) and _lf < len(_centers_l) \
+                        and _lf < len(_slist_l) and int(_slist_l[_lf]) > 0:
+                    _c_win, _ = _sample_windows(
+                        frames, None, [_gf],
+                        [[float(_centers_l[_lf][0]), float(_centers_l[_lf][1])]],
+                        [int(_slist_l[_lf])])
+                    _clean = _gpu_resize_batch(_c_win, res)[0]   # [res,res,3] 0..1, 无模糊无SR
+                    _st["ref_image"] = _clean.to(torch.float16).contiguous()
+                else:
+                    h3ff.vlog(f"[H3-FaceCut] clean ref skipped: id{_tid} anchor geometry missing\n"
+                              f"[H3-FaceCut] 干净参考跳过: 身份{_tid} 锚定几何缺失")
+            except Exception as _e:
+                h3ff.vlog(f"[H3-FaceCut] clean ref_image build failed id{_tid} ({_e}) — "
+                          f"ref falls back to processed crop row\n"
+                          f"[H3-FaceCut] 身份{_tid} 干净参考帧构建失败 ({_e}) — 参考回退为加工后的裁剪行")
         mask_rows = _fill_mask_rows(subtracks, cursor, res)
+
         multi_track_flag = tracks is not None
         src_tracks = None
         tracks = None
@@ -1245,6 +1525,8 @@ class H3FaceCut(io.ComfyNode):
                 "flash_attn": bool(use_flash_attn), "sec_memory": int(mllm_memory_size),
                 "n_shots": len(shots), "shot_cuts": [int(c) for c in shot_cuts],
                 "shots": [[int(s), int(e)] for (s, e) in shots],
+                "anchors": [[tid, st["f0"], st["f1"], st["ref_row"]]
+                            for tid, (_k, st) in sorted(_best_by_track.items())],
                 "source": "images" if use_images else "latent"}
         pack = _build_pack(a_lat, subtracks, cursor, multi_track_flag, meta, fps_eff)
         shot_info = {"shots": [[int(s), int(e)] for s, e in shots],
@@ -1284,17 +1566,18 @@ class H3FaceCut(io.ComfyNode):
                       "[H3-FaceCut] 警告: mask 输出全零 — SeC mask 缺失 (检查上方 SeC 日志)")
 
         crop_images = crop_images.detach().to(torch.float16).float().contiguous()
-
+        # ---- identity_refs 预览 (在量化后的 crop_images 上取行, 与 Resample 实际消费的行一致) ----
+        identity_refs_out, _ = _build_identity_refs(subtracks, crop_images, res)
+        if identity_refs_out is None:
+            identity_refs_out = torch.zeros(1, res, res, 3)
         if cache_dir:
             latent_cache.save_blob_async(
                 cache_dir, blob,
                 {"crop_images": crop_images.detach().to(torch.float16).cpu().contiguous(),
-                 "subtracks": subtracks,
-                 "n_crop_rows": int(cursor),
-                 "multi_track": bool(multi_track_flag),
-                 "meta": meta},
-                fp)
-            h3ff.vlog(f"[H3-FaceCut] cache save submitted (async)\n[H3-FaceCut] 缓存保存已提交 (异步)")
+                 "subtracks": subtracks, "n_crop_rows": int(cursor),
+                 "multi_track": bool(multi_track_flag), "meta": meta}, fp)
+        h3ff.vlog(f"[H3-FaceCut] cache save submitted (async)\n[H3-FaceCut] 缓存保存已提交 (异步)")
+        return io.NodeOutput(crop_images.contiguous(), pack, mask_rows.contiguous(),
+                             shot_info, identity_refs_out.contiguous())
 
-        return io.NodeOutput(crop_images.contiguous(), pack, mask_rows.contiguous(), shot_info)
 

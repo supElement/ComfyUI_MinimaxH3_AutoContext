@@ -180,6 +180,15 @@ def _color_match_rows(rows, ref_rows, eps=1e-4):
     out = (rows - mx) * (sr + eps) / (sx + eps) + mr
     return out.clamp(0.0, 1.0)
 
+def _row_sharpness(row):
+    """单行 [H,W,3] → 原始拉普拉斯方差 (256² area 降采样, 与 FaceCut 锚定同度量)。"""
+    g = row.detach().float().mean(dim=-1)
+    if max(int(g.shape[-2]), int(g.shape[-1])) > 256:
+        g = torch.nn.functional.interpolate(g[None, None], size=(256, 256), mode="area")[0, 0]
+    lap = (g[:-2, :-2] + g[:-2, 2:] + g[2:, :-2] + g[2:, 2:] - 4.0 * g[1:-1, 1:-1])
+    return float(lap.var())
+
+
 def _text_cond_fingerprint(prompt, ri, rv, ra):
     """块文本条件的内容指纹 — text-cond 缓存的键。
     Qwen3-VL 会把图像/视频的像素内容嵌入文本条件，键必须含像素内容而非仅数量，
@@ -214,8 +223,9 @@ def _pick_sharpest_row(rows, max_n=32):
         n_s = min(K, max_n)
         idxs = sorted(set(int(round(i * (K - 1) / max(1, n_s - 1))) for i in range(n_s)))
         g = rows[idxs].float().mean(dim=-1)
-        lap = (g[..., :-2, :-2] + g[..., :-2, 2:] + g[..., 2:, :-2] + g[..., 2:, 2:]
-               - 4.0 * g[..., 1:-1, 1:-1])
+        if max(int(g.shape[-2]), int(g.shape[-1])) > 256:
+            g = torch.nn.functional.interpolate(g.unsqueeze(1), size=(256, 256), mode="area").squeeze(1)
+        lap = (g[..., :-2, :-2] + g[..., :-2, 2:] + g[..., 2:, :-2] + g[..., 2:, 2:] - 4.0 * g[..., 1:-1, 1:-1])
         lv = lap.var(dim=(1, 2))
         best = int(torch.argmax(lv).item())
         gi = idxs[best]
@@ -475,6 +485,7 @@ class H3FaceResample(io.ComfyNode):
             outputs=[
                 io.Image.Output(display_name="images"),
                 io.Dict.Output(display_name="bbox"),
+                io.Image.Output(display_name="identity_refs"),
             ],
             hidden=[io.Hidden.unique_id, io.Hidden.prompt],
         )
@@ -525,8 +536,8 @@ class H3FaceResample(io.ComfyNode):
             h3ff.log("[H3-FaceResample] no samplable subtrack, empty canvas passed\n"
                      "[H3-FaceResample] 无可采样子轨, 输出空画布")
             return io.NodeOutput(torch.zeros(1, 64, 64, 3),
-                                 {"version": int(pack.get("version") or 5), "subtracks": subs,
-                                  "a_lat": a_lat, "meta": pack.get("meta", {})})
+                                 {"version": int(pack.get("version") or 5), "subtracks": subs, "a_lat": a_lat, "meta": pack.get("meta", {})},
+                                 torch.zeros(1, 64, 64, 3))   
 
         missing = [k for k in ("model", "vae", "clip") if rt.get(k) is None]
         if missing:
@@ -791,6 +802,7 @@ class H3FaceResample(io.ComfyNode):
         text_cond_hits = 0
 
         canvas_rows = []
+        identity_ref_frames = []
         for pi, p in enumerate(plans):
             group, tid, off, K = p["group"], p["tid"], p["off"], p["K"]
             blocks, gi_base = p["blocks"], p["gi_base"]
@@ -800,28 +812,70 @@ class H3FaceResample(io.ComfyNode):
             rows_in = crop_images[off:off + K].to(torch.float16).float()
             block_seeds = [int(seed) + 1 + gi_base for _ in range(len(blocks))]
 
-            # ---- 自动身份锚: 该身份最清晰一帧 → <Picture N> 参考图 (软失败可跳过) ----
+            # ---- 自动身份锚 (v21): 优先 Face_Cut 定案的身份锚定行, 回退纯清晰度 ----
             ri_eff = list(ri)
             id_tag = None
             if identity_ref:
-                _pick = _pick_sharpest_row(rows_in)
-                if _pick is not None:
-                    _gi, _frame = _pick
+                _gi, _anchor_src = None, None
+                _best_rr, _best_key, _best_img = None, None, None
+                for _gst in group:
+                    _rr = _gst.get("ref_row")
+                    if _rr is None:
+                        continue
+                    _rel = int(_rr) - off
+                    if not (0 <= _rel < int(K)):
+                        continue
+                    _sh = _gst.get("ref_sharp")
+                    if _sh is None:                      # 旧 pack 无 ref_sharp → 现算补齐 (与 FaceCut 同度量)
+                        _sh = _row_sharpness(rows_in[_rel])
+                    _key = (float(_gst.get("ref_score", 0.0)), float(_sh))
+                    if _best_key is None or _key > _best_key:
+                        _best_rr, _best_key = _rel, _key
+                        _best_img = _gst.get("ref_image")
+                if _best_rr is not None:
+                    _gi = _best_rr
+                    if _best_img is not None:
+                        # 干净参考: FaceCut 从源帧按锚定窗口重采样的原画面 (未经 pre_blur/SR)
+                        _frame = _best_img.detach().to(torch.float32).contiguous()
+                        _anchor_src = (f"face_cut clean ref_image (original, no pre_blur/SR, "
+                                       f"score={_best_key[0]:.1f} sharp={_best_key[1]:.4f})")
+                    else:
+                        _frame = rows_in[_gi]
+                        _anchor_src = (f"face_cut ref_row PROCESSED (old pack w/o ref_image — "
+                                       f"rerun Face_Cut with clear_cache for original ref; "
+                                       f"score={_best_key[0]:.1f} sharp={_best_key[1]:.4f})")
+                else:
+                    _pick = _pick_sharpest_row(rows_in)
+                    if _pick is not None:
+                        _gi, _frame = _pick
+                        _anchor_src = "sharpest (fallback: pack has no ref_row)"
+                        h3ff.warn(f"[H3-FaceResample] identity_ref id{tid}: pack has no verified "
+                                  f"ref_row — plain sharpness anchor in use; rerun H3FaceCut for "
+                                  f"identity-verified anchors\n"
+                                  f"[H3-FaceResample] 身份{tid}: face_pack 无已验证锚定行 — "
+                                  f"回退纯清晰度选锚; 请重跑 Face_Cut 以获得身份校验锚定")
+                if _gi is not None:
+                    # _frame = rows_in[_gi]
                     try:
+
                         _entry = (h3_sampler._prepare_ref_images(
-                                      [_frame.unsqueeze(0).float()], vae, device, res, res, crop_mode)
-                                  or [None])[0]
+                            [_frame.unsqueeze(0).float()], vae, device, res, res, crop_mode) or [None])[0]
                         if _entry and _entry.get("pixel") is not None:
                             ri_eff.append(_entry)
                             id_tag = f"<Picture {len(ri_eff)}>"
+                            _px = _entry["pixel"].detach().float().cpu()
+                            if _px.dim() == 3:
+                                _px = _px.unsqueeze(0)
+                            identity_ref_frames.append(_px.clamp(0.0, 1.0).contiguous())
                             h3ff.log(f"[H3-FaceResample] identity_ref: id{tid} anchor = row {_gi} "
-                                     f"(sharpest of {K}) → {id_tag}\n"
-                                     f"[H3-FaceResample] 身份锚: 身份{tid} 锚定帧 = 第 {_gi} 行 "
-                                     f"(共 {K} 行中最清晰) → {id_tag}")
+                                     f"(global {off + _gi}) [source: {_anchor_src}] → {id_tag}\n"
+                                     f"[H3-FaceResample] 身份锚: 身份{tid} 锚定帧 = 组内第 {_gi} 行 "
+                                     f"(全局第 {off + _gi} 行) [来源: {_anchor_src}] → {id_tag}")
                     except Exception as _e:
                         h3ff.warn(f"[H3-FaceResample] identity_ref build failed ({_e}) — "
                                   f"continuing without anchor\n"
                                   f"[H3-FaceResample] 身份锚构建失败 ({_e}) — 不使用锚定继续")
+    
 
             fix_sig_id = fix_sig
 
@@ -1121,15 +1175,25 @@ class H3FaceResample(io.ComfyNode):
         px = torch.cat(canvas_rows, dim=0)
         if int(px.shape[0]) != int(pack.get("n_crop_rows") or 0):
             raise RuntimeError("[H3-FaceResample] canvas row accounting mismatch\n[H3-FaceResample] 画布行数账目不符")
+
+        if identity_ref_frames:
+            identity_ref_out = torch.cat(identity_ref_frames, dim=0).contiguous()
+        else:
+            identity_ref_out = torch.zeros(1, 64, 64, 3)
+
         h3ff.log(f"[H3-FaceResample] done: canvas {tuple(px.shape)} ({int(px.shape[0])} rows, "
                  f"same row structure as crop_images, fp16 resident)\n"
                  f"[H3-FaceResample] 完成: 画布 {tuple(px.shape)} ({int(px.shape[0])} 行, "
                  f"与 crop_images 行结构一致, fp16 驻留)")
+
         if text_cond_hits:
             h3ff.log(f"[H3-FaceResample] text-cond cache: {len(text_cond_cache)} unique combo(s), "
                      f"{text_cond_hits} block(s) reused, Qwen3-VL encoded once\n"
                      f"[H3-FaceResample] 文本条件缓存: {len(text_cond_cache)} 个唯一组合, "
                      f"{text_cond_hits} 个块复用, Qwen3-VL 仅编码一次")
         
-        return io.NodeOutput(px.contiguous(), {"version": int(pack.get("version") or 5), "subtracks": subs, "a_lat": a_lat, "meta": pack.get("meta", {})})
+        return io.NodeOutput(px.contiguous(),
+                             {"version": int(pack.get("version") or 5), "subtracks": subs, "a_lat": a_lat, "meta": pack.get("meta", {})},
+                             identity_ref_out)
+
 
