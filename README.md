@@ -14,7 +14,7 @@ H3 的显存需求随分辨率、时长（每 +5s 翻倍）、精度（fp8→bf1
 支持latent缓存存取，方便推理过程中因某种原因导致推理中断后，快速跳过已推理分段，缓存文件以分段为单位存储，在采样节点上游参数不变的情况下，读取已有 latent cache 文件。  
 缓存磁盘占用：新增目录级上限，默认 32 GB，超出自动清理最旧文件（可用环境变量 H3_CACHE_MAX_GB 调整，设 0 关闭）
 
-⚠️注意：更改模型,包括lora、sageattention等加速节点时，latent检测不会发现更改，所以必须删除latent缓存（test分支V0.9.1 除外，已支持检测，如无效，亦可按本方法清除缓存），两种删除latent缓存的方法：  
+⚠️注意：更改模型,包括lora、sageattention等加速节点时，latent检测不会发现更改，所以必须删除latent缓存（test分支V0.9.1 以上版本除外，已支持检测，如无效，亦可按本方法清除缓存），两种删除latent缓存的方法：  
 - 开启Minimax_H3_AutoContext_Sampler节点上的 clear_cache 参数，这会在采样开始时，强制重新建立本节点缓存文件。
 - 手动删除缓存目录中的对应文件夹（\ComfyUI\output\cache），文件夹名为“node_” + “节点ID”。
 
@@ -33,6 +33,13 @@ H3 的显存需求随分辨率、时长（每 +5s 翻倍）、精度（fp8→bf1
 已安装，从 main 切到 test：
 
       git fetch origin  → git checkout test  → git pull
+
+### V0.9.2 （test分支）
+
+- 优化SR面部放大处理速度，边长小于192px的画面才会使用放大模型先做一次处理。
+- 优化自动提取id参考的选取逻辑。
+- Minimax_H3_Face_Cut 和 Minimax_H3_Face_Resample 节点上增加输出端口 identity_refs ，仅用于校验自动截取的每id参考图像，两个节点的输出相同。
+
 ### V0.9.1 （test分支）
 
 - 支持 checkpoint / 加速 LoRA / 改精度 / 挂函数级补丁后的缓存检测。
