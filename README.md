@@ -35,6 +35,8 @@ H3 的显存需求随分辨率、时长（每 +5s 翻倍）、精度（fp8→bf1
       git fetch origin  → git checkout test  → git pull
 ### V0.9.2 （test分支）
 
+<img width="1509" height="747" alt="image" src="https://github.com/user-attachments/assets/ce8931d0-a711-4cdc-8d3b-f1386008ce60" />
+
 - 优化SR面部放大处理速度，边长小于192px的画面才会使用放大模型先做一次处理。
 - 优化自动提取id参考的选取逻辑。
 - Minimax_H3_Face_Cut 和 Minimax_H3_Face_Resample 节点上增加输出端口 identity_refs ，仅用于校验自动截取的每id参考图像，两个节点的输出相同。
