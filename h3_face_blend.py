@@ -1,35 +1,14 @@
-"""h3_face_blend.py — 修脸第 3 步: 缩放 + 像素贴回 (v16, motion_align 位置修正)
+"""h3_face_blend.py — 修脸第 3 步: 缩放 + 像素贴回 (无 VAE)。
 
-v16 变更:
-- 新增 motion_align (默认开): 逐帧估计重采样画布脸相对原帧脸的位置漂移并抵消 —
-  把贴回的脸"粘"到原帧面部的真实位置上, 运动完全继承原视频, 消除贴回后抖动
-  (尤其高 σ 块边界)。估计: 统一分辨率中心模板 NCC (FFT 批量互相关 + 亚像素
-  抛物线) + 峰值强度/显著性双门控 + 时间中值平滑 + 失败帧线性插值; 修正与
-  亚像素几何合并为一次 grid_sample, 无修正帧位精确直通。纯 torch 无新增依赖,
-  软失败回退普通贴回。
-- (v15.1) lowfreq_lock 默认关: 只适用于低 σ 细节锐化; 修崩坏脸请保持关闭。
+逐子轨把 Resample 画布行缩放回原帧窗口并像素级贴回。要点:
+- 窗口几何: 支持 FaceCut 逐帧 S_list (窗口随脸缩放), 旧 pack 回退常数 S。
+- motion_align (默认开): 中心模板 NCC 估计画布脸相对原帧的位置漂移并抵消,
+  贴回运动完全继承原视频, 消除高 σ 块边界抖动; 软失败回退普通贴回。
+- lowfreq_lock: 低频取原帧 / 高频取画布, 仅适用低 σ 细节锐化; 修崩坏脸保持关。
+- use_sec_mask / masks 端口: 可选 SeC mask 贴回 (只贴人脸), 行与画布 1:1;
+  alpha 来源优先级: 端口 > pack 内置 > 羽化框回退。
+- 等尺寸 run 分块批处理, 自动 GPU (无 CUDA 回退 CPU), 纯 torch 无新增依赖。
 
-v15 变更:
-- 金字塔低频锁定 (lowfreq_lock): mix = blur(原帧) + (画布 - blur(画布));
-  锁定 σ 取窗口 5%, 钳制 [4,14]px。
-- 张量主路径按 等尺寸 run 分块批处理, 自动用 GPU (无 CUDA 回退 CPU):
-  缩放/亚像素采样/混合全部批量化; 无亚像素偏移的帧保持位精确直通,
-  有偏移的帧与旧版逐帧 grid_sample 同一算子 (仅批量化)。
-- scipy mask 腐蚀/羽化保持逐帧 CPU 原实现 (结果不变)。
-
-v14 变更:
-- 支持 v20 FaceCut 的逐帧窗口 (subtrack 内新增 S_list): 每帧按各自的 S_fr 缩放画布行
-  并贴回 — 窗口随脸平滑缩放, 同一身份贴回无直切感; 旧 pack (无 S_list) 自动回退
-  每子轨常数 S, 行为与 v13 一致。
-- mask alpha 改为逐帧生成 (腐蚀/羽化随该帧 S_fr 等比缩放)。
-- 日志收编: 常规运行只保留 出口摘要 + 警告; 逐子轨细节走 h3ff.vlog。
-
-v13 变更:
-- 新增可选输入端口 masks (来自 Minimax_H3_Face_Cut 的 MASK 输出, 直连线, 不经过 Resample)。
-  行结构与 crop_images/画布 1:1 对齐 (Cut 侧保证), 1=人脸。
-- alpha 来源优先级: masks 端口 > face_pack 内置 masks (旧接线兼容) > 羽化框回退。
-- use_sec_mask=False 时忽略一切 mask, 行为与 v11 box 羽化完全一致。
-- feather_px 复用: box 模式羽化矩形边; mask 模式 = 腐蚀 feather/2 + blur σfeather/2。
 """
 import numpy as np
 import torch
@@ -120,11 +99,12 @@ _MA_WORK = 192      # 估计分辨率 (所有窗口统一 area 降采样到此�
 _MA_TMPL = 0.40     # 模板边长占窗口比例 (≈脸区域 — 刻意小于窗口: 画布背景基本
                     #   原地, 模板混入背景会把相关性"锚"在背景上, 测不出脸的漂移)
 _MA_SEARCH = 0.15   # 搜索半径占窗口比例
-_MA_PEAK = 0.30     # NCC 峰值强度下限 (低于 → 该帧不可靠)
+_MA_PEAK = 0.22     # NCC 峰值强度下限 (低于 → 该帧不可靠)
 _MA_PROM = 2.5      # 峰值显著性下限 (峰值 / 搜索面中值绝对值)
-_MA_MED = 5         # Hampel 离点检测窗宽
+_MA_MED = 9         # Hampel 离点检测窗宽
 _MA_MAXSH = 0.125   # 单帧修正量上限 (占窗口边长比例)
-
+_MA_GSIGMA = 2.5    # 零相位高斯 σ (帧)
+_MA_SEC = 1.15      # 次峰抑制比 (峰值 / ±3邻域外最大值)
 
 def _ma_interp1d(idx, vi, vals):
     """1D 线性插值 (np.interp 语义: 越界取端值)。idx [K] 查询; vi [m] 升序; vals [m]。"""
@@ -134,34 +114,51 @@ def _ma_interp1d(idx, vi, vals):
     return vals[pos - 1] * (1.0 - w) + vals[pos] * w
 
 
+def _grad2d(x):
+    """[m,W,W] 中心差分梯度幅值 — 平坦区权重归零, 相关由边缘/纹理主导。"""
+    gx = x[:, :, 2:] - x[:, :, :-2]
+    gx = torch.nn.functional.pad(gx, (1, 1, 0, 0))
+    gy = x[:, 2:, :] - x[:, :-2, :]
+    gy = torch.nn.functional.pad(gy, (0, 0, 1, 1))
+    return torch.sqrt(gx * gx + gy * gy + 1e-8)
+
+def _gauss1d_f(arr, sigma):
+    """零相位高斯平滑 (replicate 边界) — 不引入时间滞后。"""
+    if float(sigma) <= 0.0:
+        return np.asarray(arr, dtype=np.float32)
+    r = max(1, int(round(3.0 * float(sigma))))
+    x = torch.arange(-r, r + 1, dtype=torch.float32)
+    k = torch.exp(-(x * x) / (2.0 * float(sigma) ** 2))
+    k = k / k.sum()
+    t = torch.from_numpy(np.ascontiguousarray(arr, dtype=np.float32))[None, None]
+    return torch.nn.functional.conv1d(
+        torch.nn.functional.pad(t, (r, r), mode="replicate"), k[None, None])[0, 0].numpy()
+
 def _ma_clean(arr, ok, K):
-    """失败帧线性插值 → Hampel 离点剔除 (中值±3.5σ 外才替换, 保留真实阶跃 —
-    块边界跳变是真实信号不能抹平) → [1,2,1]/4 轻平滑 (白噪声减半)。"""
+    """失败帧线性插值 → 中值(9) (保阶跃、压尖刺) → 零相位高斯(σ=2.5)。
+    替代旧版 Hampel + [1,2,1]/4: 旧版只把白噪声减半, 残噪逐帧直通进贴回网格
+    = 贴回抖动主因; 新链噪声抑制强一个量级且同样零相位, 块边界真实阶跃保留。"""
     if not bool(ok.any()):
         return torch.zeros(K)
     vi = torch.nonzero(ok).flatten()
     if int(vi.numel()) == 1:
-        return arr[vi].repeat(K)
-    o = _ma_interp1d(torch.arange(K, dtype=torch.float32), vi.float(), arr[vi])
-    pad = torch.cat([o[:1].repeat(2), o, o[-1:].repeat(2)])
-    win = pad.unfold(0, _MA_MED, 1)                     # [K,5]
-    med = win.median(dim=1).values
-    mad = (win - med[:, None]).abs().median(dim=1).values
-    thr = 3.5 * 1.4826 * mad + 0.5
-    o = torch.where((o - med).abs() > thr, med, o)
-    # [1,2,1]/4 轻平滑: 估计白噪声减半, 阶跃仅 1 帧过渡
-    pad = torch.cat([o[:1], o, o[-1:]])
-    win3 = pad.unfold(0, 3, 1)
-    return (win3[:, 0] + 2.0 * win3[:, 1] + win3[:, 2]) * 0.25
+        a2 = arr[vi].repeat(K).numpy().astype(np.float32)
+    else:
+        a2 = _ma_interp1d(torch.arange(K, dtype=torch.float32),
+                          vi.float(), arr[vi]).numpy().astype(np.float32)
+    r = _MA_MED // 2
+    med = np.empty(K, dtype=np.float32)
+    for i in range(K):
+        med[i] = np.median(a2[max(0, i - r): i + r + 1])
+    return torch.from_numpy(_gauss1d_f(med, _MA_GSIGMA))
 
 
 def _motion_align_track(img, can_rows, geo, f0, sizes, K, dev):
-    """估计整条子轨每帧的贴回总偏移 (dx, dy) — 单位: 该帧窗口 Su 的像素。
-
-    img: 原视频 [T,H,W,3] (CPU); can_rows: 画布行 [K,res,res,3] (CPU, 可 fp16);
-    geo[i] = (ix1, iy1, fx, fy); sizes[i] = 该帧窗口边长。
-    返回 (dx, dy): 两个 [K] CPU float32 总偏移 (已含 fx/fy 亚像素补偿),
-    可直接作为贴回网格的采样偏移。全帧失败 → 全零 (等价旧行为)。"""
+    """v18 = v16 中心模板 NCC 骨架 + 三处强化:
+    ① 梯度幅值域 (对扩散重绘的非线性色调漂移更稳);
+    ② 次峰抑制门控 (唯一尖峰才可信, 平台/周期纹理剔除);
+    ③ 时域 中值(9)+零相位高斯(2.5) 替代 Hampel+[1,2,1]/4 (残噪直通是抖动主因)。
+    接口/返回与 v16 一致: (dx, dy) 已含 fx/fy; 全帧失败回退 fx/fy。"""
     try:
         W = _MA_WORK
         t = max(24, int(W * _MA_TMPL)) & ~1
@@ -170,12 +167,9 @@ def _motion_align_track(img, can_rows, geo, f0, sizes, K, dev):
         S = torch.arange(p0 - R, p0 + R + 1, device=dev)
         n_s = int(S.numel())
         P2 = W + t
-
-        # 逐帧测得的总偏移 (W 坐标, 含 fx 补偿)
         meas_x = torch.full((K,), float("nan"))
         meas_y = torch.full((K,), float("nan"))
         ok = torch.zeros(K, dtype=torch.bool)
-
         CH = 32
         for c0 in range(0, K, CH):
             c1 = min(c0 + CH, K)
@@ -190,14 +184,12 @@ def _motion_align_track(img, can_rows, geo, f0, sizes, K, dev):
             A = torch.stack(A_l)
             B = torch.stack(B_l)
             del A_l, B_l
-            T = B[:, p0:p0 + t, p0:p0 + t]                  # 模板 = 画布中心 (脸)
-
-            # G[s] = Σ_x A[x]·T[x-s] (互相关; 零填充到 P2 保证线性无环绕)
+            A = _grad2d(A)                       # ← v18①
+            B = _grad2d(B)                       # ← v18①
+            T = B[:, p0:p0 + t, p0:p0 + t]       # 模板 = 画布中心 (脸)
             FA = torch.fft.rfft2(A, s=(P2, P2))
             FT = torch.fft.rfft2(T, s=(P2, P2))
             G = torch.fft.irfft2(FA * torch.conj(FT), s=(P2, P2))
-
-            # NCC 归一: A 的 t×t 盒滤波 (积分图) — 只在搜索网格上取值
             Ap = torch.zeros_like(G)
             Ap[:, :W, :W] = A
             II1 = torch.cumsum(torch.cumsum(Ap, dim=1), dim=2)
@@ -212,20 +204,31 @@ def _motion_align_track(img, can_rows, geo, f0, sizes, K, dev):
 
             S1 = _win(II1)
             S2 = _win(II2)
-            meanT = T.mean(dim=(1, 2))                       # [m]
+            meanT = T.mean(dim=(1, 2))
             ssT = ((T - meanT[:, None, None]) ** 2).sum(dim=(1, 2))
-            Gs = G.index_select(1, S).index_select(2, S)     # [m,n_s,n_s]
+            Gs = G.index_select(1, S).index_select(2, S)
             num = Gs - S1 * meanT[:, None, None]
             varA = torch.clamp(S2 - S1 * S1 / float(t * t), min=1e-8)
             ncc = num / torch.sqrt(varA * torch.clamp(ssT, min=1e-8)[:, None, None])
-
-            # 峰值 + 双门控
             flat = ncc.reshape(ncc.shape[0], -1)
             pk, arg = flat.max(dim=1)
+            # ---- v18② 次峰抑制 ----
+            m_b = int(pk.shape[0])
+            ar = torch.arange(m_b, device=ncc.device)
+            py_, px_ = arg // n_s, arg % n_s
+            oy_, ox_ = torch.meshgrid(torch.arange(-3, 4, device=ncc.device),
+                                      torch.arange(-3, 4, device=ncc.device), indexing="ij")
+            ny_ = (py_[:, None] + oy_.reshape(1, -1)).clamp(0, n_s - 1)
+            nx_ = (px_[:, None] + ox_.reshape(1, -1)).clamp(0, n_s - 1)
+            sup = ncc.clone()
+            sup[ar[:, None], ny_, nx_] = -1e30
+            sec = sup.reshape(m_b, -1).max(dim=1).values
+            del sup
             med = flat.median(dim=1).values
-            good = (pk >= _MA_PEAK) & (pk / torch.clamp(med.abs(), min=1e-3) >= _MA_PROM)
+            good = (pk >= _MA_PEAK) \
+                 & (pk / torch.clamp(sec.abs(), min=1e-3) >= _MA_SEC) \
+                 & (pk / torch.clamp(med.abs(), min=1e-3) >= _MA_PROM)
 
-            # 亚像素抛物线 (边界回退整像素)
             def _sub3(v0, v1, v2):
                 dd, ee = v1 - v0, v1 - v2
                 s = 0.5 * (dd - ee) / (dd + ee) if (dd + ee) > 1e-12 else 0.0
@@ -239,23 +242,20 @@ def _motion_align_track(img, can_rows, geo, f0, sizes, K, dev):
                 sy = y0 + _sub3(nm[max(0, y0 - 1), x0], nm[y0, x0], nm[min(n_s - 1, y0 + 1), x0])
                 sx = x0 + _sub3(nm[y0, max(0, x0 - 1)], nm[y0, x0], nm[y0, min(n_s - 1, x0 + 1)])
                 gi = c0 + m_i
-                meas_x[gi] = (sx - R)          
+                meas_x[gi] = (sx - R)
                 meas_y[gi] = (sy - R)
                 ok[gi] = True
-
-        # 全部失败 → 回退 fx/fy (即旧版亚像素贴回, 不丢补偿)
         if not bool(ok.any()):
             fx_all = torch.tensor([float(geo[i][2]) for i in range(K)])
             fy_all = torch.tensor([float(geo[i][3]) for i in range(K)])
             return fx_all, fy_all
-
-        # 减去精确已知的 fx/fy (W 坐标) → 只平滑"运动"部分; 再加回精确值
         fx_w = torch.tensor([geo[i][2] * (W / float(sizes[i])) for i in range(K)])
         fy_w = torch.tensor([geo[i][3] * (W / float(sizes[i])) for i in range(K)])
-        mov_x = _ma_clean(meas_x - fx_w, ok, K)
+        mov_x = _ma_clean(meas_x - fx_w, ok, K)   # ← v18③
         mov_y = _ma_clean(meas_y - fy_w, ok, K)
-
-        # 换算到各帧 Su + 加回 fx + 钳制 ±12.5% 窗口 + 微小清零
+        _mm = mov_x.abs() + mov_y.abs()
+        h3ff.vlog(f"[H3-FaceBlend] ma_track: ok {int(ok.sum())}/{K}, "
+                  f"|mov| med={float(_mm.median()):.2f} max={float(_mm.max()):.2f} (W px)")
         sz = torch.tensor([float(s) for s in sizes])
         dx = mov_x * (sz / float(W)) + torch.tensor([float(geo[i][2]) for i in range(K)])
         dy = mov_y * (sz / float(W)) + torch.tensor([float(geo[i][3]) for i in range(K)])
@@ -274,6 +274,7 @@ def _motion_align_track(img, can_rows, geo, f0, sizes, K, dev):
                     torch.tensor([float(geo[i][3]) for i in range(K)]))
         except Exception:
             return torch.zeros(K), torch.zeros(K)
+
 
 
 class H3FaceBlend(io.ComfyNode):
