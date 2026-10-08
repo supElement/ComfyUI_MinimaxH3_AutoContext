@@ -824,24 +824,28 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
         print(f"[H3-Auto] Generating segment {idx+1}/{len(chunks)} (frames {start_f}-{end_f}) {account}\n[H3-Auto] 生成段 {idx+1}/{len(chunks)} (帧{start_f}-{end_f}) {account}")
     
         # ==================== 提示词构建 ====================
+
         window_prompt = prompt_getter(idx)
-    
         seg_ref_vid, seg_ref_aud = ref_vid_data, ref_aud_data
+        # 切片编码前判定: 本段提示词未声明 <Video N>/<Audio N> (raw 格式豁免) 时跳过切片,
+        _seg_declares_va = (prompt_format == "raw") or any(
+            m[0] in ("video", "audio") for m in _parse_ref_mentions(window_prompt))
         if ref_sync_mode == "segmented":
-            if seg_ref_vid or seg_ref_aud:
+            if (seg_ref_vid or seg_ref_aud) and _seg_declares_va:
                 print(f"[H3-Auto] Segment {idx+1}/{len(chunks)}: slicing and VAE encoding reference video/audio...\n[H3-Auto] 段 {idx+1}/{len(chunks)}: 正在切片并 VAE 编码参考视频/音频...")
-            seg_start_ratio = start_f / total_frames if total_frames > 0 else 0.0
-            seg_end_ratio = end_f / total_frames if total_frames > 0 else 0.0
-            seg_ref_vid = _slice_ref_videos_for_segment(
-                ref_vid_data, seg_start_ratio, seg_end_ratio,
-                vae, audio_vae, device, fps)
-            seg_ref_aud = _slice_ref_audios_for_segment(
-                ref_aud_data, seg_start_ratio, seg_end_ratio,
-                audio_vae, device)
-    
-        seg_ref_img, seg_ref_vid, seg_ref_aud, window_prompt = _filter_refs_for_prompt(
-            window_prompt, ref_img_data, seg_ref_vid, seg_ref_aud, fmt=prompt_format)
-    
+                seg_start_ratio = start_f / total_frames if total_frames > 0 else 0.0
+                seg_end_ratio = end_f / total_frames if total_frames > 0 else 0.0
+                seg_ref_vid = _slice_ref_videos_for_segment(
+                    ref_vid_data, seg_start_ratio, seg_end_ratio, vae, audio_vae, device, fps)
+                seg_ref_aud = _slice_ref_audios_for_segment(
+                    ref_aud_data, seg_start_ratio, seg_end_ratio, audio_vae, device)
+            elif (seg_ref_vid or seg_ref_aud) and not _seg_declares_va:
+                seg_ref_vid, seg_ref_aud = [], []
+                print(f"[H3-Auto] Segment {idx+1}/{len(chunks)}: prompt declares no <Video N>/<Audio N> — reference slicing/encoding skipped\n[H3-Auto] 段 {idx+1}/{len(chunks)}: 提示词未声明 <Video N>/<Audio N> — 跳过参考切片与编码")
+            seg_ref_img, seg_ref_vid, seg_ref_aud, window_prompt = _filter_refs_for_prompt(
+                window_prompt, ref_img_data, seg_ref_vid, seg_ref_aud, fmt=prompt_format)
+
+
         print("\033[32m" + f"[H3-Auto] ----- Segment {idx+1}/{len(chunks)} full prompt ({len(window_prompt)} chars) -----\n[H3-Auto] ----- 段 {idx+1}/{len(chunks)} 完整提示词 ({len(window_prompt)}字) -----" + "\033[0m")
         print(window_prompt)
         print(f"[H3-Auto] {'=' * 50}")
@@ -851,7 +855,8 @@ def run_auto_context_generation(model, vae, audio_vae, clip,
             seg_ref_img,
             seg_ref_vid,
             first_frame if is_first_chunk else None,
-            last_frame if is_last_chunk else None
+            last_frame if is_last_chunk else None,
+            seg_ref_aud,
         )
     
         # ----- 筛选属于当前段的外部 Keyframes -----
@@ -1180,7 +1185,7 @@ def _prepare_ref_images(ref_images, vae, device, gen_w, gen_h, crop_mode="stretc
             result.append({"pixel": resized, "latent": lat})
     return result
 
-def _compute_conditions_hash(ref_img_data, ref_vid_data, first_frame=None, last_frame=None):
+def _compute_conditions_hash(ref_img_data, ref_vid_data, first_frame=None, last_frame=None, ref_aud_data=None):
     """
     计算当前段实际使用的所有外部输入条件（像素）的指纹哈希。
     只对当前段真正用到的素材取指纹，避免跨段误判。
@@ -1189,7 +1194,8 @@ def _compute_conditions_hash(ref_img_data, ref_vid_data, first_frame=None, last_
     """
     hasher = hashlib.md5()
 
-    if not ref_img_data and not ref_vid_data and first_frame is None and last_frame is None:
+    if not ref_img_data and not ref_vid_data and not ref_aud_data \
+            and first_frame is None and last_frame is None:
         return "no_external_conditions"
 
     if first_frame is not None:
@@ -1207,6 +1213,11 @@ def _compute_conditions_hash(ref_img_data, ref_vid_data, first_frame=None, last_
         pixel = vid_data.get("pixel")
         if pixel is not None and pixel.shape[0] > 0:
             hasher.update(latent_cache.tensor_sig(pixel, 2048).encode())
+
+    for aud_data in (ref_aud_data or []):
+        wav = (aud_data.get("audio_dict") or {}).get("waveform")
+        if torch.is_tensor(wav) and wav.shape[-1] > 0:
+            hasher.update(latent_cache.tensor_sig(wav, 2048).encode())
 
     return hasher.hexdigest()
 
@@ -1257,6 +1268,8 @@ def _prepare_ref_videos(ref_videos, vae, audio_vae, device, gen_w, gen_h, fps,
             if v_lat is None:
                 continue
 
+        # pre_encode=False (segmented 模式): 只保留 pixel/audio_dict 供逐段切片
+        
         result.append({
             "pixel": frames,
             "video_latent": v_lat,
@@ -1279,6 +1292,7 @@ def _prepare_ref_audios(ref_audios, audio_vae, device, pre_encode=True):
             a_lat = _encode_audio(audio_vae, a, device)
             if a_lat is None:
                 continue
+        # pre_encode=False (segmented 模式): 只保留 audio_dict 供逐段切片, latent 留空
         result.append({"latent": a_lat, "audio_dict": a})
     return result
 

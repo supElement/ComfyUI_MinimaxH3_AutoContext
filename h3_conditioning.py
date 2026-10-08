@@ -174,6 +174,10 @@ def build_conditioning_payload(seed, frame_count,
         if user_refs_added >= max_user_slots:
             break
         v_lat = vid["video_latent"]
+        if v_lat is None:
+            # pre_encode=False 的未编码条目 (segmented 模式的切片源) 不是有效条件, 跳过
+            continue
+        
         a_lat = vid.get("audio_latent")
         if a_lat is not None:
             ref_items_for_clip.append({"type": "audio"})

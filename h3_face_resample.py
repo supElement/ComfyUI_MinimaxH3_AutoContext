@@ -1,48 +1,47 @@
-"""h3_face_resample.py — 修脸第 2 步: 画布重采样 (v19.5, 全帧保留 + 编码期网格补齐 + 日志收编)
+"""h3_face_resample.py — 修脸第 2 步: 画布重采样
 
-v19.5 变更 (C1-v3 图指纹体系 + 输入一致性):
-- face_prompt 默认文本更新 (更具体的抗融化/抗塑料质感描述; 已保存的工作流保留
-  其序列化值, 不受影响)。
-- 集成模式运行时缺参考图时回退本节点 ref_image_* 直连输入 (原先被直接忽略)。
-- 输入行/参考行统一 fp16 量化 (.to(fp16).float()): 与 Face_Cut v20.4 输出及缓存
-  路径位精确一致 → rows_hash 不再因缓存命中与否而漂移。
-- C1-v3: 独立模式以自身 hidden prompt 图指纹 (graph_fp) 入键, 覆盖本地权重链上
-  注意力后端等挂载节点的控件变化; 集成模式 rmeta 不变 (内容哈希传递性覆盖)。
-
-v19.4 变更 (通用性/速度/显存, 常规路径输出不变):
-- C1: 缓存键补齐 模型/VAE/CLIP 权重指纹 (model_fp/vae_fp/clip_fp) — 换 checkpoint、
-  换 4步/8步加速 LoRA、改精度/函数级补丁时旧缓存自动失效 (旧版完全没有模型指纹,
-  是"换加速档位对比效果却命中旧缓存"这类静默错误的总根源)。
-- P1: 噪声种子按身份固定 (不再逐块 +bi); noise_v=2 入键, 旧画布缓存一次性失效。
-- v4: auto_sigma/sigma_boost 已移除 (实测无效, 见节点历史);
-  σ 由用户直接在调度器上设定 (H3 修脸实测起点 >= 0.6)。
-- S1: rows_hash 由全量 fp16 字节 md5 (GB 级, 每次运行同步阻塞数秒) 改为
-  等距采样签名 (≤64K 元素), 单帧改动仍然覆盖。
-- S5: 逐块 soft_empty_cache 移除 (同身份块形状相同, 块间清空纯为分配器预热开销)。
-- V2: 画布行 fp16 驻留内存 (RAM 减半; 相对误差远低于 8bit 量化台阶)。
-- V3: VAE 解码 OOM 回退: 清缓存重试 → tiled 解码 (慢但优于崩溃), 常规路径不变。
-- C2: sampler_tag 的自定义采样器对象以 类名:采样函数名 入指纹 (旧版只记 "custom")。
-- 注: 曾计划的"跳过 ctx 头编码"优化经代码级分析放弃 — 17n+5 网格在时间上不可加,
-  分块编码的边界 token 依赖 ctx 帧的 VAE 感受野, 跳过会产生错误对齐。
-
-v19.3 — 日志收编: 常规运行只保留 入口摘要/出口摘要/警告/缓存命中; 逐身份/逐块/逐子轨
-细节走 h3ff.vlog (h3_facefix.py 顶部 _VERBOSE=True 打开)。结构逻辑与 v19.2 完全一致 —
-画布行恒为 res², 对 FaceCut v20 的逐帧窗口 (S_list) 天然兼容, 无需改动。
-
-v19.2 — 网格契约收窄为 17n+5 (5,22,39,56,73,90,...; token 数 ≡2 mod 5):
-- 这是本流水线所有既有编码路径 (token_blocks/_plan_blocks/face_split_blocks) 一致
-  使用并验证过的唯一契约; 相邻合法长度最大间隙 16 < _PAD_CAP=21 → 任何编码长度
-  都能一次补齐, 绝不因网格约束新增采样段/丢帧 (补帧=重复末帧, 解码后裁掉;
-  音频账本同步补齐, 时间跨度一致)。
-- 补帧上限 21 (实测标定): 覆盖最保守网格下最大间隙 16 仍不拆段 — 补帧代替分段。
-v19 — 网格约束移到编码期, FaceCut 不再丢帧。
-v9~v10: 行序=子轨序、输入已归一化 res², 分块编码, 采样→解码→裁掉 ctx 头, 行 1:1 替换。
+当前版本要点:
+- 两种接线模式:
+    集成 (info 接主采样): 本地 model/vae/clip/提示词/fps/parameter 忽略
+      (唯一例外: parameter.shot_prompts); h3_runtime / seg_sizes /
+      boundaries / segment_prompts / decoded_frames 全部取自 info。
+    独立 (info 留空, 修普通视频): model/vae/clip/采样器取本节点端口,
+      提示词/fps/分段取 parameter。
+- 网格契约: 合法编码长度 = 17n+5 (5,22,39,56,73,90,...)。任何编码长度都一次
+  补齐到最近合法长度 (补帧=重复末帧, 解码后裁掉; 音频账本同步补齐, 时间跨度
+  一致); 补帧上限 _PAD_CAP=21 (覆盖最保守网格下最大间隙 16), 绝不因网格约束
+  新增采样段/丢帧。解码后裁掉 ctx 头与补帧尾, 每块恰好贡献 (b1-b0) 行画布。
+- 分块: 集成模式按主采样实际段边界切块 (与 _pick_prompt 的提示词映射同源);
+  独立模式按 parameter.chunk_frames/context_frames 切块。同身份连续子轨合并
+  为一条采样序列; 跨镜头单元强制断开。
+- 块间续接: ctx 头锚定上一块尾部 (与主采样 _copy_overlap_tail + noise_mask=0
+  同逻辑); noise_mask 同时处理 ctx 头与 lock_audio/audio_drive (音频区不重
+  采样)。单脸模式下窗口跳变过大时该边界不锚定 (防换人)。
+- 身份锚: 优先 Face_Cut 已验证的 ref_row/ref_image (干净参考: 源帧按锚定窗口
+  重采样, 未经 pre_blur/SR); 旧 pack 无 ref_row 时回退纯清晰度选锚并警告。
+  注入为 <Picture N> 参考; 与 face_prompt、身份固定噪声种子共同构成抗抖三件套。
+- 缓存键 (rmeta): rows_hash / a_lat_hash / 块种子 / σ阶梯 / 提示词哈希 /
+  参考素材 conditions_hash / sampler_tag / plan_hash / chunk/ctx 预算 /
+  model_fp / vae_fp / clip_fp / noise_v / prompt_v / identity_ref_fp;
+  独立模式额外入自身图指纹 graph_fp (覆盖本地权重链上注意力后端等挂载节点
+  的控件变化)。任一敏感键变更 → 旧缓存自动失效。
+- 音频账本: pack.a_lat (latent 模式) > audio 端口 (images 模式) > 静音占位。
+- 文本条件缓存: 同 prompt + 同参考素材 + 同 CLIP 权重跳过 Qwen3-VL 编码;
+  键含像素内容而非仅数量 (换参考图不会假命中)。
+- 输入行/参考行统一 fp16 量化 (.to(fp16).float()): 与 Face_Cut v20.4 输出
+  位精确一致 → rows_hash 不因缓存命中与否漂移。
+- 输出画布行 fp16 驻留内存 (RAM 减半); 逐子轨色彩匹配 (Reinhard) 在缓存加载
+  之后执行 — 切换 color_match 不会使缓存失效。
+- VAE 解码 OOM 回退: 清缓存重试 → tiled 解码 (慢但优于崩溃)。
+- 日志收编: 常规运行只保留入口摘要/出口摘要/警告/缓存命中; 逐身份/逐块/逐
+  子轨细节走 h3ff.vlog (h3_facefix.py 顶部 _VERBOSE=True 打开)。
 """
 import torch
 import comfy.sample
 import comfy.samplers
 import comfy.model_management
 import comfy.nested_tensor
+import latent_preview
 import os
 import re
 import hashlib
@@ -296,7 +295,8 @@ def _resolve_audio_latent(raw):
 def _merge_runtime(rt_info, parameter, model, vae, audio_vae, clip, sampler_name,
                    scheduler, sampler_obj, seed, ref_images):
     """构建 h3_runtime (prompt/fps 本地端口已删除, 一律取自 parameter 或 info)。
-    集成模式 (rt_info 非空): info 的非 None 键覆盖一切 (唯一例外: parameter.shot_prompts)。
+    集成模式 (rt_info 非空): info 的非 None 键覆盖一切 
+    (例外: parameter.shot_prompts; ref_images/ref_videos 由 execute 层的本地端口覆盖逻辑接管)。 
     独立模式: parameter 必选。"""
     rt_local = {
         "model": model, "vae": vae, "audio_vae": audio_vae, "clip": clip,
@@ -432,15 +432,26 @@ class H3FaceResample(io.ComfyNode):
                                          "only: refs are passed to a block only if its prompt mentions them)\n"
                                          "参考图 (提示词中用 <Picture N> 引用 — 声明才引用: 仅当块提示词提到时才传递)"),
                     prefix="ref_image_", min=0, max=9)),
+                
+                io.Autogrow.Input("ref_videos", optional=True, template=io.Autogrow.TemplatePrefix(
+                    input=io.Image.Input("ref_video", tooltip="Reference video frames (24fps, 2-15s). Consumed only when the "
+                    "block prompt declares <Video N>. Local port OVERRIDES info-passed reference videos when "
+                    "non-empty; in segmented mode each block takes only its matching time slice (lip sync via "
+                    "the paired audio)\n"
+                    "参考视频帧 (24fps, 2-15s)。仅当块提示词声明 <Video N> 时传入。本地端口非空时优先于 "
+                    "info 传入的参考视频；segmented 模式下每个采样块只取对应时间切片 (配对音轨驱动口型)"),
+                    prefix="ref_video_", min=0, max=3)),
+                io.Autogrow.Input("ref_video_audios", optional=True, template=io.Autogrow.TemplatePrefix(
+                    input=io.Audio.Input("ref_video_audio", tooltip="Paired audio track of the reference video with the same "
+                    "index (lip sync). Leave empty for a silent reference video\n"
+                    "同编号参考视频的配对音轨 (口型同步)。不接则该参考视频作为无声参考传入"),
+                    prefix="ref_video_audio_", min=0, max=3)),
+                
                 io.String.Input(
                     "face_prompt",
                     multiline=True,
                     default=(
-                        "clear and well-defined facial structure: sharp but natural eye contours, distinct iris and pupil, "
-                        "defined eyelid crease, clear lip shape, natural eyebrow structure; "
-                        "skin retains visible pores and natural highlight rolloff; "
-                        "no blur, no smearing, no distortion, no melting or twisted features; "
-                        "not smoothed into a plastic or mask-like appearance"
+                        "Enhance this video with sharp, crisp details while preserving a natural photorealistic appearance. "
                     ),
                     tooltip="Face-repair prompt, composed with the original per-segment prompt according to "
                             "prompt_mode. Scene prompts from the parameter node are written for whole-shot "
@@ -495,6 +506,7 @@ class H3FaceResample(io.ComfyNode):
                 clear_cache=False, color_match=True, audio=None, parameter=None,
                 model=None, vae=None, audio_vae=None, clip=None, sampler_name="euler",
                 scheduler="simple", sampler=None, ref_images=None,
+                ref_videos=None, ref_video_audios=None,
                 face_prompt="", prompt_mode="prepend",
                 identity_ref=True) -> io.NodeOutput:
         h3_patches.apply_patches()  
@@ -503,22 +515,33 @@ class H3FaceResample(io.ComfyNode):
             raise ValueError("[H3-FaceResample] pack version mismatch — rerun H3FaceCut\n"
                              "[H3-FaceResample] bbox 版本不符 — 请重跑 Face_Cut")
         a_lat = pack.get("a_lat")
-
+        # ---- 本地 ref_video/ref_video_audio Autogrow 端口组装 ----
+        ref_video_audios = ref_video_audios or {}
+        ref_video_list = []
+        for i in range(4):
+            vval = (ref_videos or {}).get(f"ref_video_{i}")
+            if vval is None:
+                continue
+            ref_video_list.append({"video": vval,
+                                   "audio": ref_video_audios.get(f"ref_video_audio_{i}")})
         # ---- 运行时: info (集成) > parameter > 本地端口 (独立兜底) ----
         rt_info = {}
         if isinstance(info, dict) and isinstance(info.get("h3_runtime"), dict):
             rt_info = info["h3_runtime"]
-        rt = _merge_runtime(rt_info, parameter, model, vae, audio_vae, clip,
-                            sampler_name, scheduler, sampler, seed, ref_images)
-                            
-        if not rt.get("ref_images") and ref_images:
+        rt = _merge_runtime(rt_info, parameter, model, vae, audio_vae, clip, sampler_name, scheduler, sampler, seed, ref_images)
+        # if not rt.get("ref_images") and ref_images:
+        if ref_images:
             rt["ref_images"] = _autogrow_to_list(ref_images, "ref_image_", 10)
-            
+        # ---- 本地 ref_video 端口优先级高于 info 传入: 端口非空即覆盖, 为空时沿用 info ----
+        if ref_video_list:
+            rt["ref_videos"] = ref_video_list
         if rt_info:
             h3ff.log("\033[33m[H3-FaceResample] integrated mode: local model/vae/clip/prompt/fps/"
-                     "parameter ignored (exception: parameter.shot_prompts), h3_runtime from info\n"
+                     "parameter ignored (exceptions: parameter.shot_prompts + ref_image/ref_video ports), "
+                     "h3_runtime from info\n"
                      "[H3-FaceResample] 集成模式: 本地 model/vae/clip/提示词/fps/parameter 已忽略 "
-                     "(例外: parameter.shot_prompts), 以 info 的 h3_runtime 为准\033[0m")
+                     "(例外: parameter.shot_prompts 与 ref_image/ref_video 本地端口), "
+                     "以 info 的 h3_runtime 为准\033[0m")
         else:
             h3ff.log("[H3-FaceResample] standalone mode: model/vae/clip/sampler from local ports; "
                      "prompt/fps/segmentation from parameter\n"
@@ -613,12 +636,12 @@ class H3FaceResample(io.ComfyNode):
                  f"{len(todo)}/{len(subs)} 条子轨待采样 (网格 17n+5, 补帧上限 {_PAD_CAP}, "
                  f"音频锁定={lock_a}, 参考切片={ref_sync})")
 
-        ri = (h3_sampler._prepare_ref_images(rt.get("ref_images"), vae, device, res, res, crop_mode)
-              if rt.get("ref_images") else [])
-        rv = (h3_sampler._prepare_ref_videos(rt.get("ref_videos"), vae, audio_vae, device, res, res, ref_fps, crop_mode)
-              if rt.get("ref_videos") else [])
-        ra = (h3_sampler._prepare_ref_audios(rt.get("ref_audios"), audio_vae, device)
-              if rt.get("ref_audios") else [])
+        # segmented 模式跳过全量预编码: 参考视频/音频只在各块切片时编码
+        segmented_active = (ref_sync == "segmented") and bool(rt.get("ref_videos") or rt.get("ref_audios")) and n_frames_total > 0
+        ri = (h3_sampler._prepare_ref_images(rt.get("ref_images"), vae, device, res, res, crop_mode) if rt.get("ref_images") else [])
+        rv = (h3_sampler._prepare_ref_videos(rt.get("ref_videos"), vae, audio_vae, device, res, res, ref_fps, crop_mode, pre_encode=(not segmented_active)) if rt.get("ref_videos") else [])
+        ra = (h3_sampler._prepare_ref_audios(rt.get("ref_audios"), audio_vae, device, pre_encode=(not segmented_active)) if rt.get("ref_audios") else [])
+
 
         # ---- 节点缓存 (与主采样器同款) ----
         try:
@@ -659,9 +682,15 @@ class H3FaceResample(io.ComfyNode):
         _cm = hashlib.md5()
         _cm.update((h3_sampler._compute_conditions_hash(ri, rv) if (ri or rv) else "no_ref").encode())
         for _a in ra:
-            if _a.get("latent") is not None:
-                _cm.update(_a["latent"].detach().float().cpu().numpy().tobytes())
+            _lat = _a.get("latent")
+            if _lat is not None:
+                _cm.update(_lat.detach().float().cpu().numpy().tobytes())
+            else:
+                _w = (_a.get("audio_dict") or {}).get("waveform")
+                if torch.is_tensor(_w):
+                    _cm.update(latent_cache.tensor_sig(_w, 4096).encode())
         conditions_hash = _cm.hexdigest()
+
         _so = rt.get("sampler_obj")
         if _so is not None:
             _sfn = getattr(_so, "sampler_function", None)
@@ -672,7 +701,8 @@ class H3FaceResample(io.ComfyNode):
         model_fp = latent_cache.model_fingerprint(model)
         vae_fp = latent_cache.vae_fingerprint(vae)
         clip_fp = latent_cache.clip_fingerprint(clip)
-        segmented_active = (ref_sync == "segmented") and bool(rv or ra) and n_frames_total > 0
+        # segmented_active = (ref_sync == "segmented") and bool(rv or ra) and n_frames_total > 0
+
         if (ref_sync == "segmented") and (rv or ra) and not segmented_active:
             h3ff.vlog("[H3-FaceResample] ref_sync=segmented but total frame count unknown, "
                       "refs passed in full\n"
@@ -803,6 +833,7 @@ class H3FaceResample(io.ComfyNode):
 
         canvas_rows = []
         identity_ref_frames = []
+        overall_pbar = comfy.utils.ProgressBar(gi_total)
         for pi, p in enumerate(plans):
             group, tid, off, K = p["group"], p["tid"], p["off"], p["K"]
             blocks, gi_base = p["blocks"], p["gi_base"]
@@ -949,23 +980,42 @@ class H3FaceResample(io.ComfyNode):
                     enc0 = f0_first + b0 - ctx
                     prompt_b = block_meta[bi]["prompt"]
                     src_name = block_meta[bi]["src"]
+
                     blk_ri, blk_rv, blk_ra = ri_eff, rv, ra
+                    # ---- 提前解析本块提示词的引用声明: 未声明 <Video N>/<Audio N> 时跳过切片,
+                    _fmt_b = str(rt.get("prompt_format") or "official")
+                    _mentions = h3_sampler._parse_ref_mentions(prompt_b)
+                    _declares_va = (_fmt_b == "raw") or any(m[0] in ("video", "audio") for m in _mentions)
                     if segmented_active:
-                        try:
-                            blk_rv = h3_sampler._slice_ref_videos_for_segment(
-                                rv, block_meta[bi]["s_r"], block_meta[bi]["e_r"], vae, audio_vae, device, ref_fps)
-                            blk_ra = h3_sampler._slice_ref_audios_for_segment(
-                                ra, block_meta[bi]["s_r"], block_meta[bi]["e_r"], audio_vae, device)
-                        except Exception as _e:
-                            h3ff.warn(f"[H3-FaceResample] ref slicing failed ({_e}), passing full refs\n"
-                                      f"[H3-FaceResample] 参考切片失败 ({_e})，回退全量传递")
-                            blk_rv, blk_ra = rv, ra
+                        if _declares_va:
+                            try:
+                                blk_rv = h3_sampler._slice_ref_videos_for_segment(
+                                    rv, block_meta[bi]["s_r"], block_meta[bi]["e_r"], vae, audio_vae, device, ref_fps)
+                                blk_ra = h3_sampler._slice_ref_audios_for_segment(
+                                    ra, block_meta[bi]["s_r"], block_meta[bi]["e_r"], audio_vae, device)
+                            except Exception as _e:
+                                h3ff.warn(f"[H3-FaceResample] ref slicing failed ({_e}), re-encoding full refs for this block\n"
+                                          f"[H3-FaceResample] 参考切片失败 ({_e})，本块回退为全量参考 (即时编码)")
+                                try:
+                                    blk_rv = h3_sampler._prepare_ref_videos(rt.get("ref_videos"), vae, audio_vae, device, res, res, ref_fps, crop_mode, pre_encode=True)
+                                    blk_ra = h3_sampler._prepare_ref_audios(rt.get("ref_audios"), audio_vae, device, pre_encode=True)
+                                except Exception as _e2:
+                                    h3ff.warn(f"[H3-FaceResample] full-ref fallback failed ({_e2}), this block gets no refs\n"
+                                              f"[H3-FaceResample] 全量参考回退失败 ({_e2})，本块不传参考")
+                                    blk_rv, blk_ra = [], []
+                        else:
+                            # 本块未声明 <Video N>/<Audio N>: 跳过切片与 VAE 编码 (省一次)
+                            blk_rv, blk_ra = [], []
+                            h3ff.vlog(f"[H3-FaceResample] block frames [{f0_first + b0},{f0_first + b1}): prompt declares "
+                                      f"no <Video N>/<Audio N> — reference slicing/encoding skipped\n"
+                                      f"[H3-FaceResample] 块帧 [{f0_first + b0},{f0_first + b1}): 提示词未声明 "
+                                      f"<Video N>/<Audio N> — 跳过参考切片与编码")
+                
                     # ---- 声明才引用: 提示词提到 <Picture N> 等才传递参考素材 ----
                     try:
-                        _mentions = h3_sampler._parse_ref_mentions(prompt_b)
                         if _mentions:
                             blk_ri, blk_rv, blk_ra, prompt_b = h3_sampler._filter_refs_for_prompt(
-                                prompt_b, blk_ri, blk_rv, blk_ra, fmt=str(rt.get("prompt_format") or "official"))
+                                prompt_b, blk_ri, blk_rv, blk_ra, fmt=_fmt_b)
                             if not blk_ri and any(m[0] == "picture" for m in _mentions):
                                 h3ff.warn(f"[H3-FaceResample] block frames [{f0_first + b0},{f0_first + b1}): picture refs "
                                           f"declared but none resolved — check ref count\n"
@@ -982,7 +1032,7 @@ class H3FaceResample(io.ComfyNode):
                     except Exception as _e:
                         h3ff.warn(f"[H3-FaceResample] ref filter failed ({_e}), passing all refs\n"
                                   f"[H3-FaceResample] 参考过滤失败 ({_e})，回退全量传递")
-
+                
                     base_lat = h3ff.encode_frames_adaptive(vae, enc_px.contiguous(), want_t=T_blk, tag=f"[身份{tid} 块{bi + 1}]")
                     if base_lat is None:
                         raise RuntimeError("[H3-FaceResample] canvas encoding failed\n[H3-FaceResample] 画布编码失败")
@@ -1082,11 +1132,13 @@ class H3FaceResample(io.ComfyNode):
 
                     s = block_seeds[bi]
                     noise = comfy.sample.prepare_noise(latent_i, s)
+                    callback = latent_preview.prepare_callback(model, k)
+                    disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
                     try:
                         if rt.get("sampler_obj") is not None:
                             out_s = comfy.sample.sample_custom(
                                 model, noise, CFG, rt["sampler_obj"], fix_sig_id, positive, [], latent_i,
-                                noise_mask=mask, disable_pbar=False, seed=s)
+                                noise_mask=mask, callback=callback, disable_pbar=disable_pbar, seed=s)
                         else:
                             ks = comfy.samplers.KSampler(
                                 model, steps=k, device=model.load_device,
@@ -1094,9 +1146,11 @@ class H3FaceResample(io.ComfyNode):
                                 scheduler=rt.get("scheduler", "simple"),
                                 denoise=1.0, model_options=model.model_options)
                             out_s = ks.sample(noise, positive, [], cfg=CFG, latent_image=latent_i,
-                                              denoise_mask=mask, sigmas=fix_sig_id, callback=None,
-                                              disable_pbar=False, seed=s, force_full_denoise=True)
+                                              denoise_mask=mask, sigmas=fix_sig_id,
+                                              callback=callback, disable_pbar=disable_pbar, seed=s,
+                                              force_full_denoise=True)
                         v_i, _ = h3_conditioning.unpack_nested_latent({"samples": out_s})
+
                     except Exception as e:
                         import traceback
                         traceback.print_exc()
@@ -1142,6 +1196,7 @@ class H3FaceResample(io.ComfyNode):
                               f"补{pad}帧→{enc_legal} (17n+5, 上下文 {ctx}) 保留 {int(px_i.shape[0])}, "
                               f"参考({len(blk_ri)}图/{len(blk_rv)}视频/{len(blk_ra)}音频), 提示词: {src_name}")
                     del base_lat, audio_blk, latent_i, noise, out_s, v_i, px_i
+                    overall_pbar.update(1)
                 rows = torch.cat(blk_parts, dim=0).contiguous()
                 if int(rows.shape[0]) != K:
                     raise RuntimeError(f"[H3-FaceResample] identity {tid} row accounting mismatch: "

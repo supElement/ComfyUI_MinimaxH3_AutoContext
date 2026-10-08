@@ -1,34 +1,31 @@
-"""h3_face_cut.py — 修脸第 1 步: 分镜优先的检测与稳定裁剪 (v20.4, 逐帧平滑窗口)
+"""h3_face_cut.py — 修脸第 1 步: 分镜优先的检测与稳定裁剪
 
-v20.4 变更 (GPU 批量化 + pre_blur, 检测/几何语义不变):
-- 采样/缩放 GPU 批量化: _sample_windows 逐帧 CPU grid_sample → 整批上卡
-  (uint8 上传 + 批量 grid_sample, OOM 自动减半重试); 无 SR 模型路径的
-  common_upscale(lanczos, CPU) → interpolate bicubic+antialias(GPU)。
-  → win_v 2→3: 缩放算法变化使旧缓存值与新产物不一致, 升级后旧缓存失效一次。
-- 输出 crop_images 统一 fp16 量化 (.to(fp16).float()): 新鲜输出与缓存命中输出
-  位精确一致 (缓存本体即 fp16), 下游 rows_hash 不再漂移。
-- 新参数 pre_blur (默认 0=关): 裁剪窗在 SR/bicubic 放大前可选高斯预模糊 —
-  压制源噪声/插值锯齿, 提高小脸 SR 稳定性。已入缓存键。
-- _track_work 精确进度条总量 (原 F_expect 高估, 进度条到不了头)。
-
-v20 变更 (同一身份裁剪平滑化, 远景小脸占比不受影响):
-- 窗口边长 S 从"每个 DP 分段一个常数"改为"逐帧一条平滑序列":
-    S_t = 该帧脸尺寸 × (1+余量) → 中值滤波 (窗5) → 相邻变化率限速 (_S_RATE)
-    → 包含性地板 (快速推镜头时限速让位, 脸必须完整在窗内) → 钳制 [_MIN_WIN, min(W,H)]。
-  小脸仍得到小 S → res² 画布上占比恒为 ≈1/(1+余量), 与脸的绝对大小无关 —
-  远景小脸不会被稀释 (修脸强度不因远景而打折)。
-- 窗口中心按整条出现区间统一中值平滑; DP 分段只划定 skip 边界, 不再产生几何接缝 —
-  相邻分段的 (S_t, center_t) 序列天然连续, 贴回后同一身份无直切感。
-- 尺寸超比罚 8→2: 逐帧 S 已让段内小脸保持占比, 分段只剩 skip 划分与极端变焦防护。
+当前版本要点:
+- 分镜优先 (shot-aware): 官方 PySceneDetect 管线 (临时视频 + open_video +
+  SceneManager), 依赖缺失自动降级为仅上游分段隔离。镜头单元只按真实切点划分,
+  上游生成接缝不充当镜头边界 (接缝是生成账本, 内容跨接缝连续)。
+- 身份追踪: sec_model=None → 单脸模式; 选权重 → 内置 SeC-4B 逐镜头单元独立
+  追踪多身份, 相邻单元单人时自动续接同一 id。YOLO 提供逐帧实测尺寸信号。
+- 逐帧平滑窗口 (S_t): 脸尺寸序列先经差分域 Hampel 去脉冲 (_smooth_size_gaps),
+  再经零相位高斯 去密集抖动 (_gauss1d, 对称核 → 推拉趋势零滞后);
+  S_t = 平滑后脸尺寸 ×(1+余量) 逐帧直通 → 钳制 [_MIN_WIN, min(W,H)]。
+  画布内脸占比恒 ≈1/(1+余量), 推拉镜头下不胀缩; 窗口中心同样
+  中值平滑 + 零相位高斯, 贴回后同一身份无直切感。
+- 分段 = 仅镜头切点 + skip 边界 (脸 >= res×skip_ratio 跳过重采样),
+  不产生几何接缝 (逐帧窗口跨段连续), 镜头未切换不切段。
+- GPU 批量化: _sample_windows 整批上卡 grid_sample; 无 SR 路径 bicubic+
+  antialias; SR 路径按尺寸桶分批, OOM 自动减半重试。输出 crop_images 统一
+  fp16 量化 — 新鲜输出与缓存命中位精确一致, 下游 rows_hash 不漂移。
+- pre_blur (默认 0=关): SR/bicubic 放大前对裁剪窗口施加高斯预模糊, 压制源噪声
+  与插值锯齿, 提高小脸 SR 稳定性。已入缓存键。
+- 全帧保留: 不按 17n+5 掐尾 — 网格约束由 Face_Resample 编码期补齐。
+- 身份锚定: 逐子轨按 (身份可信分 + 清晰度) 打分, 逐身份取全局最优行;
+  赢家子轨另构建"干净参考帧" (源帧按锚定窗口重采样, 未经 pre_blur/SR)。
+  输出 identity_refs 供用户在 Resample 前预检 — 参考错 = 修脸身份错。
+- 缓存: 指纹含 win_v / 模型文件实体 (size+mtime) / VAE / blocks 等; 升级后旧
+  缓存自动失效一次, 无需手动 clear_cache。
 - 日志收编: 常规运行只保留入口/出口/警告; 逐子轨细节走 h3ff.vlog
   (h3_facefix.py 顶部 _VERBOSE=True 打开)。
-- 缓存指纹加 win_v=2: 升级后旧缓存自动失效 (无需手动 clear_cache)。
-
-v19.3 — 分镜检测仅保留官方临时文件路径; 窗口下限提为 _MIN_WIN。
-v19.2 — 删除窗口撑大残留, 窗口只由真实检测框决定。
-v19 — 全帧保留 (17n+5 网格约束移出本节点, 由 Face_Resample 编码期补齐)。
-v18 — 分镜优先 (shot-aware), 官方 PySceneDetect 管线; v17.2 — latent 端口 optional;
-v12 — 尺寸信号 YOLO 实测优先; v11 — multi_sec 内置 SeC-4B 身份追踪 (pack v7)。
 """
 import os
 import shutil
@@ -39,7 +36,6 @@ import folder_paths
 import comfy.utils
 import hashlib
 import comfy.model_management
-import time
 
 try:
     from . import latent_cache
@@ -61,16 +57,13 @@ _MODEL_EXTS = {".pt", ".pth", ".onnx", ".engine", ".torchscript"}
 # 调小 → 远景占比更高 (脸在画布上更大)
 _MIN_WIN = 48
 
-# ---- 窗口边长时序平滑 ----
-# 相邻两帧 S 的最大变化率 (0.20 = 每帧最多 ±20%)。调小 → 更平滑但快速推镜头时
-_S_RATE = 0.20
+_SZGAP_WIN = 2     # Hampel 邻域半径 (差分个数; ±2 → 邻域窗5)
+_SZGAP_K = 6.0     # MAD 倍数 (阈值主项; 调小更激进, 调大更保守)
+_SZGAP_R = 0.30    # 相对下限 (邻域中值差分的30%, 防 MAD≈0 时误杀同向真实波动)
+_TRJ_SIGMA = 3.0   # 高斯 σ (帧)
 
 # ---- SR 放大的尺寸桶宽 ----
 _SR_BUCKET = 16
-
-# ---- DP 单段帧数上限  ----
-# 只用于把 DP 复杂度从 O(n²) 压到 O(n·上限); 切段无几何接缝 (逐帧窗口跨段连续)。
-_SEG_MAX = 240
 
 # ---- SR 最大遍数 (1 = 单次) ----
 _SR_MAX_PASSES = 1
@@ -86,7 +79,6 @@ def _win_floor():
 
 # ================= 内置常量=================
 _GAP_TOL = 24        # 检测缺失多少帧内视为同一次出现 (绝不跨镜头)
-_SCALE_SPLIT = 1.2   # 片内容许的最大脸尺寸比 (软目标, 进入 DP 分段代价)
 _SKIP_RATIO = 0.8    # 脸 >= res × 此比例 → 跳过重采样
 _SEC_MEM_SIZE = 12   # SeC-4B 记忆库槽位数 (上游默认; 逐镜头单元独立调用, 12 足够)
 
@@ -132,7 +124,7 @@ def _size(bx):
 
 
 def _median_smooth(seqs):
-    """逐坐标中值平滑 (窗口5, 端点收缩)。全流水线唯一平滑实现 (测量去噪用)。"""
+    """框中心中值平滑 (窗口5, 端点收缩) — 中心去脉冲; 密集抖动由调用方零相位高斯处理。"""
     sm = []
     for i in range(len(seqs)):
         win = seqs[max(0, i - 2): i + 3]
@@ -338,28 +330,72 @@ def _shot_bounds(blocks, cuts, F):
 # ==================================================================
 # ============ 逐帧平滑窗口 (同一身份不再直切) ============
 # ==================================================================
-def _smooth_window_sizes(face_sizes, expand_f, W, H, rate=_S_RATE):
-    """逐帧窗口边长序列 (v20.3): S_t = 该帧脸尺寸×(1+余量) → 中值滤波(窗5) →
-    变化率限速 → 包含性地板 → 钳制 [_win_floor(), min(W,H)]。
-    合批改由放大期的"尺寸桶 + pad"承担, 本函数几何与 v20 完全一致。"""
+
+def _smooth_size_gaps(sizes):
+    """差分域 Hampel 去检测噪声 (v25): 相邻帧差分与邻域运动模式显著矛盾的
+    (脉冲型检测噪声, 如 ...71→58 的尾部 -13) 替换为邻域中值差分后累加还原。
+    真实运动的差分连续同号, 阈值内原样保留 → 推拉趋势零滞后零失真。
+    thr = k×MAD + 30%×|邻域中值差分|; 端点用单侧邻域。返回平滑后序列 (等长)。"""
+    n = len(sizes)
+    out0 = [float(s) for s in sizes]
+    if n < 3:
+        return out0
+    d = [out0[i + 1] - out0[i] for i in range(n - 1)]
+    m = len(d)
+    d2 = list(d)
+    n_fix, max_dev = 0, 0.0
+    for i in range(m):
+        lo, hi = max(0, i - _SZGAP_WIN), min(m, i + _SZGAP_WIN + 1)
+        nb = d[lo:i] + d[i + 1:hi]
+        if not nb:
+            continue
+        med = float(np.median(nb))
+        mad = float(np.median([abs(x - med) for x in nb]))
+        thr = _SZGAP_K * mad + _SZGAP_R * abs(med)
+        dev = abs(d[i] - med)
+        if dev > thr:
+            d2[i] = med
+            n_fix += 1
+            max_dev = max(max_dev, dev)
+    if n_fix == 0:
+        return out0
+    h3ff.vlog(f"[H3-FaceCut] size gaps: {n_fix}/{m} outlier gap(s) fixed "
+              f"(max dev {max_dev:.1f}px) — Hampel on frame diffs\n"
+              f"[H3-FaceCut] 尺寸差分去噪: 修复 {n_fix}/{m} 个离群差分 "
+              f"(最大偏离 {max_dev:.1f}px) — 相邻帧差分 Hampel")
+    out = [out0[0]]
+    for i in range(m):
+        out.append(out[-1] + d2[i])
+    return out
+
+
+def _gauss1d(arr, sigma):
+    """零相位高斯 (replicate 端点): 对称核 → 线性趋势零滞后零失真, 只压高频残噪。"""
+    a = np.asarray(arr, dtype=np.float64)
+    n = len(a)
+    if n < 3 or sigma <= 0:
+        return a
+    r = max(1, int(round(3.0 * float(sigma))))
+    x = torch.arange(-r, r + 1, dtype=torch.float32)
+    k = torch.exp(-(x * x) / (2.0 * float(sigma) ** 2))
+    k = k / k.sum()
+    t = torch.from_numpy(np.ascontiguousarray(a, dtype=np.float32))[None, None]
+    return torch.nn.functional.conv1d(
+        torch.nn.functional.pad(t, (r, r), mode="replicate"), k[None, None])[0, 0].double().numpy()
+
+
+def _smooth_window_sizes(face_sizes, expand_f, W, H):
+    """逐帧窗口边长序列: S_t = (已平滑的)脸尺寸 × (1+余量) — 逐帧正比直通。
+    face_sizes 由调用方先完成两级平滑: 差分域 Hampel 去脉冲 (_smooth_size_gaps)
+    + 零相位高斯去密集抖动 (_gauss1d, 对称核 → 真实推拉趋势零滞后) —
+    测量噪声不进入 S, 真实推拉完整保留。
+    面部在画布中的呈现占比恒 ≈1/(1+expand), 与脸绝对尺寸无关, 推拉镜头下不胀缩。
+    钳制 [_win_floor(), min(W,H)]: 近景脸大到窗口顶满画面时按画面上限收缩,
+    与后期软件固定比例裁剪在画面极限处的行为一致。"""
     fl = _win_floor()
     cap = max(fl, min(int(W), int(H)))
-    n = len(face_sizes)
-    raw = []
-    for s in face_sizes:
-        s = float(s) * (1.0 + float(expand_f))
-        raw.append(max(fl, min(cap, s)))
-    med = [float(np.median(raw[max(0, i - 2): i + 3])) for i in range(n)]
-    out = [med[0]]
-    for i in range(1, n):
-        prev, tgt = out[-1], med[i]
-        max_d = prev * float(rate)
-        nxt = prev + max(-max_d, min(max_d, tgt - prev))
-        need = raw[i]
-        if nxt < need:
-            nxt = need
-        out.append(min(cap, nxt))
-    return [max(fl, int(round(s))) for s in out]
+    return [max(fl, min(cap, int(round(float(s) * (1.0 + float(expand_f)))))) for s in face_sizes]
+
 
 def _window_centers(boxes, S_seq, W, H):
     """逐帧钳制窗口中心 (v20): 脸完整在窗内 ∩ 窗完整在帧内 (构造性包含)。
@@ -481,58 +517,15 @@ def _sample_windows(frames, masks_full, use, centers, S_seq, dev=None):
     return crops, win_masks
 
 
-def _partition_appearance(sm_sz, S_seq, res, scale_split, skip_thr):
-    """一次出现内的最优分段 (DP)。v20.2: gsum 改前缀和 O(1) 取段代价 + 段长上限 _SEG_MAX,
-    复杂度 O(n·_SEG_MAX)。其余语义与 v20 一致。"""
-    n = len(sm_sz)
-    if n < 5:
-        return []
-    INF = float("inf")
-    pre = [0.0] * (n + 1)
-    for k in range(n):
-        pre[k + 1] = pre[k] + res / float(max(1, int(S_seq[k])))
-    dp = [0.0] + [INF] * n
-    prev = [-1] * (n + 1)
-    for i in range(1, n + 1):
-        mx, mn = 0.0, INF
-        for a in range(i - 1, max(0, i - _SEG_MAX) - 1, -1):
-            s = sm_sz[a]
-            if s > mx:
-                mx = s
-            if s < mn:
-                mn = s
-            L = i - a
-            if L < 5:
-                continue
-            gsum = pre[i] - pre[a]
-            if mn >= skip_thr:
-                c = 0.0
-            else:
-                c = 22.0 + gsum
-                if mx > mn * float(scale_split):
-                    c += (mx / (mn * float(scale_split)) - 1.0) * gsum * 2.0
-            if dp[a] + c < dp[i]:
-                dp[i] = dp[a] + c
-                prev[i] = a
-    if dp[n] == INF:
-        return []
-    out, i = [], n
-    while i > 0:
-        out.append((prev[i], i))
-        i = prev[i]
-    return out[::-1]
-
-
-def _build_subtracks_for_track(boxes_seq, frames, H, W, res, expand_f, scale_split,
+def _build_subtracks_for_track(boxes_seq, frames, H, W, res, expand_f,
                                skip_ratio, gap_tol, tid, masks_full=None,
                                size_override=None, shot_id=None, sr_model=None, sr_batch=4, pre_blur=0.0, pbar=None):
-    """单条身份轨迹 → (subtracks, crop_parts, n_rows)。
-    分工: SeC-4B 身份/mask, YOLO 逐帧实测尺寸; 本函数只做应用层几何:
-    DP 分段 (skip 边界) → 逐帧平滑窗口 (S_t 与中心均按整条出现区间计算并时序平滑)
-    → 采样 → 账本。检测帧全部分配, 不丢弃。
+    """ 分工: SeC-4B 身份/mask, YOLO 逐帧实测尺寸; 本函数只做应用层几何:
+    分段 (镜头切点 + skip 边界) → 几何平滑 (中心: 中值窗5→零相位高斯;
+    尺寸: 差分Hampel→零相位高斯) → S_t 直通 → 采样 → 账本。
+    检测帧全部分配, 不丢弃。
     镜头单元约束: appearance 合并与框插值禁止跨镜头单元 (切镜头处强制断开, 防跳变)。
-    v20.1: 修复逐帧缩放的 BCHW 布局错误; 相邻分段共享同一套连续的 (S_t, center_t)
-    序列 → 段边界不再直切; 小脸占比恒为 1/(1+余量), 与脸绝对大小无关。
+    无 DP 尺寸切段: 镜头未切换时整段一条连续 (S_t, center_t) 序列。
     v19: 不按 17n+5 掐尾 — 全部帧保留, 网格约束由 Face_Resample 编码期补齐。"""
     F = len(boxes_seq)
     det_idx = [i for i, b in enumerate(boxes_seq) if b is not None]
@@ -588,24 +581,50 @@ def _build_subtracks_for_track(boxes_seq, frames, H, W, res, expand_f, scale_spl
         seg_starts.append(b + 1)
         for ra, rb in zip(seg_starts[:-1], seg_starts[1:]):
             raw_boxes = _median_smooth([filled[j] for j in range(ra, rb)])
-            raw_sz = [_fs(i) for i in range(ra, rb)]
-            sm_sz = [float(np.median(raw_sz[max(0, k - 2): k + 3])) for k in range(len(raw_sz))]
-            S_seq = _smooth_window_sizes(sm_sz, expand_f, W, H)
+            # ---- 零相位高斯 (中心/尺寸轨迹去密集抖动, 对称核零滞后) ----
+            _cxs = _gauss1d([(b[0] + b[2]) * 0.5 for b in raw_boxes], _TRJ_SIGMA)
+            _cys = _gauss1d([(b[1] + b[3]) * 0.5 for b in raw_boxes], _TRJ_SIGMA)
+            _hfs = [_size(b) * 0.5 for b in raw_boxes]
+            raw_boxes = [[float(cx) - h, float(cy) - h, float(cx) + h, float(cy) + h]
+                         for cx, cy, h in zip(_cxs, _cys, _hfs)]
+            # 尺寸 (缩放): Hampel 去脉冲 零相位高斯去密集抖动
+            raw_sz = _gauss1d(
+                _smooth_size_gaps([_fs(i) for i in range(ra, rb)]), _TRJ_SIGMA)
+            S_seq = _smooth_window_sizes(raw_sz, expand_f, W, H)
+
             if (rb - ra) < 5:
-                pieces.append((ra, rb, S_seq, raw_boxes))
+                pieces.append((ra, rb, S_seq, raw_boxes, raw_sz))
                 continue
-            for pa, pb in _partition_appearance(sm_sz, S_seq, res, float(scale_split), res * float(skip_ratio)):
-                pieces.append((ra + pa, ra + pb, S_seq[pa:pb], raw_boxes[pa:pb]))
+            _thr = res * float(skip_ratio)
+            _cur, _i = ra, ra
+            while _i < rb:
+                if raw_sz[_i - ra] >= _thr:
+                    _j = _i
+                    while _j < rb and raw_sz[_j - ra] >= _thr:
+                        _j += 1
+                    if _j - _i >= 5:  # 连续 >=5 帧才整段跳过; 零碎大脸帧归入采样
+                        if _cur < _i:
+                            pieces.append((_cur, _i, S_seq[_cur - ra:_i - ra], raw_boxes[_cur - ra:_i - ra], raw_sz[_cur - ra:_i - ra]))
+                        pieces.append((_i, _j, S_seq[_i - ra:_j - ra], raw_boxes[_i - ra:_j - ra], raw_sz[_i - ra:_j - ra]))
+                        _cur = _j
+                    _i = _j
+                else:
+                    _i += 1
+            if _cur < rb:
+                pieces.append((_cur, rb, S_seq[_cur - ra:rb - ra], raw_boxes[_cur - ra:rb - ra], raw_sz[_cur - ra:rb - ra]))
+
     if not pieces:
         return subtracks, crop_parts, 0
 
-    for si, (pa, pb, S_seq, boxes) in enumerate(pieces):
+    for si, (pa, pb, S_seq, boxes, sz_seq) in enumerate(pieces):
         idxs = list(range(pa, pb))
-        med = float(np.median([_fs(j) for j in idxs]))
+        med = float(np.median(sz_seq))
         if med <= 0:
             med = float(np.median([_size(b) for b in boxes]))
         f0_all, f1_all = pa, pb
-        if med >= res * float(skip_ratio):
+
+        if min(sz_seq) >= res * float(skip_ratio):
+
             h3ff.vlog(f"[H3-FaceCut] id{tid} sub{si+1} [{f0_all},{f1_all}) skipped: "
                       f"face {med:.0f}px >= {float(skip_ratio):.2f}xres({res})\n"
                       f"[H3-FaceCut] 身份{tid} 子轨{si+1} [{f0_all},{f1_all}) 跳过: "
@@ -626,7 +645,6 @@ def _build_subtracks_for_track(boxes_seq, frames, H, W, res, expand_f, scale_spl
                 if win_masks[i] is None:
                     win_masks[i] = win_masks[min(have, key=lambda k: abs(k - i))]
 
-        # crops, win_masks = _sample_windows(frames, masks_full, idxs, centers, S_seq)
         if float(pre_blur) > 0.0:
             crops = _blur_batch(crops, float(pre_blur))
         have = [i for i, m in enumerate(win_masks) if m is not None]
@@ -644,7 +662,6 @@ def _build_subtracks_for_track(boxes_seq, frames, H, W, res, expand_f, scale_spl
             for _K in sorted(buckets):
                 _idxs_g = buckets[_K]
                 if _SR_SKIP_WIN > 0 and _K >= _SR_SKIP_WIN:
-                    # 窗口 >= _SR_SKIP_WIN: bicubic 一步到 res, 不做 SR
                     _resized = _gpu_resize_batch([crops[_i] for _i in _idxs_g], res)
                     for _j, _i in enumerate(_idxs_g):
                         proc[_i] = _resized[_j]
@@ -1066,7 +1083,6 @@ class H3FaceCut(io.ComfyNode):
         shot_detect = True   
         shot_active = shot_detect and _has_scenedetect()
         gap_tol = _GAP_TOL
-        scale_split = _SCALE_SPLIT
         mllm_memory_size = _SEC_MEM_SIZE
         use_flash_attn = _flash_attn_available()
         face_tracking = ("multi_sec" if str(sec_model) not in (None, "", "None") else "single")
@@ -1185,7 +1201,7 @@ class H3FaceCut(io.ComfyNode):
                       "sec_file": _file_stat_sig(_sec_fp_path),
                       "vae_fp": latent_cache.vae_fingerprint(vae) if vae is not None else None,
                       "res": int(res), "expand": int(expand),
-                      "gap_tol": int(gap_tol), "scale_split": float(scale_split),
+                      "gap_tol": int(gap_tol),
                       "skip_ratio": float(skip_ratio), "face_tracking": str(face_tracking),
                       "sec_model": str(sec_model), "sec_threshold": float(sec_threshold),
                       "mllm_memory_size": int(mllm_memory_size), "use_flash_attn": bool(use_flash_attn),
@@ -1405,7 +1421,7 @@ class H3FaceCut(io.ComfyNode):
 
         for tid, boxes_seq, masks_full, sz_override in src_tracks:
             sts, cps, n_rows = _build_subtracks_for_track(
-                boxes_seq, frames, H, W, res, expand_f, float(scale_split), float(skip_ratio),
+                boxes_seq, frames, H, W, res, expand_f, float(skip_ratio),
                 int(gap_tol), tid, masks_full=masks_full,
                 size_override=(sz_override if face_tracking == "multi_sec" else None),
                 shot_id=shot_id, sr_model=sr_model, sr_batch=sr_batch, pbar=crop_pbar, pre_blur=float(pre_blur))
@@ -1519,7 +1535,7 @@ class H3FaceCut(io.ComfyNode):
                 "n_frames": F_expect, "n_subtracks": len(subtracks), "n_sampled": n_sampled,
                 "n_identities": len({st.get("track_id", 0) for st in subtracks}),
                 "face_tracking": face_tracking, "gap_tol": int(gap_tol),
-                "scale_split": float(scale_split), "skip_ratio": float(skip_ratio),
+                "skip_ratio": float(skip_ratio),
                 "yolo_threshold": float(yolo_threshold), "sec_threshold": float(sec_threshold),
                 "shot_active": bool(shot_active), "shot_threshold": float(shot_threshold),
                 "flash_attn": bool(use_flash_attn), "sec_memory": int(mllm_memory_size),
