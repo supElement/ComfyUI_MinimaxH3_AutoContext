@@ -14,7 +14,7 @@ H3 的显存需求随分辨率、时长（每 +5s 翻倍）、精度（fp8→bf1
 支持latent缓存存取，方便推理过程中因某种原因导致推理中断后，快速跳过已推理分段，缓存文件以分段为单位存储，在采样节点上游参数不变的情况下，读取已有 latent cache 文件。  
 缓存磁盘占用：新增目录级上限，默认 32 GB，超出自动清理最旧文件（可用环境变量 H3_CACHE_MAX_GB 调整，设 0 关闭）
 
-⚠️注意：更改模型,包括lora、sageattention等加速节点时，latent检测不会发现更改，所以必须删除latent缓存（test分支V0.9.1 以上版本除外，已支持检测，如无效，亦可按本方法清除缓存），两种删除latent缓存的方法：  
+⚠️注意：更改模型,包括lora、sageattention等加速节点时，latent检测不会发现更改，所以必须删除latent缓存（V0.9.1 以上版本除外，已支持检测，如无效，亦可按本方法清除缓存），两种删除latent缓存的方法：  
 - 开启Minimax_H3_AutoContext_Sampler节点上的 clear_cache 参数，这会在采样开始时，强制重新建立本节点缓存文件。
 - 手动删除缓存目录中的对应文件夹（\ComfyUI\output\cache），文件夹名为“node_” + “节点ID”。
 
@@ -25,53 +25,41 @@ H3 的显存需求随分辨率、时长（每 +5s 翻倍）、精度（fp8→bf1
 
 ## BUG修复、优化和新功能
 
-### test分支
+### 合并更新汇总（V0.8.5–V0.9.2）
 
-首次安装（要 test 分支）：
-
-      git clone -b test https://github.com/supElement/ComfyUI_MinimaxH3_AutoContext.git
-已安装，从 main 切到 test：
-
-      git fetch origin  → git checkout test  → git pull
-### V0.9.2 （test分支）
+#### 面部修复与身份参考
+- **节点链路**
+  - `Minimax_H3_Face_Cut`：检测与裁剪，分镜 + YOLO 检测 + 可选 SeC-4B 追踪。
+  - `Minimax_H3_Face_Resample`：精修，主采样同款模型做块级 img2img 重采样（块结构镜像主采样分段 + 块间锚定）。
+  - `Minimax_H3_Face_Blend`：贴回，精修脸按几何账本与 mask 逐像素贴回原画面。
+  - 详细说明：[中文](https://github.com/supElement/ComfyUI_MinimaxH3_AutoContext/blob/test/h3_fix_zh.md) | [English](https://github.com/supElement/ComfyUI_MinimaxH3_AutoContext/blob/test/h3_fix_en.md)
+- **自动 ID 参考锚定**：每 ID 自动提取最清晰（最大占比）面部帧作为参考图像，默认 `<Picture 1>`；并优化自动提取 ID 参考的选取逻辑。若连接并声明参考图，则自动锚定帧的参考序号改为参考图数量 + 1。例如连接 2 张参考图像时，自动锚定帧作为 `<Picture 3>` 参考。若对生成结果有负面影响，关闭 `identity_ref` 参数即可。
+- **`identity_refs` 输出**：`Minimax_H3_Face_Cut` 和 `Minimax_H3_Face_Resample` 新增输出端口 `identity_refs`，仅用于校验自动截取的每 ID 参考图像，两个节点输出相同。
+- **面部修复提示词**：新增单独的面部修复提示词输入参数。
+- **SR 面部放大优化**：优化速度、内存、显存占用；边长小于 192px 的画面才会使用放大模型先做一次处理。SR 放大前可选卸载主模型 / VAE / CLIP。
+- **`sr_batch`**：默认 4，范围 1–16，SR 每次前向的帧数；只影响速度与显存峰值，不影响结果。  
 
 <img width="1509" height="747" alt="image" src="https://github.com/user-attachments/assets/ce8931d0-a711-4cdc-8d3b-f1386008ce60" />
 
-- 优化SR面部放大处理速度，边长小于192px的画面才会使用放大模型先做一次处理。
-- 优化自动提取id参考的选取逻辑。
-- Minimax_H3_Face_Cut 和 Minimax_H3_Face_Resample 节点上增加输出端口 identity_refs ，仅用于校验自动截取的每id参考图像，两个节点的输出相同。
-
-### V0.9.1 （test分支）
-
-- 支持 checkpoint / 加速 LoRA / 改精度 / 挂函数级补丁后的缓存检测。
-- 增加每ID面部特征自动锚定，提取最清晰（最大占比）面部帧做为参考图像，默认<Picture 1>；若连接并声明了参考图，则自动锚定的帧的参考序号改变为参考图数量+1，例如：连接了2张参考图像，则自动锚定帧做为<Picture 3> 参考；若对生成结果有负面影响，关闭 identity_ref 参数即可。
-- 增加单独的面部修复提示词输入参数。
-- 优化显存峰值占用；优化面部回帖稳定性；优化cache缓存逻辑稳定性。
-
-### V0.9.0 （test分支）
-
-- 集成项目MiniMax-H3-Semantic-Bridge的语义桥能力：将 SenseNova U1.5 教师桥蒸馏出的 ~11MB 学生适配器混合进 H3 条件，增强提示词遵循度（空间关系/计数/材质/反射等），推理时无需 SenseNova 参与。语义桥并非通用方法，部分情况会产生劣化，所以非必要不要开启。
-- `Minimax_H3_AutoContext_parameter` 节点新增 4 个参数：`semantic_bridge`（开关）、`semantic_bridge_adapter`（适配器文件）、`semantic_bridge_alpha`（融合强度，默认 0.10，官方 A/B 示例用 0.15）、`semantic_bridge_magnitude`（幅度对齐方式，默认 per_token）。
+#### 语义桥（Semantic Bridge）
+- 集成 MiniMax-H3-Semantic-Bridge：将 SenseNova U1.5 教师桥蒸馏出的 ~11MB 学生适配器混合进 H3 条件，增强提示词遵循度（空间关系 / 计数 / 材质 / 反射等），推理时无需 SenseNova 参与。
+- `Minimax_H3_AutoContext_parameter` 新增参数：
+  - `semantic_bridge`：开关
+  - `semantic_bridge_adapter`：适配器文件
+  - `semantic_bridge_alpha`：融合强度，默认 0.10，官方 A/B 示例 0.15
+  - `semantic_bridge_magnitude`：幅度对齐方式，默认 `per_token`
 - 只变换条件张量，不修改 H3 DiT 权重；段间续接锚定与参考素材通道不受影响，可随时启用或断开。
-- ⚠️ 上游 v1 仅验证 FL2VA/文本路径；Ref2VA 参考路径（ref_video / ref_audio，含口型同步）未验证，实测可能劣化口型与演唱表现，使用前请自行开/关 A/B 对比。
+- ⚠️ 语义桥并非通用方法，部分情况会产生劣化，非必要不要开启。上游 v1 仅验证 FL2VA / 文本路径；Ref2VA 参考路径（`ref_video` / `ref_audio`，含口型同步）未验证，实测可能劣化口型与演唱表现，使用前请自行开 / 关 A/B 对比。
 - 注：修脸链路（Face_Cut / Face_Resample / Face_Blend）暂不应用语义桥。
 
-优化：
-- 优化面部修复节点处理逻辑；优化内存和显存占用；SR 放大前可选卸载主模型/VAE/CLIP。
-- 固定提示词时，不再每块重载文本编码器，并在此情况下，加强指纹校验(像素内容指纹)，避免换图假命中。
-- 新增	sr_batch（默认 4，范围 1~16）	SR 每次前向的帧数；只影响速度与显存峰值，不影响结果。
-- 移除	sec_auto_unload，SeC-4B追踪结束后现在始终自动卸载，无需开关。
+#### 缓存与性能
+- 支持 checkpoint / 加速 LoRA / 改精度 / 挂函数级补丁后的缓存检测。
+- 固定提示词时，不再每块重载文本编码器；并加强指纹校验（像素内容指纹），避免换图假命中。
 
-### v0.8.5 （test分支）
+#### 注意力校正
+- 新增 `Minimax_H3_TST_AttentionPatch` 注意力校正节点：H3 TST 注意力校正 — 谱张力诊断 + 视频行 query 自适应缩放，抑制时序闪烁 / 小脸崩坏。
+- `tau` 强度建议 0.2-0.3，需放在其它 attention patch 下游。  
 
-<img width="2156" height="629" alt="image" src="https://github.com/user-attachments/assets/b0b9373a-258b-485e-b5e8-0b3778f744e3" />  <br>
-  
-增加Minimax_H3_TST_AttentionPatch 注意力校正节点；H3 TST 注意力校正 — 谱张力诊断 + 视频行 query 自适应缩放，抑制时序闪烁/小脸崩坏。tau 强度（0.2），需放在其它 attention patch 下游。  
-
-增加并优化面部修复节点。详细说明：[中文](https://github.com/supElement/ComfyUI_MinimaxH3_AutoContext/blob/test/h3_fix_zh.md) | [English](https://github.com/supElement/ComfyUI_MinimaxH3_AutoContext/blob/test/h3_fix_en.md)</sub>
-- Minimax_H3_Face_Cut： 检测与裁剪，分镜 + YOLO 检测 + 可选 SeC-4B 追踪。
-- Minimax_H3_Face_Resample： 精修，主采样同款模型做块级 img2img 重采样 (块结构镜像主采样分段 + 块间锚定) 。
-- Minimax_H3_Face_Blend： 贴回，精修脸按几何账本与 mask 逐像素贴回原画面。
 
 ### 稳定更新汇总（V0.5.8–V0.7.2）
 - 参数节点兼容性修复：修复 H3Parameter 的 total_frames / chunk_frames / context_frames 连接 Math Expression 等节点后，分段预估请求死循环、ComfyUI 页面卡死的问题。
@@ -173,6 +161,14 @@ git clone https://github.com/supElement/ComfyUI_MinimaxH3_AutoContext.git
 
 在 ComfyUI Manager 中搜索 `ComfyUI_MinimaxH3_AutoContext`，点击 Install。
 
+### classic 分支(原main分支)
+
+首次安装（只想使用旧版 classic 分支）：
+
+      git clone -b classic https://github.com/supElement/ComfyUI_MinimaxH3_AutoContext.git
+已安装，从 main 切到 classic：
+
+      git fetch origin  → git checkout classic  → git pull
 
 ## <a id="params"></a> ⚙️ 节点参数
 
