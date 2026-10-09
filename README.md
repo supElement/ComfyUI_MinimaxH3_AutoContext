@@ -33,10 +33,9 @@ H3 的显存需求随分辨率、时长（每 +5s 翻倍）、精度（fp8→bf1
 已安装，从 main 切到 test：
 
       git fetch origin  → git checkout test  → git pull
-
 ### V0.9.2 （test分支）
 
-<img width="1509" height="747" alt="image" src="https://github.com/user-attachments/assets/ce8931d0-a711-4cdc-8d3b-f1386008ce60" />  
+<img width="1509" height="747" alt="image" src="https://github.com/user-attachments/assets/ce8931d0-a711-4cdc-8d3b-f1386008ce60" />
 
 - 优化SR面部放大处理速度，边长小于192px的画面才会使用放大模型先做一次处理。
 - 优化自动提取id参考的选取逻辑。
@@ -188,15 +187,28 @@ git clone https://github.com/supElement/ComfyUI_MinimaxH3_AutoContext.git
 | crop_mode | `stretch` | 参考图/首尾帧/参考视频缩放裁剪：`center` / `stretch` / `none` |
 | ref_sync_mode | `segmented` | 参考视频/音频是否按段切片：`global`（每段使用完整素材） / `segmented`（按段的时间比例切片） |
 | width × height | 960×544 | 一采分辨率（二采时被 latent_input 覆盖） |
-| total_frames | 362 | 生成总帧数（17n+5）；在 `Clip_Tag`/`timeline`  模式下仅作为兜底（无标签/无时间标记时），最终被各段之和覆盖 |
+| total_frames | 362 | 生成总帧数（17n+5）；在 `Clip_Tag`/`timeline` 模式下仅作为兜底（无标签/无时间标记时），最终被各段之和覆盖 |
 | fps | 24 | 帧率，用于音频同步和提示词秒数换算 |
 | chunk_frames | 90 | 每段生成帧数（17n+5），仅在 `sequential` / `global` 模式下生效 |
 | context_frames | 22 | 段间续接帧数（17n+5：5/22/39/56…），建议 22 以上 |
 | lock_audio | `true` | 二采时锁定音频区（noise_mask audio=0）：只重新采样视频、保持一采音频不变 |
 | audio_drive | `false` | 音频驱动开关，开启后视频跟随 drive_audio 生成 |
-| video_guide | `none` | 视频延长参数，支持分段。 none: 不启用(不修改视频参考逻辑)；pre_guide: 视频续写（采样节点 ref_video_0 或 + ref_video_audio_0 端口）；post_guide: 视频前推（采样节点 ref_video_0 或 + ref_video_audio_0 端口）；pre_post_guide: 双视频中间衔接（采样节点 ref_video_0 或 + ref_video_audio_0 端口，ref_video_1 或 + ref_video_audio_1 端口）。锚定帧数由 context_frames 决定。注意：非none时，采样节点的对应参考端口的参考会被强行剪切为context_frames参数中设置的数值。参考引用逻辑与普通参考相同（提示词中声明了，才会引用）|
+| video_guide | `none` | 视频延长参数，支持分段。 none: 不启用；pre_guide: 视频续写（采样节点 ref_video_0 或 + ref_video_audio_0 端口）；post_guide: 视频前推（采样节点 ref_video_0 或 + ref_video_audio_0 端口）；pre_post_guide: 双视频中间衔接（采样节点 ref_video_0 或 + ref_video_audio_0 端口，ref_video_1 或 + ref_video_audio_1 端口）。锚定帧数由 context_frames 决定。注意：非none时，采样节点的对应参考端口的参考会被强行剪切为context_frames参数中设置的数值。参考引用逻辑与普通参考相同（提示词中声明了，才会引用）|
+| semantic_bridge | false | 语义桥开关：将 SenseNova 蒸馏的 ~11MB 学生适配器按 C = H + alpha*(S-H) 混合进条件张量，增强提示词遵循度。只变换条件，不动模型权重；段间续接锚定与参考通道不受影响。适配器放入 models/semantic_bridge/ |
+| semantic_bridge_adapter | none | 语义桥适配器文件（models/semantic_bridge/ 下的 .safetensors）。none = 禁用。启动后新放入的文件需重启 ComfyUI 才会出现在下拉框 |
+| semantic_bridge_alpha | 0.10 | 融合强度。官方推荐起点 0.10，官方 A/B 示例用 0.15，建议在 0.10~0.15 之间微调 |
+| semantic_bridge_magnitude | per_token | 融合前幅度对齐：per_token 逐 token RMS 对齐（官方推荐）/ global 全张量标量对齐 / none 不对齐 |
 
 > 节点上实时显示「预计分段」预览（前端 JS 计算，不参与推理）。
+
+关于语义桥
+
+- 上游项目：Speach1sdef178/MiniMax-H3-Semantic-Bridge（适配器下载：[HuggingFace](https://huggingface.co/speach1sdef178/MiniMax-H3-Semantic-Bridge)）
+- 连接方式：**无需改工作流接线** —— 在 parameter 节点开启 `semantic_bridge` 并选择适配器即可，主采样节点逐段自动应用
+- 影响范围：只混合文本/FL2VA 条件张量；段间续接锚定与参考素材通道不受影响
+- 适配器安装：下载 `.safetensors` 放入 `ComfyUI/models/semantic_bridge/`（目录自动创建），重启 ComfyUI 后在 `semantic_bridge_adapter` 下拉框中选择
+- 缓存行为：桥参数参与分段缓存指纹，改 alpha / 换适配器 / 开关桥后对应段自动重建
+- ⚠️ 适用范围：上游 v1 仅验证 FL2VA/文本路径；Ref2VA（参考视频/音频）未验证，实测可能劣化口型与演唱，请自行 A/B
 
 ### Minimax_H3_AutoContext_Sampler（主节点）
 
