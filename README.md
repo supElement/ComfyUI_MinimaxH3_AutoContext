@@ -27,38 +27,24 @@ H3 的显存需求随分辨率、时长（每 +5s 翻倍）、精度（fp8→bf1
 
 ### 合并更新汇总（V0.8.5–V0.9.2）
 
-#### 面部修复与身份参考
-- **节点链路**
+- **面部修复节点** - 详细说明：[中文](https://github.com/supElement/ComfyUI_MinimaxH3_AutoContext/blob/test/h3_fix_zh.md) | [English](https://github.com/supElement/ComfyUI_MinimaxH3_AutoContext/blob/test/h3_fix_en.md)
   - `Minimax_H3_Face_Cut`：检测与裁剪，分镜 + YOLO 检测 + 可选 SeC-4B 追踪。
   - `Minimax_H3_Face_Resample`：精修，主采样同款模型做块级 img2img 重采样（块结构镜像主采样分段 + 块间锚定）。
   - `Minimax_H3_Face_Blend`：贴回，精修脸按几何账本与 mask 逐像素贴回原画面。
-  - 详细说明：[中文](https://github.com/supElement/ComfyUI_MinimaxH3_AutoContext/blob/test/h3_fix_zh.md) | [English](https://github.com/supElement/ComfyUI_MinimaxH3_AutoContext/blob/test/h3_fix_en.md)
-- **自动 ID 参考锚定**：每 ID 自动提取最清晰（最大占比）面部帧作为参考图像，默认 `<Picture 1>`；并优化自动提取 ID 参考的选取逻辑。若连接并声明参考图，则自动锚定帧的参考序号改为参考图数量 + 1。例如连接 2 张参考图像时，自动锚定帧作为 `<Picture 3>` 参考。若对生成结果有负面影响，关闭 `identity_ref` 参数即可。
-- **`identity_refs` 输出**：`Minimax_H3_Face_Cut` 和 `Minimax_H3_Face_Resample` 新增输出端口 `identity_refs`，仅用于校验自动截取的每 ID 参考图像，两个节点输出相同。
-- **面部修复提示词**：新增单独的面部修复提示词输入参数。
-- **SR 面部放大优化**：优化速度、内存、显存占用；边长小于 192px 的画面才会使用放大模型先做一次处理。SR 放大前可选卸载主模型 / VAE / CLIP。
-- **`sr_batch`**：默认 4，范围 1–16，SR 每次前向的帧数；只影响速度与显存峰值，不影响结果。  
 
 <img width="1509" height="747" alt="image" src="https://github.com/user-attachments/assets/ce8931d0-a711-4cdc-8d3b-f1386008ce60" />
 
-#### 语义桥（Semantic Bridge）
-- 集成 MiniMax-H3-Semantic-Bridge：将 SenseNova U1.5 教师桥蒸馏出的 ~11MB 学生适配器混合进 H3 条件，增强提示词遵循度（空间关系 / 计数 / 材质 / 反射等），推理时无需 SenseNova 参与。
-- `Minimax_H3_AutoContext_parameter` 新增参数：
-  - `semantic_bridge`：开关
-  - `semantic_bridge_adapter`：适配器文件
-  - `semantic_bridge_alpha`：融合强度，默认 0.10，官方 A/B 示例 0.15
-  - `semantic_bridge_magnitude`：幅度对齐方式，默认 `per_token`
-- 只变换条件张量，不修改 H3 DiT 权重；段间续接锚定与参考素材通道不受影响，可随时启用或断开。
-- ⚠️ 语义桥并非通用方法，部分情况会产生劣化，非必要不要开启。上游 v1 仅验证 FL2VA / 文本路径；Ref2VA 参考路径（`ref_video` / `ref_audio`，含口型同步）未验证，实测可能劣化口型与演唱表现，使用前请自行开 / 关 A/B 对比。
-- 注：修脸链路（Face_Cut / Face_Resample / Face_Blend）暂不应用语义桥。
+- 语义桥（Semantic Bridge）
+  - 集成 MiniMax-H3-Semantic-Bridge：将 SenseNova U1.5 教师桥蒸馏出的 ~11MB 学生适配器混合进 H3 条件，增强提示词遵循度（空间关系 / 计数 / 材质 / 反射等），推理时无需 SenseNova 参与。
+  - ⚠️ 语义桥并非通用方法，部分情况会产生劣化，非必要不要开启。上游 v1 仅验证 FL2VA / 文本路径；Ref2VA 参考路径（`ref_video` / `ref_audio`，含口型同步）未验证，实测可能劣化口型与演唱表现，使用前请自行开 / 关 A/B 对比。
 
-#### 缓存与性能
-- 支持 checkpoint / 加速 LoRA / 改精度 / 挂函数级补丁后的缓存检测。
-- 固定提示词时，不再每块重载文本编码器；并加强指纹校验（像素内容指纹），避免换图假命中。
+- 缓存与性能
+  - 支持 checkpoint / 加速 LoRA / 改精度 / 挂函数级补丁后的缓存检测。
+  - 固定提示词时，不再每块重载文本编码器；并加强指纹校验（像素内容指纹），避免换图假命中。
 
-#### 注意力校正
-- 新增 `Minimax_H3_TST_AttentionPatch` 注意力校正节点：H3 TST 注意力校正 — 谱张力诊断 + 视频行 query 自适应缩放，抑制时序闪烁 / 小脸崩坏。
-- `tau` 强度建议 0.2-0.3，需放在其它 attention patch 下游。  
+- 注意力校正节点
+  - 新增 `Minimax_H3_TST_AttentionPatch` 注意力校正节点：H3 TST 注意力校正 — 谱张力诊断，抑制时序闪烁 / 小脸崩坏。
+  - `tau` 强度建议 0.2-0.3，需放在其它 attention patch 下游。  
 
 
 ### 稳定更新汇总（V0.5.8–V0.7.2）
@@ -88,6 +74,10 @@ H3 的显存需求随分辨率、时长（每 +5s 翻倍）、精度（fp8→bf1
 | **Minimax_H3_AutoContext_parameter** | 参数组节点：集中管理提示词/分段/分辨率/音频等参数，输出 `parameter`，并实时预览「预计分段」 |
 | **Minimax_H3_AutoContext_Sampler** | 主节点：分段推理 + 续接锚定 + 采样（一采/二采共用） |
 | **Minimax_H3_Seam_Correction** | 接缝修正节点：对解码后视频的段间接缝做像素域修正 |
+| Minimax_H3_Face_Cut | ① 检测与裁剪: 分镜 + YOLO 检测 + 可选 SeC-4B 追踪, 逐帧平滑窗口裁成统一 res² 小图 |
+| Minimax_H3_Face_Resample | ② 精修: 主采样同款模型做块级 img2img 重采样 (块结构镜像主采样分段 + 块间锚定) |
+| Minimax_H3_Face_Blend | ③ 贴回: 精修脸按几何账本与 mask 逐像素贴回原画面 (零 VAE) |
+| Minimax_H3_TST_AttentionPatch | 注意力校正：H3 TST 注意力校正 — 谱张力诊断，抑制时序闪烁、小脸崩坏（效果有限） |
 
 > 用法：`parameter 节点 --parameter--> 主节点`。提示词在 parameter 节点填写，主节点通过 `parameter`（必选）接收。
 
