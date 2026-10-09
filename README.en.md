@@ -7,6 +7,7 @@
 
 # ComfyUI_MinimaxH3_AutoContext
 
+
 One-click MiniMax H3 long video automated generation node: **segmented reasoning + inter-segment anchoring + prompt timeline slicing + secondary sampling (2-samp) + seam correction + face repair (test branch)**. Under limited GPU memory, long videos are split into multiple independent reasoning segments, achieving seamless inter-segment concatenation through overlay enhancement methods, while automatically slicing prompts along the timeline to align each segment's generated content with the prompt rhythm; similarly slice and align audio-visual references; only the referenced references in the current segment participate in reasoning.  
 H3's GPU memory requirement grows exponentially with resolution, duration (each +5s doubles), and precision (fp8→bf16), so GPU memory is relative—32GB GPU memory will overflow and slow down when generating 15s 1080p with bf16, segmentation may increase the overhead of anchoring frames, but peak GPU memory only depends on the length of a single segment and is independent of the target total length, actual reasoning time is actually faster than generating a long video once.  
 Supports secondary sampling. Video continuation, video forward, dual video concatenation.  
@@ -16,6 +17,7 @@ Cache disk usage: New directory-level limit, default 32 GB, automatically cleans
 ⚠️Note: Changing the model, including LoRA, SageAttention, etc., acceleration nodes, latent detection will not detect the change, so latent cache must be deleted (except test branch V0.9.1, which supports detection, and can also be cleared using this method if invalid), two methods to delete latent cache:  
 - Enable the clear_cache parameter on the Minimax_H3_AutoContext_Sampler node, which will force re-establish the cache file for this node at the start of sampling.  
 - Manually delete the corresponding folder in the cache directory (\ComfyUI\output\cache), folder name is "node_" + "node ID".
+
 
 <img width="2230" height="976" alt="image" src="https://github.com/user-attachments/assets/5634914a-6f98-4d4f-b573-2c8b41e0c57e" />
 
@@ -109,7 +111,7 @@ Added and optimized face repair node. Detailed description: [Chinese](https://gi
 - Automatically pads the last segment to avoid overly short tail segments
 - `fps` is only used for audio synchronization and prompt second conversion
 
-### 🔗 Inter-segment Continuation
+### 🔗 Inter-Segment Continuation
 
 - **Overlay Enhancement**: Non-first segments automatically "take over" the ending frame of the previous segment, with new content naturally continuing from where the previous segment ended, eliminating pauses or position jumps at the seams
 - The ending frame of the previous segment is used as a motion reference for the current segment, helping to continue the direction and speed of motion
@@ -129,7 +131,7 @@ Added and optimized face repair node. Detailed description: [Chinese](https://gi
 
 > In `Clip_Tag` and `timeline` modes, `total_frames` and `chunk_frames` parameters are ignored (segment length determined by the prompt), only fallback to these values when the mode degrades (e.g., no tags/time markers detected).
 
-### 🏷️ Clip_Tag Tag Segmentation Mode
+### 🏷️ Clip_Tag Tag Splitting Mode
 
 - Segments prompts based on user-defined tags (e.g., `段1`/`段2`/`段3`), each segment = one chunk = all prompts for that segment
 - Segment duration determined by prompt content (three priority levels):
@@ -153,7 +155,7 @@ Added and optimized face repair node. Detailed description: [Chinese](https://gi
 - `denoise` controls redraw intensity; `sigmas` supports custom sigma sequences (same as `SamplerCustomAdvanced`)
 - `lock_audio`: Two-stage only redraws video, reuses one-stage audio
 
-### 🎵 Audio Drive
+### 🎵 Audio-Driven (Audio Drive)
 
 - `drive_audio` (AUDIO, optional) + `audio_drive` switch
 - After enabling, video follows this audio to generate, output audio = source audio itself (lip sync/rhythm driven by it)
@@ -240,7 +242,7 @@ About Semantic Bridge
 
 ## <a id="second-pass"></a> 🔄 Binary Sampling and SplitSigmas High/Low Frequencies
 
-### Basic Binary Sampling (Low-Resolution First Sample → High-Resolution Second Sample)
+### Basic Binary Sampling (Low-Resolution Single Sampling → High-Resolution Binary Sampling)
 
 ```text
 parameter node ──parameter──> Main node (first sample, 864×480)
@@ -334,7 +336,7 @@ Audio design:
 0-5 seconds:...
 ```
 
-**Segment Duration Rules** (three levels of priority):
+**Segment Duration Rules** (three priority levels):
 
 1. Duration immediately following the tag line: `段1:0-5秒` → 5 seconds; `段1:3-8秒` → 5 seconds (duration markers are removed from the prompt)
 2. In-segment time markers 0-based: `【0-2秒】`+`【2-5秒】` → 5 seconds
