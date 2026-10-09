@@ -451,7 +451,11 @@ class H3FaceResample(io.ComfyNode):
                     "face_prompt",
                     multiline=True,
                     default=(
-                        "Enhance this video with sharp, crisp details while preserving a natural photorealistic appearance. "
+                        "clear and well-defined facial structure: sharp but natural eye contours, distinct iris and pupil, "
+                        "defined eyelid crease, clear lip shape, natural eyebrow structure; "
+                        "skin retains visible pores and natural highlight rolloff; "
+                        "no blur, no smearing, no distortion, no melting or twisted features; "
+                        "not smoothed into a plastic or mask-like appearance"
                     ),
                     tooltip="Face-repair prompt, composed with the original per-segment prompt according to "
                             "prompt_mode. Scene prompts from the parameter node are written for whole-shot "
