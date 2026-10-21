@@ -27,7 +27,7 @@ H3 的显存需求随分辨率、时长（每 +5s 翻倍）、精度（fp8→bf1
 
 ### 合并更新汇总（V0.8.5–V0.9.2）
 
-- **面部修复节点** - 详细说明：[中文](https://github.com/supElement/ComfyUI_MinimaxH3_AutoContext/blob/test/h3_fix_zh.md) | [English](https://github.com/supElement/ComfyUI_MinimaxH3_AutoContext/blob/test/h3_fix_en.md)
+- **面部修复节点** - 详细说明：[中文](h3_fix_zh.md) | [English](h3_fix_en.md)
   - `Minimax_H3_Face_Cut`：检测与裁剪，分镜 + YOLO 检测 + 可选 SeC-4B 追踪。
   - `Minimax_H3_Face_Resample`：精修，主采样同款模型做块级 img2img 重采样（块结构镜像主采样分段 + 块间锚定）。
   - `Minimax_H3_Face_Blend`：贴回，精修脸按几何账本与 mask 逐像素贴回原画面。
