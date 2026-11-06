@@ -505,7 +505,8 @@ def _sample_windows(frames, masks_full, use, centers, S_seq, dev=None):
     for k, j in enumerate(use):                                           # masks: CPU, 轻量
         m = masks_full[j] if (masks_full is not None and j < len(masks_full)) else None
         if m is not None:
-            S = int(S_seq[k]); cx, cy = float(centers[k][0]), float(centers[k][1])
+            S = int(S_seq[k])
+            cx, cy = float(centers[k][0]), float(centers[k][1])
             ax = torch.arange(S, dtype=torch.float32)
             xs = ((cx - S * 0.5 + 0.5 + ax) / W) * 2.0 - 1.0
             ys = ((cy - S * 0.5 + 0.5 + ax) / H) * 2.0 - 1.0
